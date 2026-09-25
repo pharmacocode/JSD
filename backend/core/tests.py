@@ -117,7 +117,11 @@ class FIFOConsumptionTests(TestCase):
 
 
 class COGSFrozenSnapshotTests(TestCase):
-    """Spec 5/6: COGS snapshot frozen at delivery creation."""
+    """
+    Spec 5/6: the COGS snapshot is WRITTEN at delivery creation for the audit
+    trail (3.7) — while every displayed cost stays dynamic (user request:
+    no frozen costs anywhere; charts and lists recompute from current prices).
+    """
 
     def setUp(self):
         self.client_obj = Client.objects.create(name="Alpha Traders")
@@ -171,28 +175,46 @@ class COGSFrozenSnapshotTests(TestCase):
             self.expected_cogs_per_case("10"),
         )
 
-    def test_snapshot_immutable_against_future_changes(self):
-        """Direct (base) cost never alters; overhead stays dynamic per month."""
+    def test_snapshot_is_audit_only_and_displayed_costs_stay_dynamic(self):
+        """
+        The snapshot columns are written once and never rewritten (audit), but
+        every figure the UI shows is recomputed from CURRENT data — a later
+        price edit moves the direct cost while the snapshot itself does not.
+        """
         delivery, _result = create_delivery(
             self.client_obj, self.sku, D("10"), delivery_date=date(2026, 9, 10)
         )
         frozen_base = delivery.base_cogs_per_case_snapshot
+        frozen_full = delivery.cogs_per_case_snapshot
 
-        # New batch at a wildly different price per case.
-        make_batch(self.bottle, "500", "999", arrival=date(2026, 9, 15))
-        # Overhead changes for the month — live allocation moves, base stays.
+        # Prices change AFTER the delivery: the bottle batch is repriced,
+        # the master display price and the month's overhead move too.
+        MaterialBatch.objects.filter(material=self.bottle).update(
+            price_per_unit=D("40")
+        )
         rent = OverheadCategory.objects.get(name="Rent")
         MonthlyOverhead.objects.filter(category=rent).update(amount=D("99999"))
-        # Master display price changes.
         Material.objects.filter(pk=self.bottle.pk).update(
             current_price_per_unit=D("1")
         )
 
         delivery.refresh_from_db()
+        # The audit columns keep the creation-time figures …
         self.assertEqual(delivery.base_cogs_per_case_snapshot, frozen_base)
+        self.assertEqual(delivery.cogs_per_case_snapshot, frozen_full)
+        # … while every displayed value follows the current data: the bottle
+        # batch now costs 40/case (queue repriced), the label still 12, and
+        # print comes from the current config as before.
+        print_per_case = (D("50") + D("10")) / D("100") * D("24") * D("1.05")
+        expected_base = money(D("40") + D("12") + print_per_case)
+        self.assertEqual(delivery.base_cogs_per_case_current, expected_base)
+        # Overhead stays live for the month: 99999 / 10 cases.
+        self.assertEqual(
+            delivery.overhead_per_case_current, money(D("99999") / D("10"))
+        )
         self.assertEqual(
             delivery.cogs_per_case_current,
-            money(frozen_base + delivery.overhead_per_case_current),
+            money(expected_base + delivery.overhead_per_case_current),
         )
 
     def test_second_delivery_in_month_uses_live_overhead_estimate(self):
@@ -624,7 +646,7 @@ class APITests(TestCase):
         self.assertEqual(resp.status_code, 201)
         delivery = StockDelivery.objects.get()
         self.assertEqual(delivery.selling_price_per_case, D("300"))
-        # COGS frozen server-side and non-zero (raw materials at minimum).
+        # COGS recorded server-side and non-zero (raw materials at minimum).
         self.assertGreater(delivery.cogs_per_case_snapshot, D("0"))
 
     def test_payment_endpoint_decreases_pending(self):
@@ -1194,6 +1216,75 @@ class DashboardSummaryTests(TestCase):
                 D(r["profit_excl_overhead"]),
             )
 
+    def test_chart_costs_follow_current_prices_not_frozen_snapshots(self):
+        """
+        User request — no frozen costs: the chart's raw material and print
+        costs recompute from CURRENT data. Editing the batch price or adding
+        a print config AFTER the deliveries were made must move the numbers.
+        """
+        stats = self.stats()
+        self.assertEqual(D(stats["total_direct_cost"]), D("70"))  # 7 × ₹10
+
+        # Raw material price edit -> materials cost moves immediately.
+        batch = MaterialBatch.objects.filter(material=self.mat).first()
+        batch.price_per_unit = D("20")
+        batch.save()
+        stats = self.stats()
+        self.assertEqual(D(stats["total_direct_cost"]), D("140"))  # 7 × ₹20
+        self.assertEqual(
+            sum((D(r["direct_cost"]) for r in stats["client_breakdown"]), D("0")),
+            D(stats["total_direct_cost"]),
+        )
+
+        # A print config that did not exist at delivery time flows in too:
+        # per case = (100 + 50) / 10 labels × 1 label per case = ₹15.
+        SKUPrintCost.objects.create(
+            sku=self.sku,
+            paper_cost=D("100"),
+            print_cost_per_paper=D("50"),
+            labels_per_paper=D("10"),
+            wastage_percent=D("0"),
+        )
+        stats = self.stats()
+        self.assertEqual(D(stats["total_direct_cost"]), D("245"))  # 7 × (20+15)
+        matrix = stats["sku_client_matrix"]
+        for r in matrix:
+            self.assertEqual(D(r["print_cost"]), D(r["cases"]) * D("15"))
+            self.assertEqual(
+                D(r["materials_cost"]) + D(r["print_cost"]), D(r["direct_cost"])
+            )
+        self.assertEqual(
+            sum((D(r["direct_cost"]) for r in matrix), D("0")),
+            D(stats["total_direct_cost"]),
+        )
+
+    def test_delivery_api_costs_are_dynamic(self):
+        """
+        The deliveries API serves recomputed costs (today's queue + current
+        config), not the creation-time snapshot values.
+        """
+        rows = self.api.get("/api/deliveries/?month=2026-09").data
+        rows = rows.get("results", rows) if isinstance(rows, dict) else rows
+        self.assertTrue(rows)
+        for row in rows:
+            self.assertEqual(D(row["base_cogs_per_case"]), D("10"))
+
+        MaterialBatch.objects.filter(material=self.mat).update(
+            price_per_unit=D("25")
+        )
+        rows = self.api.get("/api/deliveries/?month=2026-09").data
+        rows = rows.get("results", rows) if isinstance(rows, dict) else rows
+        for row in rows:
+            self.assertEqual(D(row["base_cogs_per_case"]), D("25"))
+            self.assertEqual(
+                D(row["cogs_per_case_current"]),
+                D("25") + D(row["overhead_per_case_current"]),
+            )
+            self.assertEqual(
+                D(row["total_cogs"]),
+                money(D(row["qty_cases"]) * D(row["cogs_per_case_current"])),
+            )
+
     def test_overhead_categories_feed_the_profit_drilldown(self):
         stats = self.stats()
         cats = stats["overhead_categories"]
@@ -1233,10 +1324,11 @@ class MultiSKUDeliveryTests(TestCase):
     User request: ONE delivery can carry several SKUs, each with its own
     quantity (and price).
 
-    Stored as one StockDelivery row per line, so FIFO consumption, the frozen
-    COGS snapshot and the generated ledger entry stay exactly as before — but
-    the stock check covers the delivery as a whole (shared materials summed)
-    and the shared FIFO queue is walked oldest-first ACROSS the lines.
+    Stored as one StockDelivery row per line, so FIFO consumption, the
+    creation-time COGS snapshot (audit only) and the generated ledger entry
+    stay exactly as before — but the stock check covers the delivery as a
+    whole (shared materials summed) and the shared FIFO queue is walked
+    oldest-first ACROSS the lines.
     """
 
     def setUp(self):

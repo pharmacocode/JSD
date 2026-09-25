@@ -22,7 +22,7 @@ app calls the Render-hosted API through `VITE_API_BASE_URL`.
 backend/           Django project (jsd/) + app (core/)
   core/models.py   Data model (spec Section 3) + audit rules (3.7)
   core/cogs.py     FIFO engine + COGS calculation (spec Sections 5–6)
-  core/tests.py    Unit tests: FIFO order, frozen COGS, shortfall, ledger…
+  core/tests.py    Unit tests: FIFO order, dynamic COGS, shortfall, ledger…
   core/urls.py     /api/ routes
 frontend/          Vue 3 SPA (Vuetify, mobile-first, bottom nav)
   src/views/       Home, Add Delivery, Arrived Stock, Stock Adjustment,
@@ -90,13 +90,17 @@ SPA routing). Env var:
   receipts, stock in hand, SKU requirements (`qty_per_case`), print cost,
   overhead allocation and COGS are all expressed per case.
 - **FIFO batch costing (spec 5):** consumption walks `MaterialBatch` rows
-  oldest-first; the delivery's COGS is the weighted cost of the batches
+  oldest-first; at creation a delivery records the weighted cost of the batches
   actually consumed — cost follows the physical batch, not the calendar month.
-- **Live-overhead COGS:** `StockDelivery.base_cogs_per_case_snapshot` freezes only
-  the direct cost (FIFO materials + print). The displayed per-case COGS is
-  `base + <delivery month's current overhead per case>`, so later overhead /
-  labour edits for that month update every delivery of the month.
-  `cogs_per_case_snapshot` keeps the full figure as at creation (audit only).
+- **Dynamic COGS everywhere (user request — no frozen costs):** every cost the
+  UI shows is recomputed on each read — raw material cost against **today's
+  FIFO queue prices** (`cogs.dynamic_costs_for`), print/label cost against the
+  SKU's **current print config** — so price, batch and print-config edits move
+  every chart, drill-down and delivery row immediately. The per-case COGS is
+  `current direct + <delivery month's current overhead per case>`, so later
+  overhead / labour edits for that month update it too.
+  `base_cogs_per_case_snapshot` / `cogs_per_case_snapshot` keep the
+  creation-time figures for the audit trail only.
 - **Ledger is the single source of truth:** client pending balance is always a
   live sum of `ClientLedgerEntry.amount` (positive = delivery, negative =
   payment), plus the optional *balance marker* described next. No running total
@@ -141,8 +145,8 @@ SPA routing). Env var:
   was already consumed drives the remainder negative — the same convention the
   FIFO shortfall path uses — so the difference stays visible and can be
   reconciled with a Stock Adjustment. A corrected price/date feeds FIFO from
-  then on; deliveries already made keep the direct cost frozen at their
-  creation (`base_cogs_per_case_snapshot`).
+  then on and — costs being dynamic everywhere — immediately flows into every
+  chart and delivery row; the creation snapshot stays untouched as audit.
 - **Home summary (user request):** *Stock in Hand* always shows the red
   `<n> low` / green `<n> above alert` counts and expands to the per-material
   detail when tapped. The monthly card is titled **`Summary — MMM, YYYY`** and
@@ -150,7 +154,7 @@ SPA routing). Env var:
   single chart area below is populated by the selected tile, i.e. cases per SKU
   (default), revenue per client (highest → lowest) or profit per client, with an
   **Include overhead** toggle for the profit view. Revenue/profit come from
-  `stats.client_breakdown` (= revenue − frozen direct cost − the client's share
+  `stats.client_breakdown` (= revenue − current direct cost − the client's share
   of the month's per-case overhead); the profit tile follows the toggle so card
   and bars always agree. The old "top clients by revenue" doughnut is gone.
 - **Chart drill-downs (user request):** tapping a bar opens a break-up below
@@ -159,7 +163,8 @@ SPA routing). Env var:
   delivered that month**, with per-SKU revenue adding back up to the client's
   bar; on *Profit* the picked client shows **profit per SKU**, and tapping a
   SKU shows the full cost chain (revenue → raw materials → print → the month's
-  overhead per category → profit). The rows come from
+  overhead per category → profit; materials at today's FIFO prices, print at
+  the current print config). The rows come from
   `stats.sku_client_matrix` (+ `stats.overhead_categories`) and sum exactly to
   the bars above; selections clear on metric/month change.
 - **Employees are editable (user request):** `Employee` rows (name, role,
@@ -179,8 +184,8 @@ SPA routing). Env var:
 ### Assumptions confirmed with the user (v1)
 
 1. Overhead-per-bottle is a **live-recomputing estimate** through the month
-   (no "close month" lock). Historical COGS is unaffected because snapshots
-   are frozen at delivery creation.
+   (no "close month" lock). Displayed COGS recomputes from current data too —
+   creation snapshots are audit-only (user request: no frozen costs).
 2. Stock adjustments are **distinct records** layered on the FIFO queue.
 3. `selling_price_per_case` **remains overridable per delivery** (auto-filled
    from the client master by default).

@@ -545,8 +545,9 @@ class SKUViewSet(viewsets.ModelViewSet):
         """
         Cost breakup (spec 4.6 SKU detail) — PER CASE ONLY (bottles are never
         considered anywhere). Uses current FIFO batch prices + the live
-        overhead allocation; historical deliveries keep their frozen
-        cogs_per_case_snapshot.
+        overhead allocation — like every other cost figure in the app it is
+        recomputed from current data (no frozen values; snapshot fields on
+        historical deliveries are audit-only).
         """
         sku = self.get_object()
         client_id = request.query_params.get("client")
@@ -611,10 +612,11 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
     Deliveries. Custom create implements the Add-Delivery flow (spec 4.2):
     first attempt returns 409 with shortfall details when stock is short;
     resending with force=true proceeds and sets stock_shortfall_flag.
-    cogs_per_case_snapshot is set server-side only (frozen, spec 5).
+    cogs_per_case_snapshot is set server-side only (creation-time audit
+    record, spec 5 — displayed costs stay dynamic).
     """
 
-    queryset = StockDelivery.objects.all()
+    queryset = StockDelivery.objects.select_related("client", "sku")
     serializer_class = StockDeliverySerializer
 
     def get_queryset(self):
@@ -690,8 +692,8 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
             {
                 "delivery": StockDeliverySerializer(delivery).data,
                 "cogs": {
-                    # Live figures (base frozen at creation + the delivery
-                    # month's CURRENT overhead allocation).
+                    # Live figures: the actual cost just consumed + the
+                    # delivery month's CURRENT overhead allocation.
                     "per_case": result["per_case_current"],
                     "per_case_at_creation": result["per_case"],
                     "base_per_case": result["base_per_case"],
@@ -713,10 +715,11 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         POST {client, date, note, force,
               lines: [{sku, qty_cases, selling_price_per_case}]}
 
-        Creates one StockDelivery per line (each with its own frozen COGS
-        snapshot and generated client-ledger entry) inside a single
-        transaction, so the delivery is never half-saved. The stock check is
-        aggregated across the lines: a 409 carries the summed shortfall list
+        Creates one StockDelivery per line (each with its own creation-time
+        COGS snapshot — audit only — and generated client-ledger entry)
+        inside a single transaction, so the delivery is never half-saved. The
+        stock check is aggregated across the lines: a 409 carries the summed
+        shortfall list
         and the same request with force=true proceeds ("Proceed anyway").
         """
         from datetime import date as date_cls
@@ -1103,25 +1106,33 @@ class DashboardView(APIView):
             row["quantity"] = dstr(row.pop("received"))
             inward.append(row)
 
-        # Per-client breakdown this month: revenue, the frozen direct cost
-        # (materials consumed + print) and profit with/without the month's
-        # overhead. Powers the Home metric chart (revenue / profit per client,
-        # highest first) — it replaces the old "top clients" doughnut.
-        # The same loop also accumulates a client x SKU matrix (chart
-        # drill-down breakups, user request) so every figure below is derived
-        # from one identical pass over the deliveries.
+        # Per-client breakdown this month: revenue, the CURRENT direct cost
+        # and profit with/without the month's overhead. Powers the Home metric
+        # chart (revenue / profit per client, highest first). Costs are
+        # DYNAMIC (user request — no frozen snapshots): raw materials are
+        # recomputed from today's FIFO queue and print from the SKU's current
+        # print config in ONE pass (cogs.dynamic_costs_for), so a price /
+        # print-config edit moves every chart immediately. The same pass also
+        # accumulates a client x SKU matrix (chart drill-down breakups) so
+        # every figure below derives from one identical walk over the
+        # deliveries — bars and drill rows always add up exactly.
         overhead_total = cogs.overhead_for_month(month)
         overhead_per_case_month = cogs.overhead_per_case(month)
+        month_deliveries = list(
+            StockDelivery.objects.filter(
+                is_deleted=False, **month_filter
+            ).select_related("client", "sku")
+        )
+        dynamic = cogs.dynamic_costs_for(month_deliveries)
         per_client = {}
         per_client_sku = {}
         total_revenue = Decimal("0")
         total_direct_cost = Decimal("0")
         total_cases = Decimal("0")
-        for d in StockDelivery.objects.filter(
-            is_deleted=False, **month_filter
-        ).select_related("client", "sku"):
+        for d in month_deliveries:
             revenue = d.qty_cases * d.selling_price_per_case
-            direct_cost = d.qty_cases * d.base_cogs_per_case_snapshot
+            costs = dynamic[d.id]
+            direct_cost = costs["direct"]
             total_revenue += revenue
             total_direct_cost += direct_cost
             total_cases += d.qty_cases
@@ -1145,11 +1156,15 @@ class DashboardView(APIView):
                     "cases": Decimal("0"),
                     "revenue": Decimal("0"),
                     "direct_cost": Decimal("0"),
+                    "materials_cost": Decimal("0"),
+                    "print_cost": Decimal("0"),
                 },
             )
             pair["cases"] += d.qty_cases
             pair["revenue"] += revenue
             pair["direct_cost"] += direct_cost
+            pair["materials_cost"] += costs["materials"]
+            pair["print_cost"] += costs["print"]
 
         client_breakdown = []
         for client_id, row in per_client.items():
@@ -1179,17 +1194,12 @@ class DashboardView(APIView):
         # - revenue chart tap -> SKUs delivered to one client (counts + the
         #   revenue that adds back up to that client's bar),
         # - profit chart tap -> profit per SKU, then the cost chain.
-        # The frozen direct cost (materials + print) is split using the SKU's
-        # print config (print is config-derived, never FIFO) — exact while the
-        # config is unchanged since the delivery, clamped so materials can
-        # never go negative after a later config edit.
-        skus_by_id = SKU.objects.in_bulk({key[1] for key in per_client_sku})
+        # Materials and print both come from the dynamic pass above — raw
+        # materials at TODAY's FIFO queue prices, print at the CURRENT print
+        # config (no frozen costs), so they always add up to the row's direct
+        # cost and move together when a price or config is edited.
         matrix_draft = []
         for (client_id, sku_id), row in per_client_sku.items():
-            print_pc, _ = cogs.print_cost_per_case(skus_by_id[sku_id])
-            print_total = money(row["cases"] * print_pc)
-            if print_total > row["direct_cost"]:
-                print_total = row["direct_cost"]
             matrix_draft.append(
                 {
                     "client_id": client_id,
@@ -1199,8 +1209,8 @@ class DashboardView(APIView):
                     "cases": row["cases"],
                     "revenue": row["revenue"],
                     "direct_cost": row["direct_cost"],
-                    "materials_cost": row["direct_cost"] - print_total,
-                    "print_cost": print_total,
+                    "materials_cost": row["materials_cost"],
+                    "print_cost": row["print_cost"],
                     "overhead": row["cases"] * overhead_per_case_month,
                 }
             )
@@ -1257,7 +1267,8 @@ class DashboardView(APIView):
             .order_by("category__name")
         ]
 
-        # Month totals for the summary cards. Direct cost is frozen per delivery;
+        # Month totals for the summary cards. Direct cost is recomputed
+        # dynamically per delivery (today's FIFO queue + current print config);
         # overhead is the month's live bucket (the same rule the stock pages use).
         profit_excl_overhead = money(total_revenue - total_direct_cost)
         profit_incl_overhead = money(profit_excl_overhead - overhead_total)

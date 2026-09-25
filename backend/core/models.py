@@ -747,17 +747,19 @@ class StockDelivery(AuditModel):
     # Auto-filled from ClientSKUPrice at entry time, editable per-delivery
     # (override capability confirmed by user for v1 — spec 3.8 / assumption 3).
     selling_price_per_case = models.DecimalField(max_digits=12, decimal_places=2)
-    # Frozen DIRECT cost per case at creation (raw materials consumed from the
-    # FIFO batches + print/label). This is a physical fact — the batches were
-    # really consumed at those prices — so it never changes.
+    # Creation-time DIRECT cost per case (raw materials consumed from the
+    # FIFO batches + print/label), written ONCE for the AUDIT trail (3.7).
+    # Displayed costs are never frozen (user request — no frozen costs
+    # anywhere): they are recomputed from today's prices via
+    # cogs.dynamic_costs_for, see base_cogs_per_case_current below.
     base_cogs_per_case_snapshot = models.DecimalField(
         max_digits=12, decimal_places=2, default=0
     )
     # Full per-case COGS as it stood at creation (base + that month's overhead
-    # allocation at the time). Kept for the audit trail only — the value the UI
-    # shows is computed DYNAMICALLY (user request): base + the delivery month's
-    # CURRENT overhead per case, so later overhead/labour entries for the month
-    # flow through to every delivery of that month.
+    # allocation at the time). Audit only — the value the UI shows is computed
+    # DYNAMICALLY (user request): current direct cost + the delivery month's
+    # CURRENT overhead per case, so later price / print-config / overhead /
+    # labour edits flow through to every delivery.
     cogs_per_case_snapshot = models.DecimalField(
         max_digits=12, decimal_places=2, default=0
     )
@@ -782,9 +784,25 @@ class StockDelivery(AuditModel):
         return cogs.overhead_per_case(cogs.month_key(self.date))
 
     @property
+    def base_cogs_per_case_current(self):
+        """
+        Current DIRECT cost per case (raw materials + print), recomputed at
+        read time from TODAY's FIFO queue prices and the SKU's CURRENT print
+        config (user request — no frozen costs; the snapshot field above is
+        the creation-time audit record only).
+        """
+        from . import cogs
+
+        costs = cogs.dynamic_costs_for([self])
+        direct = costs[self.id]["direct"]
+        if self.qty_cases:
+            return money(direct / self.qty_cases)
+        return money(direct)
+
+    @property
     def cogs_per_case_current(self):
-        """base (frozen direct cost) + current month overhead per case."""
-        return money(self.base_cogs_per_case_snapshot + self.overhead_per_case_current)
+        """Current direct cost per case + current month overhead per case."""
+        return money(self.base_cogs_per_case_current + self.overhead_per_case_current)
 
     @property
     def total_amount(self):

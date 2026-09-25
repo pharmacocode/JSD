@@ -4,16 +4,21 @@ FIFO batch costing engine + COGS calculation — ALL PER CASE (spec Sections
 every quantity, price and cost is expressed per case).
 
 Key rules:
-- Cost follows the physical batch consumed, NOT the calendar month: the cost
-  used for a delivery is the weighted cost of the specific oldest batch(es)
-  actually consumed. September deliveries can still carry "August pricing"
-  while August stock remains in the queue.
-- StockDelivery.base_cogs_per_case_snapshot freezes the DIRECT cost
-  (materials consumed + print/label) at creation; it never changes.
-  The OVERHEAD part is DYNAMIC (user request): the displayed per-case COGS is
-  base + the delivery month's CURRENT overhead allocation, so later
-  overhead/labour edits for that month flow through to every delivery of it.
-  cogs_per_case_snapshot keeps the full figure as at creation (audit only).
+- At CREATION, cost follows the physical batch consumed: the snapshot records
+  the weighted cost of the specific oldest batch(es) actually consumed.
+  September deliveries can still carry "August pricing" while August stock
+  remains in the queue.
+- Displayed costs are DYNAMIC everywhere (user request — no frozen costs):
+  raw material cost is recomputed on every read against TODAY's FIFO queue
+  (dynamic_costs_for -> _preview_fifo_unit_cost, non-mutating) and print/label
+  cost against the SKU's CURRENT print config, so price, batch and
+  print-config edits move every chart, drill-down and delivery row
+  immediately. StockDelivery.base_cogs_per_case_snapshot /
+  cogs_per_case_snapshot keep the creation-time figures for the AUDIT trail
+  only — nothing reads them for display.
+- The OVERHEAD part is dynamic too: the displayed per-case COGS is
+  current direct cost + the delivery month's CURRENT overhead allocation,
+  so later overhead/labour edits for that month flow through to it.
 - Material quantities (batch receipts, stock in hand, SKU requirements) are
   all in CASES of that material.
 - Overhead per case = total_monthly_overhead / total_cases_sold_that_month —
@@ -400,8 +405,10 @@ def estimate_cogs(sku, client, qty_cases: Decimal, delivery_date, preview=True):
     raw_per_case = raw_total_for_delivery / qty_cases if qty_cases > 0 else ZERO
     print_per_case, print_breakdown = print_cost_per_case(sku)
 
-    # Base (direct) cost per case = materials + print. This is the part that
-    # gets frozen on the delivery; overhead is added dynamically.
+    # Base (direct) cost per case = materials + print. Recorded on the
+    # delivery for the audit trail; every later display recomputes it
+    # dynamically from current prices (dynamic_costs_for), and overhead is
+    # added dynamically on top.
     base_per_case = raw_per_case + print_per_case
 
     # Spec 6.3 per case: month overhead / cases sold this month (including
@@ -465,6 +472,70 @@ def _preview_fifo_unit_cost(material, units_needed: Decimal) -> Decimal:
     if total_taken <= 0:
         return material.current_price_per_unit
     return total_cost / total_taken
+
+
+def dynamic_costs_for(deliveries) -> dict:
+    """
+    CURRENT direct cost (raw materials + print) for the given deliveries,
+    recomputed at READ time — no frozen snapshots (user request: every chart,
+    drill-down and delivery row must react immediately to price, batch and
+    print-config edits).
+
+    Materials: each material's required quantity is summed ACROSS the given
+    deliveries and today's FIFO queue is walked ONCE for that total
+    (non-mutating), so the returned rows carry the true blended replacement
+    cost — cheap stock is never double-counted per delivery, and any totals
+    derived from the rows add back up exactly (chart bars vs drill-down rows).
+    Deficit units price at the newest known batch / master price, exactly like
+    the Add-Delivery preview. Print is the SKU's CURRENT print config (never
+    FIFO), so a config edit flows through instantly.
+
+    Returns {delivery.id: {"materials": Decimal, "print": Decimal,
+                           "direct": Decimal}} — raw Decimals; callers money()
+    them at the edges.
+    """
+    deliveries = list(deliveries)
+
+    # 1. Requirements per delivery + physical totals per material.
+    lines_per_delivery = []
+    required_by_material = {}
+    for d in deliveries:
+        lines = []
+        for material, per_case_qty in resolve_requirements(d.sku, d.client):
+            required = d.qty_cases * per_case_qty
+            lines.append((material, required))
+            if required > 0:
+                prev = required_by_material.get(material.id)
+                if prev:
+                    required_by_material[material.id] = (prev[0], prev[1] + required)
+                else:
+                    required_by_material[material.id] = (material, required)
+        lines_per_delivery.append(lines)
+
+    # 2. Today's queue, walked once per material for the whole set.
+    unit_costs = {
+        material_id: _preview_fifo_unit_cost(material, total)
+        for material_id, (material, total) in required_by_material.items()
+    }
+
+    # 3. Apply per delivery (+ per-material wastage, + current print config).
+    out = {}
+    for d, lines in zip(deliveries, lines_per_delivery):
+        materials_cost = ZERO
+        for material, required in lines:
+            wastage_factor = (
+                Decimal("1") + material.wastage_percent / Decimal("100")
+            )
+            unit_cost = unit_costs.get(material.id, material.current_price_per_unit)
+            materials_cost += required * unit_cost * wastage_factor
+        print_pc, _print_breakdown = print_cost_per_case(d.sku)
+        print_total = d.qty_cases * print_pc
+        out[d.id] = {
+            "materials": materials_cost,
+            "print": print_total,
+            "direct": materials_cost + print_total,
+        }
+    return out
 
 
 def preview_deliveries(client, lines, delivery_date):
@@ -653,7 +724,8 @@ def create_delivery(
       2. FIFO sufficiency check — if short and not force, raise
          DeliveryShortfall (API 409 -> Proceed/Cancel banner).
       3. Compute per-case COGS via actual FIFO consumption.
-      4. Save delivery with frozen cogs_per_case_snapshot.
+      4. Save delivery — the snapshot columns record the figures as at
+         creation for the AUDIT trail (displayed costs stay dynamic).
       5. Create linked ClientLedgerEntry (DELIVERY, +qty*price).
 
     Returns (delivery, result_dict). Atomic.
@@ -685,10 +757,10 @@ def create_delivery(
         date=delivery_date,
         qty_cases=qty_cases,
         selling_price_per_case=selling_price_per_case,
-        # Frozen direct cost (materials consumed + print) …
+        # Creation-time direct cost (materials consumed + print) — recorded
+        # for the audit trail; every later display recomputes dynamically.
         base_cogs_per_case_snapshot=Decimal(result["per_case_base"]),
-        # … and the full figure as at creation, kept for the audit trail
-        # (the live total = base + the delivery month's CURRENT overhead).
+        # … and the full figure as at creation (also audit-only).
         cogs_per_case_snapshot=Decimal(result["per_case"]),
         stock_shortfall_flag=short_flag,
     )
@@ -706,11 +778,16 @@ def create_delivery(
     result["delivery_id"] = delivery.id
     result["client_pending_amount"] = str(client.pending_amount)
     result["total_amount"] = str(amount)
-    # Live values AFTER saving (so the month's case count includes this one).
-    result["per_case_current"] = str(delivery.cogs_per_case_current)
+    # Figures as at creation (so the month's case count includes this one):
+    # the actual cost just consumed + the month's live overhead. From here on
+    # every screen recomputes costs dynamically (dynamic_costs_for).
+    per_case_current = money(
+        delivery.base_cogs_per_case_snapshot + delivery.overhead_per_case_current
+    )
+    result["per_case_current"] = str(per_case_current)
     result["base_per_case"] = str(delivery.base_cogs_per_case_snapshot)
     result["overhead_per_case_current"] = str(delivery.overhead_per_case_current)
-    result["total_cogs_current"] = str(delivery.total_cogs)
+    result["total_cogs_current"] = str(money(delivery.qty_cases * per_case_current))
     return delivery, result
 
 
@@ -720,9 +797,10 @@ def create_deliveries(
 ):
     """
     Multi-SKU delivery (spec 4.2): one client, one date, one note — saved as
-    one StockDelivery row per SKU line, so FIFO consumption, the frozen COGS
-    snapshot and the linked client-ledger entry behave exactly as they do for
-    a single-SKU delivery (the ledger shows one entry per SKU, as before).
+    one StockDelivery row per SKU line, so FIFO consumption, the creation-time
+    COGS snapshot (audit only) and the linked client-ledger entry behave
+    exactly as they do for a single-SKU delivery (the ledger shows one entry
+    per SKU, as before).
 
     `lines` = [{"sku": sku, "qty_cases": Decimal,
                 "selling_price_per_case": Decimal | None}, ...]
@@ -813,7 +891,12 @@ def create_deliveries(
         base_total += delivery.base_cogs_per_case_snapshot * delivery.qty_cases
         total_cases += delivery.qty_cases
         total_amount += amount
-        total_cogs += delivery.total_cogs
+        # As-at-creation figures (actual consumption + live month overhead);
+        # every later display recomputes costs dynamically.
+        per_case_current = money(
+            delivery.base_cogs_per_case_snapshot + delivery.overhead_per_case_current
+        )
+        total_cogs += delivery.qty_cases * per_case_current
         rows.append(
             {
                 "delivery_id": delivery.id,
@@ -824,8 +907,8 @@ def create_deliveries(
                 "amount": str(amount),
                 "base_cogs_per_case": str(money(delivery.base_cogs_per_case_snapshot)),
                 "overhead_per_case": str(money(delivery.overhead_per_case_current)),
-                "cogs_per_case": str(money(delivery.cogs_per_case_current)),
-                "total_cogs": str(money(delivery.total_cogs)),
+                "cogs_per_case": str(per_case_current),
+                "total_cogs": str(money(delivery.qty_cases * per_case_current)),
                 "stock_shortfall_flag": delivery.stock_shortfall_flag,
             }
         )

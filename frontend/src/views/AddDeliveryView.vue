@@ -222,7 +222,7 @@ function reset() {
             </v-list-item>
           </template>
           <v-divider />
-          <v-list-item title="COGS (frozen snapshot)">
+          <v-list-item title="COGS (current)">
             <template #append>
               <strong>{{ money(result.cogs.per_case) }} / case</strong>
             </template>

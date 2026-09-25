@@ -659,13 +659,13 @@ async function deleteItem(item) {
                   </td>
                 </tr>
                 <tr>
-                  <td>Raw materials (FIFO, frozen)</td>
+                  <td>Raw materials (current FIFO)</td>
                   <td class="text-right">
                     {{ money(profitSkuDetail.row.materials_cost) }}
                   </td>
                 </tr>
                 <tr>
-                  <td>Print / label (frozen)</td>
+                  <td>Print / label (current)</td>
                   <td class="text-right">
                     {{ money(profitSkuDetail.row.print_cost) }}
                   </td>

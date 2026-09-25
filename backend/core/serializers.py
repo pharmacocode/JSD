@@ -300,15 +300,17 @@ class StockDeliverySerializer(serializers.ModelSerializer):
     total_cogs = serializers.DecimalField(
         max_digits=14, decimal_places=2, read_only=True
     )
-    # Frozen direct cost (materials consumed + print) — never changes.
+    # Current direct cost (materials + print) — recomputed from today's FIFO
+    # queue prices and the current print config (no frozen costs; the
+    # base_cogs_per_case_snapshot field stays in the audit trail only).
     base_cogs_per_case = serializers.DecimalField(
-        source="base_cogs_per_case_snapshot",
+        source="base_cogs_per_case_current",
         max_digits=12,
         decimal_places=2,
         read_only=True,
     )
     # Dynamic parts: the delivery month's CURRENT overhead per case and the
-    # resulting live COGS (user request — overhead is not frozen).
+    # resulting live COGS (both dynamic — nothing is frozen).
     overhead_per_case_current = serializers.DecimalField(
         max_digits=12, decimal_places=2, read_only=True
     )
