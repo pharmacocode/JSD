@@ -190,7 +190,7 @@ function reset() {
           size="small"
           class="ml-2"
         >
-          Stock shortfall — reconcile via Stock Adjustment
+          Stock negative — fix via Stock Adjustment or backdated arrival
         </v-chip>
       </v-alert>
       <v-card class="mb-3">

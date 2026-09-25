@@ -106,12 +106,21 @@ async function save() {
         />
         <div
           v-if="material"
-          class="text-caption mb-2 text-medium-emphasis"
+          class="text-caption mb-2"
+          :class="
+            Number(material.stock_in_hand) < 0
+              ? 'text-error'
+              : 'text-medium-emphasis'
+          "
         >
           Current stock in hand:
           <strong>
             {{ num(material.stock_in_hand) }} {{ material.unit_of_measure }}
           </strong>
+          <span v-if="Number(material.stock_in_hand) < 0">
+            — negative: add the missing cases below (+) or record a backdated
+            arrival to clear it.
+          </span>
         </div>
 
         <v-text-field
@@ -119,7 +128,7 @@ async function save() {
           type="number"
           step="any"
           label="Quantity in cases (positive = add, negative = remove)"
-          hint="e.g. +5 found stock, -2 damaged"
+          hint="e.g. +10 to clear negative stock, -2 damaged"
           persistent-hint
         />
         <v-text-field

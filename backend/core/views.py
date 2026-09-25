@@ -673,8 +673,10 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
             return Response(
                 {
                     "detail": (
-                        "Insufficient stock — you can proceed and adjust "
-                        "stock later, or cancel."
+                        "Insufficient stock — proceeding records the delivery "
+                        "and stock in hand will show negative. Reconcile later "
+                        "with a Stock Adjustment or a backdated stock arrival, "
+                        "or cancel."
                     ),
                     "shortfall": exc.shortages,
                 },
@@ -777,8 +779,10 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
             return Response(
                 {
                     "detail": (
-                        "Insufficient stock — you can proceed and adjust "
-                        "stock later, or cancel."
+                        "Insufficient stock — proceeding records the delivery "
+                        "and stock in hand will show negative. Reconcile later "
+                        "with a Stock Adjustment or a backdated stock arrival, "
+                        "or cancel."
                     ),
                     "shortfall": exc.shortages,
                 },
@@ -1064,6 +1068,10 @@ class DashboardView(APIView):
             .select_related("material")
             .order_by("material__name", "arrival_date", "id")
         ):
+            if batch.quantity_received <= 0 and batch.quantity_remaining < 0:
+                # Deficit carrier batch (the negative-stock booking) — not an
+                # arrival, so it must not show up as an inward line item.
+                continue
             row = arrivals.setdefault(
                 batch.material_id,
                 {

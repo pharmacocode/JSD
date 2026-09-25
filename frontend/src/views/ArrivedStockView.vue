@@ -125,7 +125,13 @@ async function save() {
         prefix="₹"
         hint="Cost of this batch only — FIFO uses it from here on."
       />
-      <v-text-field v-model="date" type="date" label="Arrival date" />
+      <v-text-field
+        v-model="date"
+        type="date"
+        label="Arrival date"
+        hint="Backdate it when the stock actually arrived earlier — e.g. to clear negative stock."
+        persistent-hint
+      />
       <v-text-field v-model="note" label="Note (optional)" />
 
       <div class="d-flex ga-2 mt-2">

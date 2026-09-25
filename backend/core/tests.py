@@ -266,6 +266,104 @@ class DeliveryFlowTests(TestCase):
         self.assertEqual(result["client_pending_amount"], "1500.00")
 
 
+class NegativeStockMarkingTests(TestCase):
+    """
+    User request: a delivery marked when there is NO stock in hand must drive
+    stock in hand NEGATIVE (never silently stay at 0) so the user reconciles
+    via a Stock Adjustment or a retrospective (backdated) arrival.
+    """
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(name="Neg Stock Co")
+        self.sku = SKU.objects.create(
+            description="500ml Neg", qty_per_case=D("24"), volume_ml=500
+        )
+        self.bottle = make_material("Bottle Neg", "240")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+
+    def test_forced_delivery_without_batches_marks_stock_negative(self):
+        """Zero batches at all -> a deficit carrier batch appears at -10."""
+        delivery, result = create_delivery(
+            self.client_obj,
+            self.sku,
+            D("10"),
+            delivery_date=date(2026, 9, 5),
+            force=True,
+        )
+        self.assertTrue(delivery.stock_shortfall_flag)
+        self.assertEqual(self.bottle.stock_in_hand, D("-10"))
+        carrier = self.bottle.batches.get()
+        self.assertEqual(carrier.quantity_received, D("0"))
+        self.assertEqual(carrier.quantity_remaining, D("-10"))
+        self.assertEqual(carrier.arrival_date, date(2026, 9, 5))
+        # The deficit is BOOKED (not "unrecorded") and costed at the master
+        # display price — the same figure the Add-Delivery preview quotes for
+        # an empty queue: 10 cases x 240 / 10 cases, no print config.
+        self.assertFalse(result["has_unrecorded_shortfall"])
+        self.assertEqual(delivery.base_cogs_per_case_snapshot, money(D("240")))
+        entry = result["consumption"][0]["consumed"][0]
+        self.assertEqual(entry["batch_id"], carrier.id)
+        self.assertTrue(entry["deficit"])
+
+    def test_further_deliveries_deepen_the_negative(self):
+        create_delivery(
+            self.client_obj,
+            self.sku,
+            D("10"),
+            delivery_date=date(2026, 9, 5),
+            force=True,
+        )  # -> -10 on the carrier
+        create_delivery(
+            self.client_obj,
+            self.sku,
+            D("5"),
+            delivery_date=date(2026, 9, 6),
+            force=True,
+        )  # -> -15, same single row
+        self.assertEqual(self.bottle.stock_in_hand, D("-15"))
+        carrier = self.bottle.batches.get()
+        self.assertEqual(carrier.quantity_remaining, D("-15"))
+
+    def test_exhausted_batch_goes_negative_on_the_next_delivery(self):
+        make_batch(self.bottle, "10", "240")
+        first, _ = create_delivery(
+            self.client_obj, self.sku, D("10"), delivery_date=date(2026, 9, 1)
+        )
+        self.assertFalse(first.stock_shortfall_flag)  # exact stock, not short
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+        second, _ = create_delivery(
+            self.client_obj,
+            self.sku,
+            D("4"),
+            delivery_date=date(2026, 9, 2),
+            force=True,
+        )
+        self.assertTrue(second.stock_shortfall_flag)
+        self.assertEqual(self.bottle.stock_in_hand, D("-4"))
+        self.assertEqual(self.bottle.batches.get().quantity_remaining, D("-4"))
+
+    def test_reconciliation_paths_clear_the_negative(self):
+        create_delivery(
+            self.client_obj,
+            self.sku,
+            D("10"),
+            delivery_date=date(2026, 9, 5),
+            force=True,
+        )  # -> -10
+        # (a) Stock Adjustment — found stock.
+        apply_stock_adjustment(self.bottle, D("6"), "Found 6 cases in godown")
+        self.assertEqual(self.bottle.stock_in_hand, D("-4"))
+        # (b) Retrospective (backdated) arrival — the missing cases turn up
+        # dated before the delivery; stock nets back positive.
+        make_batch(self.bottle, "20", "235", arrival=date(2026, 9, 4))
+        self.assertEqual(self.bottle.stock_in_hand, D("16"))
+
+
 class LedgerAndAuditTests(TestCase):
     """Spec 3.2 (live pending balance) + 3.7 (soft delete / edit history)."""
 
@@ -482,6 +580,35 @@ class APITests(TestCase):
         self.assertTrue(resp.data["stock_shortfall_flag"])
         self.assertIn("cogs", resp.data)
         self.assertEqual(resp.data["total_amount"], "6000.00")
+
+    def test_forced_delivery_surfaces_negative_stock(self):
+        """Zero stock in hand -> the API shows negative stock, not 0."""
+        MaterialBatch.objects.filter(material=self.bottle).delete()
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku.id,
+                "qty_cases": "10",
+                "date": "2026-09-10",
+                "force": True,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(resp.data["stock_shortfall_flag"])
+        batches = self.api.get(f"/api/materials/{self.bottle.id}/batches/")
+        self.assertEqual(D(batches.data["stock_in_hand"]), D("-10"))
+        dash = self.api.get("/api/dashboard/?month=2026-09").data
+        row = next(r for r in dash["stock"] if r["name"] == "Bottle API")
+        self.assertEqual(row["stock_in_hand"], "-10")
+        self.assertTrue(row["below_alert"])
+        # The deficit carrier is a booking, not an arrival — it must not
+        # appear among the month's inward line items.
+        self.assertNotIn(
+            "Bottle API",
+            [r["material"] for r in dash["stats"]["inward_materials"]],
+        )
 
     def test_delivery_auto_fills_price_and_snapshot(self):
         resp = self.api.post(

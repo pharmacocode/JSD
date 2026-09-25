@@ -49,6 +49,11 @@ const stats = computed(() => data.value.stats || {})
 const stock = computed(() => data.value.stock || [])
 const belowAlert = computed(() => stock.value.filter((s) => s.below_alert))
 const aboveAlert = computed(() => stock.value.filter((s) => !s.below_alert))
+// Negative stock = delivered beyond what was in hand (user request): counted
+// separately so the user Stock-Adjusts or backdates an arrival to clear it.
+const negativeStock = computed(() =>
+  stock.value.filter((s) => Number(s.stock_in_hand) < 0)
+)
 
 // The profit tile follows the chart toggle, so tile and bars always agree.
 const profitTotal = computed(() =>
@@ -398,6 +403,16 @@ async function deleteItem(item) {
           {{ belowAlert.length }} low
         </v-chip>
         <v-chip
+          v-if="negativeStock.length"
+          color="error"
+          size="small"
+          variant="tonal"
+          class="ml-2"
+          prepend-icon="mdi-alert"
+        >
+          {{ negativeStock.length }} negative
+        </v-chip>
+        <v-chip
           v-if="aboveAlert.length"
           color="success"
           size="small"
@@ -442,7 +457,15 @@ async function deleteItem(item) {
                   {{ num(s.stock_in_hand) }} {{ s.unit }}
                 </v-chip>
                 <v-chip
-                  v-if="s.below_alert"
+                  v-if="Number(s.stock_in_hand) < 0"
+                  color="error"
+                  size="x-small"
+                  variant="flat"
+                >
+                  SHORT
+                </v-chip>
+                <v-chip
+                  v-else-if="s.below_alert"
                   color="error"
                   size="x-small"
                   variant="tonal"
@@ -453,8 +476,10 @@ async function deleteItem(item) {
             </v-list-item>
           </v-list>
           <div class="text-caption text-medium-emphasis pa-3 pt-2">
-            Red = below the alert quantity · green = at or above it. Tap a
-            material to open its batches.
+            Red = below the alert quantity · green = at or above it · SHORT =
+            negative stock (delivered beyond stock in hand) — clear it with a
+            Stock Adjustment or a backdated arrival. Tap a material to open
+            its batches.
           </div>
         </div>
       </v-expand-transition>

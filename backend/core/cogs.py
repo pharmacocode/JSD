@@ -149,25 +149,36 @@ def check_shortfall_many(client, lines):
     return shortages
 
 
-def consume_fifo(material, units: Decimal, allow_negative: bool = True):
+def consume_fifo(
+    material, units: Decimal, allow_negative: bool = True, deficit_date=None
+):
     """
     Consume `units` (cases) from `material`'s queue, oldest batch first.
     Rolls over to the next-oldest batch when the current one is
     insufficient (spec 5).
 
     Returns (consumption_list, total_cost, unrecorded_shortfall):
-      consumption_list: [{"batch_id", "qty", "price_per_unit"} ...]
+      consumption_list: [{"batch_id", "qty", "price_per_unit", ...} ...]
       total_cost: weighted cost of the batch(es) actually consumed — the
         cost that feeds the delivery's COGS snapshot.
       unrecorded_shortfall: units that could NOT be booked against any batch
-        (only happens when the material has zero batches at all).
+        (only when allow_negative=False).
 
-    When allow_negative=True (delivery flow, spec 4.2 step 4) and all
-    batches are exhausted, the remaining deficit is pushed onto the oldest
-    batches, driving their quantity_remaining negative, so a later stock
-    adjustment can reconcile it. Such deliveries are flagged
-    stock_shortfall_flag=True. The StockAdjustment model is the only other
-    writer path — batches are never silently edited elsewhere.
+    When allow_negative=True (delivery flow, spec 4.2 step 4) a deficit is
+    ALWAYS booked, so stock in hand goes NEGATIVE and stays reconcilable
+    (user request: a delivery marked when there is no stock must mark stock
+    in hand negative, prompting a Stock Adjustment or a retrospective /
+    backdated arrival):
+    - partially consumed batches are pushed negative (oldest first),
+    - an already-exhausted queue is pushed further negative on its OLDEST
+      batch,
+    - a material with NO batches at all gets a zero-received "deficit
+      carrier" batch (dated `deficit_date`, priced at the master display
+      price — what the Add-Delivery preview already quotes for an empty
+      queue) whose remaining is negative.
+    Such deliveries are flagged stock_shortfall_flag=True. StockAdjustment
+    and keyed batch edits are the only other writer paths — batches are
+    never silently edited elsewhere.
     """
     units = Decimal(units)
     consumption = []
@@ -213,10 +224,49 @@ def consume_fifo(material, units: Decimal, allow_negative: bool = True):
                 )
                 total_cost += remaining * batch.price_per_unit
                 remaining = ZERO
-        elif allow_negative and not batches:
-            # No batch rows at all — nothing to drive negative. Record the
-            # shortfall; the caller flags the delivery for later adjustment.
-            unrecorded_shortfall = round_qty(remaining)
+        elif allow_negative and batches:
+            # Queue exists but has nothing positive left — extend the deficit
+            # on the OLDEST batch so stock in hand keeps showing the true
+            # negative figure (each further delivery deepens it visibly).
+            batch = batches[0]
+            batch.quantity_remaining -= remaining  # goes negative
+            consumption.append(
+                {
+                    "batch_id": batch.id,
+                    "qty": str(round_qty(remaining)),
+                    "price_per_unit": str(batch.price_per_unit),
+                    "deficit": True,
+                }
+            )
+            total_cost += remaining * batch.price_per_unit
+            batch.save(skip_audit=True)
+            remaining = ZERO
+        elif allow_negative:
+            # No batch rows at all — book the deficit on a carrier batch
+            # (received 0, remaining negative) instead of silently leaving
+            # stock at 0. Priced at the master display price, which is what
+            # the Add-Delivery preview already quotes for an empty queue.
+            carrier = MaterialBatch(
+                material=material,
+                quantity_received=ZERO,
+                quantity_remaining=-remaining,
+                price_per_unit=material.current_price_per_unit,
+                arrival_date=deficit_date or timezone_now_date(),
+                note=(
+                    "Stock shortfall booking — reconcile via Stock "
+                    "Adjustment or a backdated stock arrival."
+                ),
+            )
+            carrier.save(skip_audit=True)
+            consumption.append(
+                {
+                    "batch_id": carrier.id,
+                    "qty": str(round_qty(remaining)),
+                    "price_per_unit": str(carrier.price_per_unit),
+                    "deficit": True,
+                }
+            )
+            total_cost += remaining * carrier.price_per_unit
             remaining = ZERO
         else:
             unrecorded_shortfall = round_qty(remaining)
@@ -317,7 +367,10 @@ def estimate_cogs(sku, client, qty_cases: Decimal, delivery_date, preview=True):
             line_cost = required * unit_cost * wastage_factor
         else:
             consumption, total_cost, unrecorded = consume_fifo(
-                material, round_qty(required), allow_negative=True
+                material,
+                round_qty(required),
+                allow_negative=True,
+                deficit_date=delivery_date,
             )
             consumption_log.append(
                 {"material_id": material.id, "consumed": consumption}
@@ -831,7 +884,10 @@ def apply_stock_adjustment(
         references.append({"batch_id": batch.id, "qty": str(signed_quantity)})
     elif signed_quantity < 0:
         consumption, _cost, unrecorded = consume_fifo(
-            material, abs(signed_quantity), allow_negative=True
+            material,
+            abs(signed_quantity),
+            allow_negative=True,
+            deficit_date=adjustment_date,
         )
         references = consumption
 

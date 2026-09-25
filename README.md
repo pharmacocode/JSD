@@ -121,6 +121,16 @@ SPA routing). Env var:
   mandatory reason — positive adds a zero-price batch, negative consumes the
   FIFO queue. The FIFO engine never rewrites what was keyed; a **wrongly keyed
   arrival is corrected on the Home screen** instead (see the next bullet).
+- **Negative stock is visible, never silently ignored (user request):** a
+  delivery recorded without enough stock (409 → *Proceed anyway*) always
+  drives `stock_in_hand` **negative** — partially consumed batches go
+  negative, an exhausted queue is pushed further negative on its oldest
+  batch, and a material with no batches at all gets a zero-received deficit
+  *carrier* batch (costed at the master price, so COGS still matches the
+  Add-Delivery preview; carriers are excluded from the inward list). Home's
+  *Stock in Hand* marks such materials **SHORT** with an `<n> negative`
+  count, and the deficit clears either via a **Stock Adjustment** or a
+  **backdated (retrospective) arrival** on *Enter Arrived Stock*.
 - **Inward line items are editable (user request):** the Home screen lists the
   month's arrivals with their underlying batches; each line can be edited in
   place (received cases, landing price, arrival date) or removed. Editing
