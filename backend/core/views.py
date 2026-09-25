@@ -999,7 +999,8 @@ class DashboardView(APIView):
     - monthly summary for ?month=YYYY-MM: cases sold per SKU, per-client
       revenue / profit breakdown (drives the metric chart), inward material
       arrivals with their editable batch line items, overhead summary and the
-      month's profit (with and without overhead).
+      month's profit (with and without overhead), plus a client x SKU matrix
+      and the month's overhead categories for the chart drill-down breakups.
     """
 
     def get(self, request):
@@ -1098,15 +1099,19 @@ class DashboardView(APIView):
         # (materials consumed + print) and profit with/without the month's
         # overhead. Powers the Home metric chart (revenue / profit per client,
         # highest first) — it replaces the old "top clients" doughnut.
+        # The same loop also accumulates a client x SKU matrix (chart
+        # drill-down breakups, user request) so every figure below is derived
+        # from one identical pass over the deliveries.
         overhead_total = cogs.overhead_for_month(month)
         overhead_per_case_month = cogs.overhead_per_case(month)
         per_client = {}
+        per_client_sku = {}
         total_revenue = Decimal("0")
         total_direct_cost = Decimal("0")
         total_cases = Decimal("0")
         for d in StockDelivery.objects.filter(
             is_deleted=False, **month_filter
-        ).select_related("client"):
+        ).select_related("client", "sku"):
             revenue = d.qty_cases * d.selling_price_per_case
             direct_cost = d.qty_cases * d.base_cogs_per_case_snapshot
             total_revenue += revenue
@@ -1124,6 +1129,19 @@ class DashboardView(APIView):
             row["cases"] += d.qty_cases
             row["revenue"] += revenue
             row["direct_cost"] += direct_cost
+            pair = per_client_sku.setdefault(
+                (d.client_id, d.sku_id),
+                {
+                    "client": d.client.name,
+                    "sku": d.sku.description,
+                    "cases": Decimal("0"),
+                    "revenue": Decimal("0"),
+                    "direct_cost": Decimal("0"),
+                },
+            )
+            pair["cases"] += d.qty_cases
+            pair["revenue"] += revenue
+            pair["direct_cost"] += direct_cost
 
         client_breakdown = []
         for client_id, row in per_client.items():
@@ -1148,6 +1166,89 @@ class DashboardView(APIView):
             )
         client_breakdown.sort(key=lambda c: Decimal(c["revenue"]), reverse=True)
 
+        # Client x SKU drill-down matrix (chart breakups, user request):
+        # - cases chart tap -> clients served for one SKU,
+        # - revenue chart tap -> SKUs delivered to one client (counts + the
+        #   revenue that adds back up to that client's bar),
+        # - profit chart tap -> profit per SKU, then the cost chain.
+        # The frozen direct cost (materials + print) is split using the SKU's
+        # print config (print is config-derived, never FIFO) — exact while the
+        # config is unchanged since the delivery, clamped so materials can
+        # never go negative after a later config edit.
+        skus_by_id = SKU.objects.in_bulk({key[1] for key in per_client_sku})
+        matrix_draft = []
+        for (client_id, sku_id), row in per_client_sku.items():
+            print_pc, _ = cogs.print_cost_per_case(skus_by_id[sku_id])
+            print_total = money(row["cases"] * print_pc)
+            if print_total > row["direct_cost"]:
+                print_total = row["direct_cost"]
+            matrix_draft.append(
+                {
+                    "client_id": client_id,
+                    "client": row["client"],
+                    "sku_id": sku_id,
+                    "sku": row["sku"],
+                    "cases": row["cases"],
+                    "revenue": row["revenue"],
+                    "direct_cost": row["direct_cost"],
+                    "materials_cost": row["direct_cost"] - print_total,
+                    "print_cost": print_total,
+                    "overhead": row["cases"] * overhead_per_case_month,
+                }
+            )
+
+        # Overhead shares are rounded per SKU row; give the rounding remainder
+        # of each client to its largest row so the drill-down rows add up to
+        # the client bar to the paise (the bars keep their original formula).
+        rows_by_client = {}
+        for row in matrix_draft:
+            rows_by_client.setdefault(row["client_id"], []).append(row)
+        for rows in rows_by_client.values():
+            target = money(sum((r["overhead"] for r in rows), Decimal("0")))
+            rounded = [money(r["overhead"]) for r in rows]
+            delta = target - sum(rounded, Decimal("0"))
+            if delta:
+                biggest = max(range(len(rows)), key=lambda i: rows[i]["overhead"])
+                rows[biggest]["overhead"] = rounded[biggest] + delta
+
+        sku_client_matrix = sorted(
+            (
+                {
+                    "client_id": row["client_id"],
+                    "client": row["client"],
+                    "sku_id": row["sku_id"],
+                    "sku": row["sku"],
+                    "cases": dstr(row["cases"]),
+                    "revenue": str(money(row["revenue"])),
+                    "direct_cost": str(money(row["direct_cost"])),
+                    "materials_cost": str(money(row["materials_cost"])),
+                    "print_cost": str(money(row["print_cost"])),
+                    "overhead": str(money(row["overhead"])),
+                    "profit_excl_overhead": str(
+                        money(row["revenue"] - row["direct_cost"])
+                    ),
+                    "profit_incl_overhead": str(
+                        money(
+                            row["revenue"]
+                            - row["direct_cost"]
+                            - row["overhead"]
+                        )
+                    ),
+                }
+                for row in matrix_draft
+            ),
+            key=lambda r: (r["client"], r["sku"]),
+        )
+
+        # Month overhead per category (feeds the profit drill-down cost chain).
+        overhead_categories = [
+            {"category": r["category__name"], "amount": str(money(r["total"]))}
+            for r in MonthlyOverhead.objects.filter(month=month)
+            .values("category__name")
+            .annotate(total=Sum("amount"))
+            .order_by("category__name")
+        ]
+
         # Month totals for the summary cards. Direct cost is frozen per delivery;
         # overhead is the month's live bucket (the same rule the stock pages use).
         profit_excl_overhead = money(total_revenue - total_direct_cost)
@@ -1170,6 +1271,8 @@ class DashboardView(APIView):
                     "total_profit_excl_overhead": str(profit_excl_overhead),
                     "total_profit_incl_overhead": str(profit_incl_overhead),
                     "overhead_per_case": str(money(overhead_per_case_month)),
+                    "sku_client_matrix": sku_client_matrix,
+                    "overhead_categories": overhead_categories,
                 },
             }
         )

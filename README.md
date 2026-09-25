@@ -143,6 +143,15 @@ SPA routing). Env var:
   `stats.client_breakdown` (= revenue − frozen direct cost − the client's share
   of the month's per-case overhead); the profit tile follows the toggle so card
   and bars always agree. The old "top clients by revenue" doughnut is gone.
+- **Chart drill-downs (user request):** tapping a bar opens a break-up below
+  the chart — on *Cases sold* the picked SKU shows the **clients served**
+  (bar chart); on *Revenue* the picked client shows the **case count per SKU
+  delivered that month**, with per-SKU revenue adding back up to the client's
+  bar; on *Profit* the picked client shows **profit per SKU**, and tapping a
+  SKU shows the full cost chain (revenue → raw materials → print → the month's
+  overhead per category → profit). The rows come from
+  `stats.sku_client_matrix` (+ `stats.overhead_categories`) and sum exactly to
+  the bars above; selections clear on metric/month change.
 - **Employees are editable (user request):** `Employee` rows (name, role,
   monthly pay, active) can be edited at any time from Masters → Overheads &
   Labour (one dialog handles add *and* edit). Retiring someone = setting

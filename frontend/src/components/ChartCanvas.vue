@@ -40,6 +40,10 @@ const props = defineProps({
   height: { type: Number, default: 220 },
 })
 
+// Bar/segment clicks drive the Home chart drill-downs (user request):
+// (index, label) of the clicked element.
+const emit = defineEmits(['select'])
+
 const canvas = ref(null)
 let chart = null
 
@@ -69,6 +73,14 @@ function build() {
     options: {
       responsive: true,
       maintainAspectRatio: false,
+      onHover: (_evt, elements) => {
+        if (canvas.value)
+          canvas.value.style.cursor = elements.length ? 'pointer' : 'default'
+      },
+      onClick: (_evt, elements) => {
+        if (elements.length)
+          emit('select', elements[0].index, props.labels[elements[0].index])
+      },
       plugins: { legend: { display: isDoughnut || props.datasets.length > 1 } },
       scales: isDoughnut
         ? {}

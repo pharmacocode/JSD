@@ -111,6 +111,7 @@ const chart = computed(() => {
           ? '1 SKU sold this month'
           : `${rows.length} SKUs sold this month`,
       labels: rows.map((r) => r.sku),
+      keys: rows.map((r) => r.sku_id),
       data: rows.map((r) => Number(r.cases)),
       label: 'Cases',
       empty: 'No sales this month yet.',
@@ -128,12 +129,149 @@ const chart = computed(() => {
       ? `${includeOverhead.value ? 'After' : 'Before'} overhead · highest first`
       : 'Highest first',
     labels: rows.map((r) => r.client),
+    keys: rows.map((r) => r.client_id),
     data: rows.map((r) => Number(r[key])),
     label: isProfit ? 'Profit (₹)' : 'Revenue (₹)',
     empty: 'No client figures this month.',
   }
 })
 
+// --- Chart drill-downs (user request) ---------------------------------------
+// Cases chart: tap a SKU -> clients served for that SKU (bar chart).
+// Revenue chart: tap a client -> the SKUs delivered to them this month as
+// case counts, with per-SKU revenue that adds back up to the client's bar.
+// Profit chart: tap a client -> profit per SKU, then tap a SKU -> the cost
+// chain (revenue - raw materials - print - overhead share = profit).
+const drillSku = ref(null) // cases chart: selected sku_id
+const drillClient = ref(null) // revenue / profit charts: selected client_id
+const drillProfitSku = ref(null) // profit drill: selected sku_id
+
+const matrix = computed(() => stats.value.sku_client_matrix || [])
+
+function onMainSelect(index) {
+  const id = chart.value.keys?.[index]
+  if (id == null) return
+  if (metric.value === 'cases') {
+    drillSku.value = drillSku.value === id ? null : id
+  } else {
+    drillClient.value = drillClient.value === id ? null : id
+    drillProfitSku.value = null
+  }
+}
+
+function onProfitDrillSelect(index) {
+  const row = profitDrill.value?.rows?.[index]
+  if (!row) return
+  drillProfitSku.value = drillProfitSku.value === row.sku_id ? null : row.sku_id
+}
+
+// Drill-downs belong to one metric and one month — clear them when either
+// changes so a stale selection can never point at the wrong rows.
+watch([metric, () => ui.month], () => {
+  drillSku.value = null
+  drillClient.value = null
+  drillProfitSku.value = null
+})
+
+// Cases chart drill: clients served for the picked SKU, highest first.
+const casesDrill = computed(() => {
+  const skuId = drillSku.value
+  const rows = matrix.value
+    .filter((r) => r.sku_id === skuId)
+    .sort((a, b) => Number(b.cases) - Number(a.cases))
+  if (!rows.length) return null
+  const totalCases = rows.reduce((s, r) => s + Number(r.cases), 0)
+  return {
+    title: `Clients served — ${rows[0].sku}`,
+    subtitle: `${monthLong(ui.month)} · ${num(totalCases, 0)} cases sold`,
+    labels: rows.map((r) => r.client),
+    data: rows.map((r) => Number(r.cases)),
+    label: 'Cases',
+  }
+})
+
+// The revenue / profit bar of the client whose bar was tapped.
+const clientBar = computed(() =>
+  (stats.value.client_breakdown || []).find(
+    (r) => r.client_id === drillClient.value
+  )
+)
+
+// Revenue chart drill: SKUs delivered to that client this month (counts).
+// The per-SKU revenue rows sum to exactly the revenue bar above — both come
+// from the same deliveries of the same month.
+const revenueDrill = computed(() => {
+  const bar = clientBar.value
+  if (!bar) return null
+  const rows = matrix.value
+    .filter((r) => r.client_id === bar.client_id)
+    .sort((a, b) => Number(b.revenue) - Number(a.revenue))
+  if (!rows.length) return null
+  return {
+    title: `SKUs delivered — ${bar.client}`,
+    subtitle: `${monthLong(ui.month)} · case counts, revenue adds up to the bar`,
+    labels: rows.map((r) => r.sku),
+    data: rows.map((r) => Number(r.cases)),
+    label: 'Cases',
+    rows,
+    totalRevenue: bar.revenue,
+  }
+})
+
+// Profit chart drill: profit per SKU for that client, highest first.
+const profitDrill = computed(() => {
+  const bar = clientBar.value
+  if (!bar) return null
+  const rows = matrix.value
+    .filter((r) => r.client_id === bar.client_id)
+    .sort((a, b) => Number(b[profitKey.value]) - Number(a[profitKey.value]))
+  if (!rows.length) return null
+  return {
+    title: `Profit per SKU — ${bar.client}`,
+    subtitle: `${monthLong(ui.month)} · ${
+      includeOverhead.value ? 'after' : 'before'
+    } overhead · tap a bar for the cost breakup`,
+    labels: rows.map((r) => r.sku),
+    data: rows.map((r) => Number(r[profitKey.value])),
+    label: 'Profit (₹)',
+    rows,
+  }
+})
+
+// Cost chain for the tapped client x SKU: revenue -> raw materials -> print
+// -> overhead share (per category) -> profit. The figures are the backend's
+// exact 2dp strings, so the chain adds up to the bars above to the paise.
+const profitSkuDetail = computed(() => {
+  const row = matrix.value.find(
+    (r) =>
+      r.client_id === drillClient.value && r.sku_id === drillProfitSku.value
+  )
+  if (!row) return null
+  const cats = stats.value.overhead_categories || []
+  const cases = Number(row.cases)
+  const sold = Number(stats.value.total_cases) || 0
+  // Per-category share of this line, remainder-adjusted so the categories
+  // add up exactly to the row's overhead share.
+  const rounded = cats.map((c) =>
+    Math.round((sold ? (cases * Number(c.amount)) / sold : 0) * 100) / 100
+  )
+  const delta =
+    Math.round(
+      (Number(row.overhead) - rounded.reduce((a, b) => a + b, 0)) * 100
+    ) / 100
+  if (rounded.length) {
+    const i = rounded.indexOf(Math.max(...rounded))
+    rounded[i] = Math.round((rounded[i] + delta) * 100) / 100
+  }
+  return {
+    row,
+    categories: cats.map((c, i) => ({
+      category: c.category,
+      month: Number(c.amount),
+      share: rounded[i],
+    })),
+  }
+})
 // --- Inward material line items (editable at any time) ---------------------
 function toggleInward(id) {
   const i = inwardOpen.value.indexOf(id)
@@ -386,8 +524,164 @@ async function deleteItem(item) {
           :labels="chart.labels"
           :datasets="[{ label: chart.label, data: chart.data }]"
           :height="240"
+          @select="onMainSelect"
         />
         <EmptyState v-else :text="chart.empty" icon="mdi-chart-bar" />
+        <div
+          v-if="chart.labels.length"
+          class="text-caption text-medium-emphasis mt-1"
+        >
+          Tap a bar to open its break-up below.
+        </div>
+
+        <!-- Chart drill-downs (user request): tap a bar above for the rows
+             underneath — cases -> clients, revenue -> SKUs, profit -> SKUs
+             -> the full cost chain. -->
+        <div v-if="metric === 'cases' && casesDrill" class="mt-3">
+          <div
+            class="text-caption font-weight-bold text-uppercase text-medium-emphasis"
+          >
+            {{ casesDrill.title }}
+          </div>
+          <div class="text-caption text-medium-emphasis">
+            {{ casesDrill.subtitle }}
+          </div>
+          <ChartCanvas
+            type="bar"
+            :labels="casesDrill.labels"
+            :datasets="[{ label: casesDrill.label, data: casesDrill.data }]"
+            :height="200"
+          />
+        </div>
+
+        <div v-else-if="metric === 'revenue' && revenueDrill" class="mt-3">
+          <div
+            class="text-caption font-weight-bold text-uppercase text-medium-emphasis"
+          >
+            {{ revenueDrill.title }}
+          </div>
+          <div class="text-caption text-medium-emphasis">
+            {{ revenueDrill.subtitle }}
+          </div>
+          <ChartCanvas
+            type="bar"
+            :labels="revenueDrill.labels"
+            :datasets="[
+              { label: revenueDrill.label, data: revenueDrill.data },
+            ]"
+            :height="200"
+          />
+          <div class="mt-2">
+            <div
+              v-for="r in revenueDrill.rows"
+              :key="r.sku_id"
+              class="d-flex align-center py-1"
+            >
+              <span class="text-body-2">{{ r.sku }}</span>
+              <span class="text-caption text-medium-emphasis ml-2">
+                {{ num(r.cases, 0) }} cases
+              </span>
+              <v-spacer />
+              <span class="text-body-2 font-weight-medium">
+                {{ money(r.revenue) }}
+              </span>
+            </div>
+            <div class="d-flex align-center py-1">
+              <span class="text-caption font-weight-bold text-uppercase">
+                Total revenue
+              </span>
+              <v-spacer />
+              <span class="text-body-2 font-weight-bold">
+                {{ money(revenueDrill.totalRevenue) }}
+              </span>
+            </div>
+            <div class="text-caption text-medium-emphasis">
+              Matches the revenue bar above — same client, same month, same
+              deliveries.
+            </div>
+          </div>
+        </div>
+
+        <div v-else-if="metric === 'profit' && profitDrill" class="mt-3">
+          <div
+            class="text-caption font-weight-bold text-uppercase text-medium-emphasis"
+          >
+            {{ profitDrill.title }}
+          </div>
+          <div class="text-caption text-medium-emphasis">
+            {{ profitDrill.subtitle }}
+          </div>
+          <ChartCanvas
+            type="bar"
+            :labels="profitDrill.labels"
+            :datasets="[{ label: profitDrill.label, data: profitDrill.data }]"
+            :height="200"
+            @select="onProfitDrillSelect"
+          />
+          <div v-if="profitSkuDetail" class="mt-3">
+            <div
+              class="text-caption font-weight-bold text-uppercase text-medium-emphasis"
+            >
+              Cost breakup — {{ profitSkuDetail.row.sku }} ·
+              {{ num(profitSkuDetail.row.cases, 0) }} cases
+            </div>
+            <v-table density="compact" class="mt-1">
+              <tbody>
+                <tr>
+                  <td>Revenue</td>
+                  <td class="text-right">
+                    {{ money(profitSkuDetail.row.revenue) }}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Raw materials (FIFO, frozen)</td>
+                  <td class="text-right">
+                    {{ money(profitSkuDetail.row.materials_cost) }}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Print / label (frozen)</td>
+                  <td class="text-right">
+                    {{ money(profitSkuDetail.row.print_cost) }}
+                  </td>
+                </tr>
+                <tr v-for="c in profitSkuDetail.categories" :key="c.category">
+                  <td class="pl-8">
+                    Overhead — {{ c.category }}
+                    <span class="text-caption text-medium-emphasis">
+                      ({{ money(c.month) }} for the month)
+                    </span>
+                  </td>
+                  <td class="text-right">{{ money(c.share) }}</td>
+                </tr>
+                <tr v-if="!profitSkuDetail.categories.length">
+                  <td>Overhead share</td>
+                  <td class="text-right">
+                    {{ money(profitSkuDetail.row.overhead) }}
+                  </td>
+                </tr>
+                <tr>
+                  <td>Profit before overhead</td>
+                  <td class="text-right font-weight-medium">
+                    {{ money(profitSkuDetail.row.profit_excl_overhead) }}
+                  </td>
+                </tr>
+                <tr>
+                  <td class="font-weight-bold">Profit after overhead</td>
+                  <td class="text-right font-weight-bold">
+                    {{ money(profitSkuDetail.row.profit_incl_overhead) }}
+                  </td>
+                </tr>
+              </tbody>
+            </v-table>
+            <div class="text-caption text-medium-emphasis mt-1">
+              Overhead = {{ num(profitSkuDetail.row.cases, 0) }} cases ×
+              {{ money(stats.overhead_per_case) }} / case in
+              {{ monthLong(ui.month) }} — the chain adds up to the profit bar
+              above.
+            </div>
+          </div>
+        </div>
 
         <!-- Inward material this month — the line items are editable in place. -->
         <div

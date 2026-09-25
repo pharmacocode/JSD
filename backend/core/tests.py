@@ -992,6 +992,93 @@ class DashboardSummaryTests(TestCase):
         self.assertEqual(rows[0]["cases"], "7")
         self.assertEqual(D(rows[0]["revenue"]), D("3000"))
 
+    def test_sku_client_matrix_drilldown_sums_match_the_client_bars(self):
+        """
+        Chart drill-downs (user request): one matrix row per client x SKU for
+        the month, and those rows add back up to the client_breakdown bars
+        exactly — revenue, cases, overhead share and both profit figures.
+        """
+        # A second SKU delivered to Alpha in the same month (3 more cases).
+        sku2 = SKU.objects.create(description="Serum 1L", qty_per_case=D("1"))
+        SKUMaterialRequirement.objects.create(
+            sku=sku2, material=self.mat, qty_per_case=D("1")
+        )
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.alpha.id,
+                "sku": sku2.id,
+                "qty_cases": "3",
+                "selling_price_per_case": "600",
+                "date": "2026-09-15",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        stats = self.stats()
+        matrix = stats["sku_client_matrix"]
+        # 10 cases sold now: overhead per case = 350 / 10 = 35.
+        self.assertEqual(D(stats["overhead_per_case"]), D("35.00"))
+
+        alpha_rows = sorted(
+            (r for r in matrix if r["client"] == "Alpha"), key=lambda r: r["sku"]
+        )
+        self.assertEqual(
+            [r["sku"] for r in alpha_rows], ["Serum 1L", "Serum 500ml"]
+        )
+        self.assertEqual([D(r["cases"]) for r in alpha_rows], [D("3"), D("2")])
+        self.assertEqual(D(alpha_rows[0]["revenue"]), D("1800"))
+        self.assertEqual(D(alpha_rows[1]["revenue"]), D("1000"))
+
+        # Every client's matrix rows sum to its bar (charts must agree).
+        bars = {r["client"]: r for r in stats["client_breakdown"]}
+        self.assertEqual(set(bars), {"Alpha", "Beta"})
+        for name, bar in bars.items():
+            rows = [r for r in matrix if r["client"] == name]
+            for key in ("cases", "revenue", "overhead"):
+                self.assertEqual(
+                    sum((D(r[key]) for r in rows), D("0")),
+                    D(bar[key]),
+                    f"{name} {key} drill rows must add up to the bar",
+                )
+            self.assertEqual(
+                sum((D(r["profit_excl_overhead"]) for r in rows), D("0")),
+                D(bar["profit_excl_overhead"]),
+            )
+            self.assertEqual(
+                sum((D(r["profit_incl_overhead"]) for r in rows), D("0")),
+                D(bar["profit_incl_overhead"]),
+            )
+
+        # The cost chain: revenue - materials - print - overhead = profit.
+        for r in matrix:
+            self.assertEqual(
+                D(r["materials_cost"]) + D(r["print_cost"]), D(r["direct_cost"])
+            )
+            self.assertEqual(
+                D(r["revenue"])
+                - D(r["materials_cost"])
+                - D(r["print_cost"])
+                - D(r["overhead"]),
+                D(r["profit_incl_overhead"]),
+            )
+            self.assertEqual(
+                D(r["revenue"]) - D(r["direct_cost"]),
+                D(r["profit_excl_overhead"]),
+            )
+
+    def test_overhead_categories_feed_the_profit_drilldown(self):
+        stats = self.stats()
+        cats = stats["overhead_categories"]
+        self.assertEqual(len(cats), 1)
+        self.assertEqual(cats[0]["category"], "Rent")
+        self.assertEqual(D(cats[0]["amount"]), D("350"))
+        # The categories total the month overhead the bars already use.
+        self.assertEqual(
+            sum((D(c["amount"]) for c in cats), D("0")),
+            D(stats["total_overhead"]),
+        )
+
     def test_inward_rows_carry_editable_line_items(self):
         stats = self.stats()
         row = stats["inward_materials"][0]
