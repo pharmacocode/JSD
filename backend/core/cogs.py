@@ -102,10 +102,38 @@ def check_shortfall(sku, client, qty_cases: Decimal):
     material (all in cases). Returns a list of shortfall dicts:
       {material_id, material, required, available, short_by, unit}
     """
+    return check_shortfall_many(client, [(sku, Decimal(qty_cases))])
+
+
+def check_shortfall_many(client, lines):
+    """
+    Multi-SKU sufficiency check (spec 4.2 step 4) without mutating the DB.
+
+    `lines` = [(sku, qty_cases), ...] for ONE delivery (same client/date).
+
+    Requirements are summed PER MATERIAL across all lines before being
+    compared with stock: two SKUs can draw on the same raw material, and two
+    SKUs can resolve to the same client-owned label, so a delivery that only
+    fits when its lines are considered together must not be reported short.
+    Each line is rounded on its own — exactly what FIFO consumption will take.
+
+    Returns the same list shape as the single-line check.
+    """
+    required_by_material = {}
+    order = []
+    for sku, qty_cases in lines:
+        qty_cases = Decimal(qty_cases)
+        for material, per_case in resolve_requirements(sku, client):
+            required = round_qty(qty_cases * per_case)
+            if material.id in required_by_material:
+                required_by_material[material.id] += required
+            else:
+                required_by_material[material.id] = required
+                order.append(material)
+
     shortages = []
-    qty_cases = Decimal(qty_cases)
-    for material, per_case in resolve_requirements(sku, client):
-        required = round_qty(qty_cases * per_case)
+    for material in order:
+        required = required_by_material[material.id]
         available = stock_available(material)
         if available < required:
             shortages.append(
@@ -386,6 +414,156 @@ def _preview_fifo_unit_cost(material, units_needed: Decimal) -> Decimal:
     return total_cost / total_taken
 
 
+def preview_deliveries(client, lines, delivery_date):
+    """
+    Non-mutating COGS + shortfall preview for a MULTI-SKU delivery (spec 4.2 /
+    Section 6, everything per case). `lines` = [{"sku": sku, "qty_cases": Decimal}].
+
+    A material needed by several lines (same raw material, or two SKUs that
+    both resolve to the client's own label) is priced ONCE against the FIFO
+    queue for the delivery's combined requirement, and that same unit cost is
+    used for each line — so the second SKU is never quoted from the front of
+    the queue a second time.
+
+    Overhead is allocated for the delivery as a whole: the month's pool /
+    (cases already sold that month + this delivery's cases).
+
+    Returns {"month", "lines": [per-line breakdown], "cogs": {aggregate
+    per-case + overhead pool}, "totals": {cases, base_cogs, cogs},
+    "shortfall": [shortfall rows summed per material across the lines]}.
+    """
+    month = month_key(delivery_date)
+    total_cases = sum((Decimal(line["qty_cases"]) for line in lines), ZERO)
+    if total_cases <= 0:
+        return {
+            "month": month,
+            "lines": [],
+            "cogs": {
+                "per_case": str(money(0)),
+                "base_per_case": str(money(0)),
+                "overhead_per_case": str(money(0)),
+                "materials_per_case": str(money(0)),
+                "print_per_case": str(money(0)),
+                "details": {"overhead": None},
+            },
+            "totals": {
+                "cases": "0",
+                "base_cogs": str(money(0)),
+                "cogs": str(money(0)),
+            },
+            "shortfall": [],
+        }
+
+    # 1. Requirements per line + the combined requirement per material.
+    per_line_reqs = []
+    materials_by_id = {}
+    required_totals = {}
+    for line in lines:
+        qty_cases = Decimal(line["qty_cases"])
+        rows = []
+        for material, per_case in resolve_requirements(line["sku"], client):
+            required = round_qty(qty_cases * per_case)
+            rows.append((material, required, per_case))
+            materials_by_id[material.id] = material
+            required_totals[material.id] = (
+                required_totals.get(material.id, ZERO) + required
+            )
+        per_line_reqs.append(rows)
+
+    # 2. One FIFO unit cost per material for the whole delivery.
+    unit_costs = {
+        material_id: _preview_fifo_unit_cost(materials_by_id[material_id], required)
+        for material_id, required in required_totals.items()
+    }
+
+    oh_per_case = overhead_per_case(month, additional_cases=total_cases)
+    # 3. Per-line breakdown; shared material costs are split back out.
+    out_lines = []
+    material_cost_total = ZERO
+    print_cost_total = ZERO
+    for line, rows in zip(lines, per_line_reqs):
+        qty_cases = Decimal(line["qty_cases"])
+        material_lines = []
+        line_material_cost = ZERO
+        for material, required, per_case in rows:
+            unit_cost = unit_costs[material.id]
+            wastage_factor = Decimal("1") + material.wastage_percent / Decimal("100")
+            line_cost = required * unit_cost * wastage_factor
+            line_material_cost += line_cost
+            material_lines.append(
+                {
+                    "material_id": material.id,
+                    "material": material.name,
+                    "unit": material.unit_of_measure,
+                    "qty_per_case": str(per_case),
+                    "qty_required": str(required),
+                    "fifo_unit_cost": str(unit_cost),
+                    "wastage_percent": str(material.wastage_percent),
+                    "line_cost": str(money(line_cost)),
+                    "line_cost_per_case": str(
+                        money(line_cost / qty_cases) if qty_cases > 0 else money(0)
+                    ),
+                }
+            )
+
+        print_per_case, print_breakdown = print_cost_per_case(line["sku"])
+        material_per_case = line_material_cost / qty_cases
+        base_per_case = material_per_case + print_per_case
+        material_cost_total += line_material_cost
+        print_cost_total += print_per_case * qty_cases
+        out_lines.append(
+            {
+                "sku": line["sku"].id,
+                "sku_description": line["sku"].description,
+                "qty_cases": str(round_qty(qty_cases)),
+                "materials_per_case": str(money(material_per_case)),
+                "print_per_case": str(money(print_per_case)),
+                "base_per_case": str(money(base_per_case)),
+                "overhead_per_case": str(money(oh_per_case)),
+                "per_case": str(money(base_per_case + oh_per_case)),
+                "total_cogs": str(money((base_per_case + oh_per_case) * qty_cases)),
+                "details": {"materials": material_lines, "print": print_breakdown},
+            }
+        )
+
+    base_total = material_cost_total + print_cost_total
+    base_per_case = base_total / total_cases
+    total_per_case = base_per_case + oh_per_case
+    return {
+        "month": month,
+        "lines": out_lines,
+        "cogs": {
+            "per_case": str(money(total_per_case)),
+            "base_per_case": str(money(base_per_case)),
+            "overhead_per_case": str(money(oh_per_case)),
+            "materials_per_case": str(money(material_cost_total / total_cases)),
+            "print_per_case": str(money(print_cost_total / total_cases)),
+            "details": {
+                "overhead": {
+                    "month": month,
+                    "total_monthly_overhead": str(money(overhead_for_month(month))),
+                    "cases_sold_in_month": str(
+                        cases_sold_in_month(month, include_cases=total_cases)
+                    ),
+                    "overhead_per_case": str(money(oh_per_case)),
+                    "note": (
+                        "LIVE estimate — recomputed as more deliveries land this "
+                        "month (confirmed assumption, no month-close lock in v1)."
+                    ),
+                }
+            },
+        },
+        "totals": {
+            "cases": str(round_qty(total_cases)),
+            "base_cogs": str(money(base_total)),
+            "cogs": str(money(total_per_case * total_cases)),
+        },
+        "shortfall": check_shortfall_many(
+            client, [(line["sku"], line["qty_cases"]) for line in lines]
+        ),
+    }
+
+
 class DeliveryShortfall(Exception):
     """Raised when stock is insufficient and force=False (spec 4.2 step 4)."""
 
@@ -481,6 +659,143 @@ def create_delivery(
     result["overhead_per_case_current"] = str(delivery.overhead_per_case_current)
     result["total_cogs_current"] = str(delivery.total_cogs)
     return delivery, result
+
+
+@transaction.atomic
+def create_deliveries(
+    client, lines, delivery_date=None, note: str = "", force: bool = False
+):
+    """
+    Multi-SKU delivery (spec 4.2): one client, one date, one note — saved as
+    one StockDelivery row per SKU line, so FIFO consumption, the frozen COGS
+    snapshot and the linked client-ledger entry behave exactly as they do for
+    a single-SKU delivery (the ledger shows one entry per SKU, as before).
+
+    `lines` = [{"sku": sku, "qty_cases": Decimal,
+                "selling_price_per_case": Decimal | None}, ...]
+
+    Atomic: the aggregated stock check runs BEFORE anything is written, and a
+    failure on any line rolls the whole delivery back — never half-saved.
+
+    Returns (deliveries, result_dict). Raises DeliveryShortfall (-> 409) or
+    ValueError (-> 400).
+    """
+    from .models import ClientSKUPrice
+
+    if delivery_date is None:
+        delivery_date = timezone_now_date()
+    if not lines:
+        raise ValueError("At least one SKU line is required.")
+
+    # 1. Normalise: one row per SKU, price defaulted from the client's own
+    #    ClientSKUPrice, duplicates rejected (an aggregated stock check would
+    #    double-count them and the ledger would be ambiguous).
+    normalised = []
+    seen_skus = set()
+    for line in lines:
+        sku = line["sku"]
+        try:
+            qty_cases = Decimal(str(line["qty_cases"]))
+        except Exception:
+            raise ValueError(f"Quantity is required for {sku.description}.")
+        if qty_cases <= 0:
+            raise ValueError(
+                f"Quantity must be greater than zero ({sku.description})."
+            )
+        if sku.id in seen_skus:
+            raise ValueError(
+                f"{sku.description} is listed twice — combine it into one line."
+            )
+        seen_skus.add(sku.id)
+
+        price = line.get("selling_price_per_case")
+        if price is None or price == "":
+            csp = ClientSKUPrice.objects.filter(client=client, sku=sku).first()
+            if csp is None:
+                raise ValueError(
+                    f"No selling price configured for {sku.description} — "
+                    "enter a price."
+                )
+            price = csp.selling_price_per_case
+        price = Decimal(str(price))
+        if price < 0:
+            raise ValueError(
+                f"Selling price cannot be negative ({sku.description})."
+            )
+        normalised.append(
+            {"sku": sku, "qty_cases": qty_cases, "selling_price_per_case": price}
+        )
+
+    # 2. ONE stock check for the whole delivery: materials shared by several
+    #    lines are summed, so a delivery that fits overall is not blocked
+    #    line by line (409 -> Proceed/Cancel, spec 4.2 step 4).
+    shortfall = check_shortfall_many(
+        client, [(l["sku"], l["qty_cases"]) for l in normalised]
+    )
+    if shortfall and not force:
+        raise DeliveryShortfall(shortfall)
+    # 3. Create the lines in order through the single-line path.
+    created = []
+    for line in normalised:
+        delivery, _line_result = create_delivery(
+            client,
+            line["sku"],
+            line["qty_cases"],
+            selling_price_per_case=line["selling_price_per_case"],
+            delivery_date=delivery_date,
+            note=note,
+            force=force,
+        )
+        created.append((delivery, line))
+
+    # 4. Live figures are read only AFTER every line exists, so the delivery
+    #    month's overhead is split over the delivery's final case count.
+    rows = []
+    total_cases = ZERO
+    total_amount = ZERO
+    total_cogs = ZERO
+    base_total = ZERO
+    for delivery, _line in created:
+        amount = money(delivery.qty_cases * delivery.selling_price_per_case)
+        base_total += delivery.base_cogs_per_case_snapshot * delivery.qty_cases
+        total_cases += delivery.qty_cases
+        total_amount += amount
+        total_cogs += delivery.total_cogs
+        rows.append(
+            {
+                "delivery_id": delivery.id,
+                "sku": delivery.sku_id,
+                "sku_description": delivery.sku.description,
+                "qty_cases": str(round_qty(delivery.qty_cases)),
+                "selling_price_per_case": str(money(delivery.selling_price_per_case)),
+                "amount": str(amount),
+                "base_cogs_per_case": str(money(delivery.base_cogs_per_case_snapshot)),
+                "overhead_per_case": str(money(delivery.overhead_per_case_current)),
+                "cogs_per_case": str(money(delivery.cogs_per_case_current)),
+                "total_cogs": str(money(delivery.total_cogs)),
+                "stock_shortfall_flag": delivery.stock_shortfall_flag,
+            }
+        )
+
+    month = month_key(delivery_date)
+    base_per_case = base_total / total_cases if total_cases > 0 else ZERO
+    oh_per_case = overhead_per_case(month)
+    return [delivery for delivery, _line in created], {
+        "month": month,
+        "lines": rows,
+        "cogs": {
+            "per_case": str(money(base_per_case + oh_per_case)),
+            "base_per_case": str(money(base_per_case)),
+            "overhead_per_case": str(money(oh_per_case)),
+        },
+        "total_cases": str(round_qty(total_cases)),
+        "total_amount": str(money(total_amount)),
+        "total_cogs_current": str(money(total_cogs)),
+        "client_pending_amount": str(client.pending_amount),
+        "stock_shortfall_flag": any(
+            delivery.stock_shortfall_flag for delivery, _line in created
+        ),
+    }
 
 
 def apply_stock_adjustment(

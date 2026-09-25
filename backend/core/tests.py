@@ -13,8 +13,11 @@ from .cogs import (
     DeliveryShortfall,
     apply_stock_adjustment,
     check_shortfall,
+    check_shortfall_many,
     consume_fifo,
+    create_deliveries,
     create_delivery,
+    stock_available,
 )
 from .models import (
     Client,
@@ -1009,6 +1012,273 @@ class DashboardSummaryTests(TestCase):
         self.assertEqual(payload["stats"]["inward_materials"][0]["quantity"], "50")
         stock = {s["name"]: s for s in payload["stock"]}
         self.assertEqual(stock["Bottle API"]["stock_in_hand"], "43")  # 50 − 7
+
+
+class MultiSKUDeliveryTests(TestCase):
+    """
+    User request: ONE delivery can carry several SKUs, each with its own
+    quantity (and price).
+
+    Stored as one StockDelivery row per line, so FIFO consumption, the frozen
+    COGS snapshot and the generated ledger entry stay exactly as before — but
+    the stock check covers the delivery as a whole (shared materials summed)
+    and the shared FIFO queue is walked oldest-first ACROSS the lines.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.client_obj = Client.objects.create(name="Multi Client")
+        self.sku_a = SKU.objects.create(
+            description="500ml A", qty_per_case=D("24"), volume_ml=500
+        )
+        self.sku_b = SKU.objects.create(
+            description="1L B", qty_per_case=D("12"), volume_ml=1000
+        )
+        # Shared raw material: 1 bottle per case of A, 2 per case of B.
+        self.bottle = make_material("Bottle shared", "10")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku_a, material=self.bottle, qty_per_case=D("1")
+        )
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku_b, material=self.bottle, qty_per_case=D("2")
+        )
+        make_batch(self.bottle, "30", "10", arrival=date(2026, 8, 1))
+        make_batch(self.bottle, "30", "20", arrival=date(2026, 9, 1))
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku_a, selling_price_per_case=D("300")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku_b, selling_price_per_case=D("500")
+        )
+
+    def bulk(self, lines, **overrides):
+        payload = {
+            "client": self.client_obj.id,
+            "date": "2026-09-20",
+            "note": "Route 1",
+            "lines": lines,
+            **overrides,
+        }
+        return self.api.post("/api/deliveries/bulk/", payload, format="json")
+
+    def preview(self, lines):
+        return self.api.post(
+            "/api/deliveries/preview/",
+            {"client": self.client_obj.id, "date": "2026-09-20", "lines": lines},
+            format="json",
+        )
+
+    def test_bulk_saves_one_row_and_ledger_entry_per_sku(self):
+        resp = self.bulk(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "4"},
+                {"sku": self.sku_b.id, "qty_cases": "3"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(StockDelivery.objects.count(), 2)
+        rows = resp.data["lines"]
+        self.assertEqual([r["sku_description"] for r in rows], ["500ml A", "1L B"])
+        self.assertEqual(D(rows[0]["qty_cases"]), D("4"))
+        self.assertEqual(rows[0]["selling_price_per_case"], "300.00")  # auto-filled
+        self.assertEqual(rows[0]["amount"], "1200.00")  # 4 x 300
+        self.assertEqual(rows[1]["amount"], "1500.00")  # 3 x 500, auto-filled
+        self.assertEqual(D(resp.data["total_cases"]), D("7"))
+        self.assertEqual(resp.data["total_amount"], "2700.00")
+        self.assertEqual(resp.data["client_pending_amount"], "2700.00")
+        self.assertFalse(resp.data["stock_shortfall_flag"])
+        self.assertGreater(D(resp.data["cogs"]["per_case"]), D("0"))
+        # One ledger entry per SKU line, carrying the delivery's date/note.
+        entries = ClientLedgerEntry.objects.filter(entry_type="DELIVERY")
+        self.assertEqual(entries.count(), 2)
+        self.assertEqual({e.note for e in entries}, {"Route 1"})
+        self.assertEqual({e.date for e in entries}, {date(2026, 9, 20)})
+        self.assertEqual(
+            sum((e.amount for e in entries), D("0")), D("2700.00")
+        )
+
+    def test_price_can_be_overridden_per_line(self):
+        resp = self.bulk(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "2", "selling_price_per_case": "250"},
+                {"sku": self.sku_b.id, "qty_cases": "1", "selling_price_per_case": "450"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["lines"][0]["amount"], "500.00")
+        self.assertEqual(resp.data["lines"][1]["amount"], "450.00")
+        self.assertEqual(resp.data["total_amount"], "950.00")
+
+    def test_lines_share_one_fifo_queue_and_exact_stock_is_accepted(self):
+        """
+        20 cases of A (20 bottles) + 20 cases of B (40 bottles) = the 60
+        bottles in stock: accepted (not reported short), and the shared queue
+        is walked oldest-first ACROSS the lines.
+        """
+        resp = self.bulk(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "20"},
+                {"sku": self.sku_b.id, "qty_cases": "20"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertFalse(resp.data["stock_shortfall_flag"])
+        rows = resp.data["lines"]
+        # A only consumes the August batch (20 x 10 = 200 => 10.00/case)
+        self.assertEqual(rows[0]["base_cogs_per_case"], "10.00")
+        # B then takes the 10 left in August (10 x 10) and 30 from the
+        # September batch (30 x 20) = 700 over 20 cases = 35.00/case.
+        self.assertEqual(rows[1]["base_cogs_per_case"], "35.00")
+        self.assertEqual(
+            sum((b.quantity_remaining for b in self.bottle.batches.all()), D("0")),
+            D("0"),
+        )
+
+    def test_stock_is_checked_for_the_whole_delivery(self):
+        """
+        Each line fits on its own (A needs 50 of 60, B needs 20 of 60) but the
+        delivery as a whole does not (70 > 60) -> 409 with the summed figures,
+        nothing saved; "Proceed anyway" (force) saves both lines flagged.
+        """
+        resp = self.bulk(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "50"},
+                {"sku": self.sku_b.id, "qty_cases": "10"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 409)
+        short = resp.data["shortfall"]
+        self.assertEqual(len(short), 1)  # one shared material, summed
+        self.assertEqual(short[0]["material"], "Bottle shared")
+        self.assertEqual(D(short[0]["required"]), D("70"))
+        self.assertEqual(D(short[0]["available"]), D("60"))
+        self.assertEqual(D(short[0]["short_by"]), D("10"))
+        self.assertEqual(StockDelivery.objects.count(), 0)
+        self.assertEqual(ClientLedgerEntry.objects.count(), 0)
+
+        resp = self.bulk(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "50"},
+                {"sku": self.sku_b.id, "qty_cases": "10"},
+            ],
+            force=True,
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(resp.data["stock_shortfall_flag"])
+        self.assertEqual(StockDelivery.objects.count(), 2)
+        # The flag is per-row (as in the single-delivery flow): line B is the
+        # one that drove a batch negative — line A still fitted on its own at
+        # its moment of creation. The response carries the aggregate any(...).
+        by_sku = {
+            d.sku.description: d.stock_shortfall_flag
+            for d in StockDelivery.objects.all()
+        }
+        self.assertEqual(by_sku, {"500ml A": False, "1L B": True})
+        self.assertTrue(any(by_sku.values()))
+
+    def test_validation_errors_and_atomicity(self):
+        # No lines at all.
+        self.assertEqual(
+            self.api.post(
+                "/api/deliveries/bulk/",
+                {"client": self.client_obj.id},
+                format="json",
+            ).status_code,
+            400,
+        )
+        # Unknown SKU.
+        self.assertEqual(
+            self.bulk([{"sku": 99999, "qty_cases": "1"}]).status_code,
+            400,
+        )
+        # Same SKU twice is ambiguous -> rejected, nothing saved.
+        resp = self.bulk(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "1"},
+                {"sku": self.sku_a.id, "qty_cases": "2"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("listed twice", resp.data["detail"])
+        # A bad line later in the list leaves the whole delivery unsaved.
+        resp = self.bulk(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "1"},
+                {"sku": self.sku_b.id, "qty_cases": "0"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(StockDelivery.objects.count(), 0)
+        self.assertEqual(ClientLedgerEntry.objects.count(), 0)
+        # Stock untouched by rejected attempts.
+        self.assertEqual(stock_available(self.bottle), D("60"))
+
+    def test_missing_price_is_rejected_for_the_offending_sku(self):
+        other = SKU.objects.create(description="Unpriced", qty_per_case=D("12"))
+        SKUMaterialRequirement.objects.create(
+            sku=other, material=self.bottle, qty_per_case=D("1")
+        )
+        resp = self.bulk(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "1"},
+                {"sku": other.id, "qty_cases": "1"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("No selling price configured for Unpriced", resp.data["detail"])
+        self.assertEqual(StockDelivery.objects.count(), 0)
+
+    def test_multi_preview_breaks_down_per_line_without_touching_stock(self):
+        resp = self.preview(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "2"},
+                {"sku": self.sku_b.id, "qty_cases": "3"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(
+            [l["sku_description"] for l in resp.data["lines"]],
+            ["500ml A", "1L B"],
+        )
+        self.assertEqual(D(resp.data["totals"]["cases"]), D("5"))
+        self.assertEqual(resp.data["shortfall"], [])
+        line_a, line_b = resp.data["lines"]
+        self.assertEqual(line_a["materials_per_case"], "10.00")
+        self.assertEqual(line_b["materials_per_case"], "20.00")
+        self.assertEqual(line_a["print_per_case"], "0.00")
+        # Nothing was written and FIFO queue is untouched.
+        self.assertEqual(StockDelivery.objects.count(), 0)
+        self.assertEqual(stock_available(self.bottle), D("60"))
+
+    def test_multi_preview_sums_the_shortfall_per_material(self):
+        resp = self.preview(
+            [
+                {"sku": self.sku_a.id, "qty_cases": "50"},
+                {"sku": self.sku_b.id, "qty_cases": "10"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 200)
+        short = resp.data["shortfall"]
+        self.assertEqual(short[0]["material"], "Bottle shared")
+        self.assertEqual(D(short[0]["required"]), D("70"))
+        self.assertEqual(D(short[0]["available"]), D("60"))
+        self.assertEqual(D(short[0]["short_by"]), D("10"))
+
+    def test_single_sku_preview_backward_compatibility(self):
+        resp = self.api.post(
+            "/api/deliveries/preview/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku_a.id,
+                "qty_cases": "2",
+                "date": "2026-09-20",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertIn("cogs", resp.data)
+        self.assertEqual(resp.data["default_selling_price"], "300.00")
+        self.assertIn("shortfall", resp.data)
 
 
 

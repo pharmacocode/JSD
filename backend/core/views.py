@@ -11,7 +11,12 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import cogs
-from .cogs import DeliveryShortfall, apply_stock_adjustment, create_delivery
+from .cogs import (
+    DeliveryShortfall,
+    apply_stock_adjustment,
+    create_deliveries,
+    create_delivery,
+)
 from .models import (
     Client,
     ClientLedgerEntry,
@@ -700,22 +705,153 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         )
 
     @action(detail=False, methods=["post"])
+    def bulk(self, request):
+        """
+        Multi-SKU delivery (spec 4.2) — one client, one date, one note:
+        POST {client, date, note, force,
+              lines: [{sku, qty_cases, selling_price_per_case}]}
+
+        Creates one StockDelivery per line (each with its own frozen COGS
+        snapshot and generated client-ledger entry) inside a single
+        transaction, so the delivery is never half-saved. The stock check is
+        aggregated across the lines: a 409 carries the summed shortfall list
+        and the same request with force=true proceeds ("Proceed anyway").
+        """
+        from datetime import date as date_cls
+
+        client = Client.objects.filter(pk=request.data.get("client")).first()
+        if client is None:
+            return Response(
+                {"detail": "client is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_lines = request.data.get("lines") or []
+        if not raw_lines:
+            return Response(
+                {"detail": "lines is required (at least one SKU with a quantity)"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        lines = []
+        for raw in raw_lines:
+            sku = SKU.objects.filter(pk=raw.get("sku")).first()
+            if sku is None:
+                return Response(
+                    {"detail": "Every line needs a valid sku"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                qty_cases = Decimal(str(raw.get("qty_cases")))
+            except (InvalidOperation, TypeError, ValueError):
+                return Response(
+                    {"detail": f"qty_cases is required for {sku.description}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            raw_price = raw.get("selling_price_per_case")
+            try:
+                price = (
+                    Decimal(str(raw_price)) if raw_price not in (None, "") else None
+                )
+            except (InvalidOperation, TypeError, ValueError):
+                return Response(
+                    {"detail": f"Invalid selling price for {sku.description}"},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            lines.append({"sku": sku, "qty_cases": qty_cases,
+                          "selling_price_per_case": price})
+
+        date_value = request.data.get("date")
+        date_value = date_cls.fromisoformat(date_value) if date_value else None
+        force = str(request.data.get("force", "")).lower() in ("1", "true", "yes")
+
+        try:
+            deliveries, result = create_deliveries(
+                client,
+                lines,
+                delivery_date=date_value,
+                note=request.data.get("note", ""),
+                force=force,
+            )
+        except DeliveryShortfall as exc:
+            # Spec 4.2 step 4: clear warning payload -> Proceed/Cancel UI.
+            return Response(
+                {
+                    "detail": (
+                        "Insufficient stock — you can proceed and adjust "
+                        "stock later, or cancel."
+                    ),
+                    "shortfall": exc.shortages,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+            )
+        return Response(
+            {
+                "deliveries": [StockDeliverySerializer(d).data for d in deliveries],
+                "lines": result["lines"],
+                "cogs": result["cogs"],
+                "total_cases": result["total_cases"],
+                "total_amount": result["total_amount"],
+                "total_cogs_current": result["total_cogs_current"],
+                "client_pending_amount": result["client_pending_amount"],
+                "stock_shortfall_flag": result["stock_shortfall_flag"],
+            },
+            status=status.HTTP_201_CREATED,
+        )
+
+    @action(detail=False, methods=["post"])
     def preview(self, request):
         """Non-mutating COGS + shortfall preview for the Add-Delivery screen."""
         from datetime import date as date_cls
 
         client = Client.objects.filter(pk=request.data.get("client")).first()
-        sku = SKU.objects.filter(pk=request.data.get("sku")).first()
-        if client is None or sku is None:
+        if client is None:
             return Response(
-                {"detail": "client and sku are required"},
+                {"detail": "client is required"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
-        qty_cases = Decimal(str(request.data.get("qty_cases", "1")))
         date_value = request.data.get("date")
         date_value = (
             date_cls.fromisoformat(date_value) if date_value else timezone.now().date()
         )
+
+        # Multi-SKU preview — POST {client, date, lines: [{sku, qty_cases}]}:
+        # one card for the whole delivery (per-line breakdown + aggregate
+        # totals + the shortfall summed per material across the lines).
+        raw_lines = request.data.get("lines")
+        if raw_lines is not None:
+            parsed = []
+            for raw in raw_lines:
+                line_sku = SKU.objects.filter(pk=raw.get("sku")).first()
+                if line_sku is None:
+                    return Response(
+                        {"detail": "Every line needs a valid sku"},
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                try:
+                    line_qty = Decimal(str(raw.get("qty_cases")))
+                except (InvalidOperation, TypeError, ValueError):
+                    return Response(
+                        {
+                            "detail": (
+                                f"qty_cases is required for {line_sku.description}"
+                            )
+                        },
+                        status=status.HTTP_400_BAD_REQUEST,
+                    )
+                parsed.append({"sku": line_sku, "qty_cases": line_qty})
+            return Response(cogs.preview_deliveries(client, parsed, date_value))
+
+        sku = SKU.objects.filter(pk=request.data.get("sku")).first()
+        if sku is None:
+            return Response(
+                {"detail": "sku is required"},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        qty_cases = Decimal(str(request.data.get("qty_cases", "1")))
         result = cogs.estimate_cogs(sku, client, qty_cases, date_value, preview=True)
         # Default selling price for display (auto-fill, spec 4.2 step 3).
         csp = ClientSKUPrice.objects.filter(client=client, sku=sku).first()

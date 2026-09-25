@@ -1,12 +1,14 @@
 <script setup>
 /**
- * Add Delivery (spec 4.2) — single screen.
+ * Add Delivery (spec 4.2) — single screen, multi-SKU.
  *
- * Everything for one delivery lives on one page: search and pick the client,
- * tap one of that client's preferred SKUs, enter qty / price / date / note,
- * watch the live COGS breakdown, then submit. A stock shortfall (HTTP 409)
- * opens the Proceed anyway / Cancel banner inline instead of a separate step,
- * and a successful submit swaps the form for the confirmation card.
+ * Everything for one delivery run lives on one page: search and pick the
+ * client, tap any number of that client's preferred SKUs to add a line, set
+ * each line's qty / price, enter date / note, watch the live aggregate COGS
+ * + shortfall preview, then submit the whole run in one atomic request. A
+ * stock shortfall (HTTP 409) opens the Proceed anyway / Cancel banner inline
+ * instead of a separate step, and a successful submit swaps the form for the
+ * confirmation card.
  */
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
@@ -20,9 +22,8 @@ const search = ref('')
 const clients = ref([])
 const client = ref(null)
 const skus = ref([])
-const sku = ref(null)
-const qty = ref(1)
-const price = ref(null)
+// One row per selected SKU: { entry, qty, price } (spec 4.2 multi-SKU).
+const lines = ref([])
 const date = ref(today())
 const note = ref('')
 const preview = ref(null)
@@ -54,76 +55,101 @@ onMounted(() => loadClients(''))
 
 function pickClient(c) {
   client.value = c
-  sku.value = null
-  price.value = null
+  lines.value = []
   // Only SKUs the client has a ClientSKUPrice for (preferred).
   skus.value = c.sku_prices || []
 }
 
 function changeClient() {
   client.value = null
-  sku.value = null
+  lines.value = []
   skus.value = []
-  price.value = null
   preview.value = null
   search.value = ''
   loadClients('')
 }
 
-function pickSku(entry) {
-  sku.value = entry
-  price.value = String(entry.selling_price_per_case) // auto-fill, editable
+// SKU chips act as toggles: tap to add a line, tap again to remove it.
+// The price is pre-filled from the client's SKU price but stays editable.
+function toggleSku(entry) {
+  const i = lines.value.findIndex((l) => l.entry.sku === entry.sku)
+  if (i >= 0) {
+    lines.value.splice(i, 1)
+  } else {
+    lines.value.push({
+      entry,
+      qty: 1,
+      price: String(entry.selling_price_per_case),
+    })
+  }
 }
 
-// Live COGS preview (materials + print + this month's overhead allocation).
-watch([() => client.value?.id, () => sku.value?.sku, qty, date], async () => {
-  if (!client.value || !sku.value || !qty.value) {
-    preview.value = null
-    return
-  }
-  try {
-    preview.value = await api.post('/deliveries/preview/', {
-      client: client.value.id,
-      sku: sku.value.sku,
-      qty_cases: String(qty.value),
-      date: date.value,
-    })
-  } catch {
-    preview.value = null
-  }
-})
+function removeLine(i) {
+  lines.value.splice(i, 1)
+}
 
-// Raw-material subtotal shown in the COGS card.
-const materialsCost = computed(() =>
-  (preview.value?.cogs?.details?.materials || []).reduce(
-    (sum, m) => sum + Number(m.line_cost_per_case),
-    0
+const isPicked = (entry) => lines.value.some((l) => l.entry.sku === entry.sku)
+
+// Live aggregate COGS preview (materials + print + this month's overhead
+// allocation) for the whole run — one request whenever the lines, client or
+// date change. Prices do not affect COGS, so a price edit only recomputes
+// the locally-derived delivery value below.
+watch(
+  [() => client.value?.id, () => date.value, lines],
+  async () => {
+    const active = lines.value.filter((l) => Number(l.qty) > 0)
+    if (!client.value || !active.length) {
+      preview.value = null
+      return
+    }
+    try {
+      preview.value = await api.post('/deliveries/preview/', {
+        client: client.value.id,
+        date: date.value,
+        lines: active.map((l) => ({
+          sku: l.entry.sku,
+          qty_cases: String(l.qty),
+        })),
+      })
+    } catch {
+      preview.value = null
+    }
+  },
+  { deep: true }
+)
+
+// Delivery value = sum(line qty × line price) — client-specific prices.
+const deliveryValue = computed(() =>
+  lines.value.reduce((sum, l) => sum + Number(l.qty) * Number(l.price || 0), 0)
+)
+
+const canSubmit = computed(() => {
+  if (loading.value || !client.value || !lines.value.length) return false
+  return lines.value.every(
+    (l) =>
+      Number(l.qty) > 0 &&
+      l.price !== null &&
+      l.price !== '' &&
+      Number(l.price) >= 0
   )
-)
-
-const canSubmit = computed(
-  () =>
-    !!client.value &&
-    !!sku.value &&
-    Number(qty.value) > 0 &&
-    price.value !== null &&
-    price.value !== '' &&
-    !loading.value
-)
+})
 
 async function submit(force = false) {
   error.value = ''
   shortfall.value = null
   loading.value = true
   try {
-    result.value = await api.post('/deliveries/', {
+    // One atomic request for every line — never a half-saved delivery.
+    result.value = await api.post('/deliveries/bulk/', {
       client: client.value.id,
-      sku: sku.value.sku,
-      qty_cases: String(qty.value),
-      selling_price_per_case: String(price.value),
       date: date.value,
       note: note.value,
       force,
+      lines: lines.value.map((l) => ({
+        sku: l.entry.sku,
+        qty_cases: String(l.qty),
+        selling_price_per_case: String(l.price),
+      })),
     })
   } catch (e) {
     if (e.status === 409) {
@@ -139,10 +165,8 @@ async function submit(force = false) {
 // Start the next delivery without leaving the page.
 function reset() {
   client.value = null
-  sku.value = null
+  lines.value = []
   skus.value = []
-  qty.value = 1
-  price.value = null
   date.value = today()
   note.value = ''
   preview.value = null
@@ -172,11 +196,31 @@ function reset() {
       <v-card class="mb-3">
         <v-list density="compact">
           <v-list-item
-            :title="`${client?.name} · ${sku?.sku_description}`"
-            :subtitle="`${num(result.delivery?.qty_cases)} cases · ${money(
-              result.delivery?.selling_price_per_case
-            )} / case`"
+            :title="`${client?.name} · ${num(result.total_cases)} cases across ${
+              result.lines.length
+            } SKU${result.lines.length > 1 ? 's' : ''}`"
+            :subtitle="`${money(result.total_amount)} total`"
           />
+          <template v-for="row in result.lines" :key="row.delivery_id">
+            <v-divider />
+            <v-list-item
+              :title="row.sku_description"
+              :subtitle="`${num(row.qty_cases)} cases × ${money(
+                row.selling_price_per_case
+              )} / case`"
+            >
+              <template #append>
+                <div class="text-right">
+                  <div class="text-body-2 font-weight-bold">
+                    {{ money(row.amount) }}
+                  </div>
+                  <div class="text-caption" style="opacity: 0.8">
+                    COGS {{ money(row.cogs_per_case) }}/case
+                  </div>
+                </div>
+              </template>
+            </v-list-item>
+          </template>
           <v-divider />
           <v-list-item title="COGS (frozen snapshot)">
             <template #append>
@@ -218,7 +262,8 @@ function reset() {
       <div class="mb-4">
         <div class="text-subtitle-1 font-weight-bold">New delivery</div>
         <div class="text-caption text-medium-emphasis">
-          Client → SKU → quantity &amp; price. COGS updates as you type.
+          Client → SKUs → quantity &amp; price per line. COGS updates as you
+          type.
         </div>
       </div>
 
@@ -276,7 +321,7 @@ function reset() {
         </v-card-text>
       </v-card>
 
-      <!-- 2. SKU (client's preferred SKUs) -->
+      <!-- 2. SKUs (client's preferred SKUs) — tap to add / remove a line -->
       <v-card class="mb-3" :disabled="!client">
         <v-card-title
           class="d-flex align-center text-subtitle-1 font-weight-bold"
@@ -289,7 +334,7 @@ function reset() {
           >
             2
           </v-avatar>
-          SKU
+          SKUs
         </v-card-title>
         <v-divider />
         <v-card-text>
@@ -297,9 +342,9 @@ function reset() {
             <v-btn
               v-for="entry in skus"
               :key="entry.id"
-              :color="sku?.id === entry.id ? 'primary' : undefined"
-              :variant="sku?.id === entry.id ? 'elevated' : 'outlined'"
-              @click="pickSku(entry)"
+              :color="isPicked(entry) ? 'primary' : undefined"
+              :variant="isPicked(entry) ? 'elevated' : 'outlined'"
+              @click="toggleSku(entry)"
             >
               {{ entry.sku_description }}
               <span class="text-caption ml-1">
@@ -307,6 +352,9 @@ function reset() {
               </span>
             </v-btn>
           </div>
+          <p v-if="lines.length" class="text-caption mb-0">
+            Tap a selected SKU again to remove its line.
+          </p>
           <v-alert
             v-if="client && !skus.length"
             type="info"
@@ -322,8 +370,8 @@ function reset() {
           </p>
         </v-card-text>
       </v-card>
-      <!-- 3. Quantity, price, date -->
-      <v-card class="mb-3" :disabled="!sku">
+      <!-- 3. Lines: quantity & price per selected SKU, plus date / note -->
+      <v-card class="mb-3" :disabled="!lines.length">
         <v-card-title
           class="d-flex align-center text-subtitle-1 font-weight-bold"
         >
@@ -335,55 +383,94 @@ function reset() {
           >
             3
           </v-avatar>
-          Quantity &amp; price
+          Quantity &amp; price per line
         </v-card-title>
         <v-divider />
         <v-card-text>
           <v-text-field v-model="date" type="date" label="Delivery date" />
-          <v-text-field
-            v-model.number="qty"
-            type="number"
-            min="1"
-            label="Quantity (cases)"
-          />
-          <!-- Short label; the "auto-filled, editable" note moved into the
-               hint instead of being crammed into the label. -->
-          <v-text-field
-            v-model="price"
-            type="number"
-            min="0"
-            label="Selling price per case"
-            prefix="₹"
-            hint="Pre-filled from the client's SKU price — editable"
-            persistent-hint
-          />
+          <div
+            v-for="(line, i) in lines"
+            :key="line.entry.sku"
+            :class="{ 'mb-4 pb-4 border-b': i < lines.length - 1 }"
+          >
+            <div class="d-flex align-center mb-1">
+              <span class="text-subtitle-2 font-weight-bold">
+                {{ line.entry.sku_description }}
+              </span>
+              <v-spacer />
+              <v-btn
+                icon="mdi-close"
+                size="small"
+                variant="text"
+                :aria-label="`Remove ${line.entry.sku_description}`"
+                @click="removeLine(i)"
+              />
+            </div>
+            <v-text-field
+              v-model.number="line.qty"
+              type="number"
+              min="1"
+              label="Quantity (cases)"
+              density="comfortable"
+            />
+            <!-- Short label; the "auto-filled, editable" note moved into the
+                 hint instead of being crammed into the label. -->
+            <v-text-field
+              v-model="line.price"
+              type="number"
+              min="0"
+              label="Selling price per case"
+              prefix="₹"
+              hint="Pre-filled from the client's SKU price — editable"
+              persistent-hint
+              density="comfortable"
+            />
+          </div>
           <v-text-field v-model="note" label="Note (optional)" class="mt-2" />
-          <p v-if="!sku" class="text-caption text-medium-emphasis mb-0">
-            Pick a SKU to enter quantity and price.
-          </p>
         </v-card-text>
       </v-card>
 
-      <!-- Live COGS breakdown. Every figure is per case, stated once in the
-           label, instead of repeating " / case" on every row. -->
+      <!-- Live COGS breakdown for the whole run: per-line rows on top, then
+           the aggregate split stated once per case (spec 4.2). -->
       <v-card v-if="preview" variant="tonal" color="primary" class="mb-3">
         <v-card-text>
           <div class="text-caption font-weight-bold text-uppercase">
-            Estimated COGS (per case)
+            Estimated COGS (per case, whole run)
           </div>
           <div class="text-h6 font-weight-bold">
             {{ money(preview.cogs.per_case) }}
           </div>
           <v-table density="compact" class="bg-transparent mt-2">
+            <thead>
+              <tr>
+                <th class="px-0 text-left">SKU</th>
+                <th class="px-0 text-right">Cases</th>
+                <th class="px-0 text-right">COGS / case</th>
+                <th class="px-0 text-right">Line COGS</th>
+              </tr>
+            </thead>
+            <tbody>
+              <tr v-for="line in preview.lines" :key="line.sku">
+                <td class="px-0 text-body-2">{{ line.sku_description }}</td>
+                <td class="text-right px-0">{{ num(line.qty_cases) }}</td>
+                <td class="text-right px-0">{{ money(line.per_case) }}</td>
+                <td class="text-right px-0">{{ money(line.total_cogs) }}</td>
+              </tr>
+            </tbody>
+          </v-table>
+          <v-divider class="my-2" />
+          <v-table density="compact" class="bg-transparent">
             <tbody>
               <tr>
                 <td class="px-0 text-body-2">Raw materials (incl. wastage)</td>
-                <td class="text-right px-0">{{ money(materialsCost) }}</td>
+                <td class="text-right px-0">
+                  {{ money(preview.cogs.materials_per_case) }}
+                </td>
               </tr>
               <tr>
                 <td class="px-0 text-body-2">Print / label (incl. wastage)</td>
                 <td class="text-right px-0">
-                  {{ money(preview.cogs.details.print?.cost_per_case || 0) }}
+                  {{ money(preview.cogs.print_per_case) }}
                 </td>
               </tr>
               <tr>
@@ -395,7 +482,7 @@ function reset() {
                   </div>
                 </td>
                 <td class="text-right px-0">
-                  {{ money(preview.cogs.details.overhead.overhead_per_case) }}
+                  {{ money(preview.cogs.overhead_per_case) }}
                 </td>
               </tr>
               <tr class="font-weight-bold">
@@ -406,12 +493,33 @@ function reset() {
           </v-table>
           <div class="text-caption mt-2" style="opacity: 0.9">
             Delivery value
-            <strong>{{ money(Number(qty) * Number(price || 0)) }}</strong>
-            · Total COGS
-            <strong>{{ money(Number(qty) * Number(preview.cogs.per_case)) }}</strong>
+            <strong>{{ money(deliveryValue) }}</strong>
+            · Total COGS (run)
+            <strong>{{ money(preview.totals.cogs) }}</strong>
           </div>
         </v-card-text>
       </v-card>
+
+      <!-- Preview shortfall: warn about stock before submitting (4.2 step 4).
+           Hidden once the submit-time banner below takes over. -->
+      <v-alert
+        v-if="preview?.shortfall?.length && !shortfall"
+        type="warning"
+        variant="tonal"
+        density="compact"
+        class="mb-3"
+      >
+        <div class="font-weight-bold mb-1">Stock shortfall (preview)</div>
+        <div
+          v-for="s in preview.shortfall"
+          :key="s.material_id"
+          class="text-body-2"
+        >
+          <strong>{{ s.material }}</strong> — short by
+          {{ num(s.short_by) }} {{ s.unit }} (need {{ num(s.required) }}, have
+          {{ num(s.available) }})
+        </div>
+      </v-alert>
 
       <!-- Shortfall banner: Proceed anyway / Cancel (spec 4.2) -->
       <v-alert v-if="shortfall" type="warning" variant="elevated" class="mb-3">
