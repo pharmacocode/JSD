@@ -8,7 +8,7 @@ defineEmits(['action'])
 </script>
 
 <template>
-  <div class="text-center pa-8 text-medium-contrast">
+  <div class="text-center pa-8 text-medium-emphasis">
     <v-icon size="48" color="grey">{{ icon }}</v-icon>
     <p class="mt-2 text-body-1">{{ text }}</p>
     <v-btn

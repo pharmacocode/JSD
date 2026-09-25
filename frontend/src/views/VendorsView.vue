@@ -148,7 +148,7 @@ async function savePayment() {
         >
           <template #append>
             <div class="text-right mr-1">
-              <div class="text-caption text-medium-contrast">we owe</div>
+              <div class="text-caption text-medium-emphasis">we owe</div>
               <v-chip
                 :color="Number(v.amount_owed) > 0 ? 'error' : 'success'"
                 size="small"
@@ -266,7 +266,7 @@ async function savePayment() {
                 <td class="text-right">{{ money(p.amount) }}</td>
               </tr>
               <tr v-if="!payments.length">
-                <td colspan="3" class="text-medium-contrast">
+                <td colspan="3" class="text-medium-emphasis">
                   No payments recorded yet.
                 </td>
               </tr>

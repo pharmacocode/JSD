@@ -106,7 +106,7 @@ async function save() {
         />
         <div
           v-if="material"
-          class="text-caption mb-2 text-medium-contrast"
+          class="text-caption mb-2 text-medium-emphasis"
         >
           Current stock in hand:
           <strong>

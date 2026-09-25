@@ -235,7 +235,7 @@ async function deletePayment(p) {
                   <tr v-for="e in employees" :key="e.id">
                     <td>
                       {{ e.name }}
-                      <span class="text-caption text-medium-contrast">
+                      <span class="text-caption text-medium-emphasis">
                         {{ e.role }}
                       </span>
                       <v-chip
@@ -259,7 +259,7 @@ async function deletePayment(p) {
                     </td>
                   </tr>
                   <tr v-if="!employees.length">
-                    <td colspan="3" class="text-medium-contrast">
+                    <td colspan="3" class="text-medium-emphasis">
                       No employees yet — use Add employee.
                     </td>
                   </tr>
@@ -284,14 +284,14 @@ async function deletePayment(p) {
                     </td>
                   </tr>
                   <tr v-if="!payments.length">
-                    <td colspan="4" class="text-medium-contrast">
+                    <td colspan="4" class="text-medium-emphasis">
                       No payments logged for this month.
                     </td>
                   </tr>
                 </tbody>
               </v-table>
 
-              <div class="text-caption text-medium-contrast mt-2">
+              <div class="text-caption text-medium-emphasis mt-2">
                 Labour total = sum of the payments above. It updates
                 automatically — there is no manual entry.
               </div>
@@ -370,7 +370,7 @@ async function deletePayment(p) {
             hide-details
             density="compact"
           />
-          <div class="text-caption text-medium-contrast mt-1">
+          <div class="text-caption text-medium-emphasis mt-1">
             Inactive employees stay in the list — their logged payments keep
             their month's Labour total intact.
           </div>

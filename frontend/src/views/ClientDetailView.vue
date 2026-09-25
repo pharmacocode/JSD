@@ -189,7 +189,7 @@ async function deleteEntry(entry) {
             </td>
           </tr>
           <tr v-if="!client.sku_prices?.length">
-            <td colspan="2" class="text-medium-contrast">
+            <td colspan="2" class="text-medium-emphasis">
               No SKUs configured — edit the client to add them.
             </td>
           </tr>
@@ -252,7 +252,7 @@ async function deleteEntry(entry) {
                   >
                     {{ Number(e.amount) >= 0 ? '+' : '' }}{{ money(e.amount) }}
                   </div>
-                  <div class="text-caption text-medium-contrast">
+                  <div class="text-caption text-medium-emphasis">
                     {{
                       e.running_balance
                         ? `bal ${money(e.running_balance)}`

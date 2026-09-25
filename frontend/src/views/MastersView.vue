@@ -51,7 +51,7 @@ const sections = [
         </v-avatar>
         <div class="ml-4">
           <div class="font-weight-bold">{{ s.title }}</div>
-          <div class="text-caption text-medium-contrast">{{ s.subtitle }}</div>
+          <div class="text-caption text-medium-emphasis">{{ s.subtitle }}</div>
         </div>
         <v-spacer />
         <v-icon>mdi-chevron-right</v-icon>

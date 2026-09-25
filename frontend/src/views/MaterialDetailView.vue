@@ -108,7 +108,7 @@ onMounted(load)
           <tr
             v-for="b in batches"
             :key="b.id"
-            :class="b.is_deleted ? 'text-medium-contrast' : ''"
+            :class="b.is_deleted ? 'text-medium-emphasis' : ''"
           >
             <td>{{ b.arrival_date }}</td>
             <td class="text-right">{{ num(b.quantity_received) }}</td>

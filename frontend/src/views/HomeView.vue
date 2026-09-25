@@ -106,6 +106,10 @@ const chart = computed(() => {
     const rows = stats.value.cases_sold_per_sku || []
     return {
       title: 'Cases sold per SKU',
+      subtitle:
+        rows.length === 1
+          ? '1 SKU sold this month'
+          : `${rows.length} SKUs sold this month`,
       labels: rows.map((r) => r.sku),
       data: rows.map((r) => Number(r.cases)),
       label: 'Cases',
@@ -116,14 +120,16 @@ const chart = computed(() => {
   const rows = [...(stats.value.client_breakdown || [])].sort(
     (a, b) => Number(b[key]) - Number(a[key])
   )
+  const isProfit = metric.value === 'profit'
   return {
-    title:
-      metric.value === 'profit'
-        ? `Profit per client — ${includeOverhead.value ? 'after' : 'before'} overhead`
-        : 'Revenue per client (highest first)',
+    // Short label + qualifier line, instead of one long mixed-size title.
+    title: isProfit ? 'Profit per client' : 'Revenue per client',
+    subtitle: isProfit
+      ? `${includeOverhead.value ? 'After' : 'Before'} overhead · highest first`
+      : 'Highest first',
     labels: rows.map((r) => r.client),
     data: rows.map((r) => Number(r[key])),
-    label: metric.value === 'profit' ? 'Profit (₹)' : 'Revenue (₹)',
+    label: isProfit ? 'Profit (₹)' : 'Revenue (₹)',
     empty: 'No client figures this month.',
   }
 })
@@ -200,13 +206,17 @@ async function deleteItem(item) {
 
 <template>
   <div>
-    <!-- Primary action: big FAB (spec 4.1) -->
+    <!-- Primary actions (spec 4.1). One size for both: the hierarchy comes from
+         colour (flat vs tonal), not from a bigger button — they used to render
+         as two different heights and wrapped awkwardly on phones. -->
     <div class="d-flex flex-wrap ga-3 mb-4">
       <v-btn
         color="primary"
-        size="x-large"
+        size="large"
+        variant="flat"
         prepend-icon="mdi-plus"
         class="flex-grow-1"
+        style="min-width: 190px"
         @click="router.push('/delivery/new')"
       >
         Add Delivery
@@ -214,8 +224,10 @@ async function deleteItem(item) {
       <v-btn
         color="secondary"
         size="large"
-        variant="elevated"
+        variant="tonal"
         prepend-icon="mdi-truck-plus"
+        class="flex-grow-1"
+        style="min-width: 190px"
         @click="router.push('/stock/arrived')"
       >
         Enter Arrived Stock
@@ -232,11 +244,11 @@ async function deleteItem(item) {
          header expands the per-material detail (user request). -->
     <v-card class="mb-4" :loading="loading">
       <v-card-title
-        class="d-flex align-center"
+        class="d-flex align-center text-subtitle-1 font-weight-bold"
         style="cursor: pointer"
         @click="stockOpen = !stockOpen"
       >
-        <v-icon start>mdi-package-variant-closed</v-icon>
+        <v-icon start color="primary">mdi-package-variant-closed</v-icon>
         Stock in Hand
         <v-chip
           v-if="belowAlert.length"
@@ -257,14 +269,14 @@ async function deleteItem(item) {
           {{ aboveAlert.length }} above alert
         </v-chip>
         <v-spacer />
-        <span class="text-caption text-medium-contrast mr-2">
+        <span class="text-caption text-medium-emphasis mr-2">
           {{ stock.length }} material{{ stock.length === 1 ? '' : 's' }}
         </span>
         <v-icon>{{ stockOpen ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
       </v-card-title>
+      <v-divider />
       <v-expand-transition>
         <div v-show="stockOpen">
-          <v-divider />
           <EmptyState
             v-if="!loading && !stock.length"
             icon="mdi-package-variant"
@@ -302,7 +314,7 @@ async function deleteItem(item) {
               </template>
             </v-list-item>
           </v-list>
-          <div class="text-caption text-medium-contrast pa-3 pt-2">
+          <div class="text-caption text-medium-emphasis pa-3 pt-2">
             Red = below the alert quantity · green = at or above it. Tap a
             material to open its batches.
           </div>
@@ -312,8 +324,8 @@ async function deleteItem(item) {
 
     <!-- Summary — MMM, YYYY: the tiles drive the chart area below (user request). -->
     <v-card>
-      <v-card-title class="d-flex align-center">
-        <v-icon start>mdi-chart-box</v-icon>
+      <v-card-title class="d-flex align-center text-subtitle-1 font-weight-bold">
+        <v-icon start color="primary">mdi-chart-box</v-icon>
         Summary — {{ monthLong(ui.month) }}
       </v-card-title>
       <v-divider />
@@ -327,11 +339,17 @@ async function deleteItem(item) {
               height="100%"
               @click="t.selectable ? (metric = t.key) : null"
             >
-              <v-card-text class="text-center">
+              <v-card-text class="d-flex flex-column text-center h-100">
                 <div class="text-h5 font-weight-bold">{{ t.value }}</div>
-                <div class="text-caption">{{ t.label }}</div>
-                <div v-if="t.note" class="text-caption">{{ t.note }}</div>
-                <div class="text-caption font-italic">{{ t.caption }}</div>
+                <div class="text-caption font-weight-bold text-uppercase">
+                  {{ t.label }}
+                </div>
+                <div v-if="t.note" class="text-caption" style="opacity: 0.85">
+                  {{ t.note }}
+                </div>
+                <div class="text-caption mt-auto" style="opacity: 0.8">
+                  {{ t.caption }}
+                </div>
               </v-card-text>
             </v-card>
           </v-col>
@@ -339,7 +357,18 @@ async function deleteItem(item) {
 
         <!-- Chart area: populated by the tile selected above (user request). -->
         <div class="d-flex flex-wrap align-center mt-4">
-          <div class="text-subtitle-2">{{ chart.title }}</div>
+          <div>
+            <!-- Section label: same 12px uppercase treatment as every other
+                 in-card label, so nothing is "big" or "small" by accident. -->
+            <div
+              class="text-caption font-weight-bold text-uppercase text-medium-emphasis"
+            >
+              {{ chart.title }}
+            </div>
+            <div class="text-caption text-medium-emphasis">
+              {{ chart.subtitle }}
+            </div>
+          </div>
           <v-spacer />
           <v-switch
             v-if="metric === 'profit'"
@@ -361,7 +390,9 @@ async function deleteItem(item) {
         <EmptyState v-else :text="chart.empty" icon="mdi-chart-bar" />
 
         <!-- Inward material this month — the line items are editable in place. -->
-        <div class="text-subtitle-2 mt-4 mb-1">
+        <div
+          class="text-caption font-weight-bold text-uppercase text-medium-emphasis mt-4 mb-1"
+        >
           Inward material ({{ monthLong(ui.month) }})
         </div>
         <div v-if="stats.inward_materials?.length">
@@ -439,13 +470,13 @@ async function deleteItem(item) {
                   />
                 </template>
                 <template v-else>
-                  <span class="text-caption text-medium-contrast" style="width: 92px">
+                  <span class="text-caption text-medium-emphasis" style="width: 92px">
                     {{ item.date }}
                   </span>
                   <span class="text-body-2">
                     {{ num(item.quantity_received) }} {{ row.unit }}
                   </span>
-                  <span class="text-caption text-medium-contrast">
+                  <span class="text-caption text-medium-emphasis">
                     · in hand {{ num(item.quantity_remaining) }} · consumed
                     {{ num(item.consumed) }}
                   </span>
@@ -466,7 +497,7 @@ async function deleteItem(item) {
                   />
                 </template>
               </div>
-              <div class="text-caption text-medium-contrast">
+              <div class="text-caption text-medium-emphasis mt-1">
                 Editing a line item recalculates stock in hand, the FIFO cost and
                 the vendor's payable. Deliveries already made keep the cost that
                 applied when they were entered.
@@ -474,7 +505,7 @@ async function deleteItem(item) {
             </div>
           </div>
         </div>
-        <p v-else class="text-medium-contrast text-body-2">
+        <p v-else class="text-body-2 text-medium-emphasis">
           No stock arrivals this month.
         </p>
       </v-card-text>

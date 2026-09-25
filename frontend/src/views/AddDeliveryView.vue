@@ -213,10 +213,33 @@ function reset() {
 
     <!-- Single-screen delivery form -->
     <template v-else>
+      <!-- Page heading: same 16px bold scale as "Enter Arrived Stock" so the two
+           entry screens read as one family. -->
+      <div class="mb-4">
+        <div class="text-subtitle-1 font-weight-bold">New delivery</div>
+        <div class="text-caption text-medium-emphasis">
+          Client → SKU → quantity &amp; price. COGS updates as you type.
+        </div>
+      </div>
+
       <v-alert v-if="error" type="error" class="mb-3">{{ error }}</v-alert>
+
       <!-- 1. Client -->
       <v-card class="mb-3">
-        <v-card-title class="text-subtitle-1">1. Client</v-card-title>
+        <v-card-title
+          class="d-flex align-center text-subtitle-1 font-weight-bold"
+        >
+          <v-avatar
+            size="24"
+            color="primary"
+            variant="tonal"
+            class="mr-2 text-caption font-weight-bold"
+          >
+            1
+          </v-avatar>
+          Client
+        </v-card-title>
+        <v-divider />
         <v-card-text>
           <div v-if="client" class="d-flex flex-wrap align-center ga-2">
             <v-chip color="primary" size="large" prepend-icon="mdi-account">
@@ -255,7 +278,20 @@ function reset() {
 
       <!-- 2. SKU (client's preferred SKUs) -->
       <v-card class="mb-3" :disabled="!client">
-        <v-card-title class="text-subtitle-1">2. SKU</v-card-title>
+        <v-card-title
+          class="d-flex align-center text-subtitle-1 font-weight-bold"
+        >
+          <v-avatar
+            size="24"
+            color="primary"
+            variant="tonal"
+            class="mr-2 text-caption font-weight-bold"
+          >
+            2
+          </v-avatar>
+          SKU
+        </v-card-title>
+        <v-divider />
         <v-card-text>
           <div class="d-flex flex-wrap ga-2">
             <v-btn
@@ -281,14 +317,27 @@ function reset() {
             No preferred SKUs configured for this client — set them on the
             client's detail page.
           </v-alert>
-          <p v-if="!client" class="text-body-2 text-medium-contrast mb-0">
+          <p v-if="!client" class="text-caption text-medium-emphasis mb-0">
             Pick a client first.
           </p>
         </v-card-text>
       </v-card>
       <!-- 3. Quantity, price, date -->
       <v-card class="mb-3" :disabled="!sku">
-        <v-card-title class="text-subtitle-1">3. Quantity &amp; price</v-card-title>
+        <v-card-title
+          class="d-flex align-center text-subtitle-1 font-weight-bold"
+        >
+          <v-avatar
+            size="24"
+            color="primary"
+            variant="tonal"
+            class="mr-2 text-caption font-weight-bold"
+          >
+            3
+          </v-avatar>
+          Quantity &amp; price
+        </v-card-title>
+        <v-divider />
         <v-card-text>
           <v-text-field v-model="date" type="date" label="Delivery date" />
           <v-text-field
@@ -297,64 +346,68 @@ function reset() {
             min="1"
             label="Quantity (cases)"
           />
+          <!-- Short label; the "auto-filled, editable" note moved into the
+               hint instead of being crammed into the label. -->
           <v-text-field
             v-model="price"
             type="number"
             min="0"
-            label="Selling price per case (₹) — auto-filled, editable"
+            label="Selling price per case"
             prefix="₹"
+            hint="Pre-filled from the client's SKU price — editable"
+            persistent-hint
           />
-          <v-text-field v-model="note" label="Note (optional)" />
-          <p v-if="!sku" class="text-body-2 text-medium-contrast mb-0">
+          <v-text-field v-model="note" label="Note (optional)" class="mt-2" />
+          <p v-if="!sku" class="text-caption text-medium-emphasis mb-0">
             Pick a SKU to enter quantity and price.
           </p>
         </v-card-text>
       </v-card>
 
-      <!-- Live COGS breakdown -->
+      <!-- Live COGS breakdown. Every figure is per case, stated once in the
+           label, instead of repeating " / case" on every row. -->
       <v-card v-if="preview" variant="tonal" color="primary" class="mb-3">
         <v-card-text>
-          <div class="text-subtitle-2">Estimated COGS — per case</div>
+          <div class="text-caption font-weight-bold text-uppercase">
+            Estimated COGS (per case)
+          </div>
           <div class="text-h6 font-weight-bold">
             {{ money(preview.cogs.per_case) }}
-            <span class="text-body-2">/ case</span>
           </div>
-          <v-table density="compact" class="bg-transparent">
+          <v-table density="compact" class="bg-transparent mt-2">
             <tbody>
               <tr>
-                <td class="px-0">Raw materials (incl. wastage)</td>
-                <td class="text-right px-0">{{ money(materialsCost) }} / case</td>
+                <td class="px-0 text-body-2">Raw materials (incl. wastage)</td>
+                <td class="text-right px-0">{{ money(materialsCost) }}</td>
               </tr>
               <tr>
-                <td class="px-0">Print / label (incl. wastage)</td>
+                <td class="px-0 text-body-2">Print / label (incl. wastage)</td>
                 <td class="text-right px-0">
-                  {{ money(preview.cogs.details.print?.cost_per_case || 0) }} / case
+                  {{ money(preview.cogs.details.print?.cost_per_case || 0) }}
                 </td>
               </tr>
               <tr>
-                <td class="px-0">
+                <td class="px-0 text-body-2">
                   Overhead allocation
-                  <div class="text-caption text-medium-contrast">
+                  <div class="text-caption" style="opacity: 0.8">
                     pool {{ money(preview.cogs.details.overhead.total_monthly_overhead) }}
                     ÷ {{ preview.cogs.details.overhead.cases_sold_in_month }} cases
                   </div>
                 </td>
                 <td class="text-right px-0">
-                  {{ money(preview.cogs.details.overhead.overhead_per_case) }} / case
+                  {{ money(preview.cogs.details.overhead.overhead_per_case) }}
                 </td>
               </tr>
               <tr class="font-weight-bold">
                 <td class="px-0">Total COGS</td>
-                <td class="text-right px-0">
-                  {{ money(preview.cogs.per_case) }} / case
-                </td>
+                <td class="text-right px-0">{{ money(preview.cogs.per_case) }}</td>
               </tr>
             </tbody>
           </v-table>
-          <div class="text-caption mt-1">
-            Delivery value:
+          <div class="text-caption mt-2" style="opacity: 0.9">
+            Delivery value
             <strong>{{ money(Number(qty) * Number(price || 0)) }}</strong>
-            · Total COGS:
+            · Total COGS
             <strong>{{ money(Number(qty) * Number(preview.cogs.per_case)) }}</strong>
           </div>
         </v-card-text>

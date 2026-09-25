@@ -133,7 +133,7 @@ async function savePrint() {
             </td>
           </tr>
           <tr v-if="!sku.requirements.length">
-            <td colspan="3" class="text-medium-contrast">
+            <td colspan="3" class="text-medium-emphasis">
               No materials linked yet — quantities are per case of this SKU
               (decimals allowed, e.g. 1.08 label cases).
             </td>
@@ -146,7 +146,7 @@ async function savePrint() {
     <v-card class="mb-3">
       <v-card-title class="text-subtitle-1">
         Print / label cost config
-        <div class="text-caption text-medium-contrast font-weight-regular">
+        <div class="text-caption text-medium-emphasis font-weight-regular">
           Labels needed per case = quantity per case ({{ sku.qty_per_case }}).
           Per-case cost = (paper + print) ÷ labels per paper × qty per case,
           wastage-adjusted.
@@ -208,7 +208,7 @@ async function savePrint() {
       <v-card-text v-if="breakup">
         <div class="text-h5 font-weight-bold mb-2">
           {{ money(breakup.per_case) }}
-          <span class="text-body-2 text-medium-contrast">/ case</span>
+          <span class="text-body-2 text-medium-emphasis">/ case</span>
         </div>
         <v-table density="compact">
           <tbody>
@@ -228,7 +228,7 @@ async function savePrint() {
             <tr>
               <td>
                 Overhead allocation
-                <div class="text-caption text-medium-contrast">
+                <div class="text-caption text-medium-emphasis">
                   {{ breakup.details.overhead.note }}
                 </div>
               </td>
@@ -266,7 +266,7 @@ async function savePrint() {
             </tr>
           </tbody>
         </v-table>
-        <p class="text-caption text-medium-contrast mt-2">{{ breakup.note }}</p>
+        <p class="text-caption text-medium-emphasis mt-2">{{ breakup.note }}</p>
       </v-card-text>
     </v-card>
 

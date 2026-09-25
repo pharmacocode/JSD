@@ -68,8 +68,8 @@ async function save() {
 
 <template>
   <v-card>
-    <v-card-title>
-      <v-icon start>mdi-truck-plus</v-icon>
+    <v-card-title class="d-flex align-center text-subtitle-1 font-weight-bold">
+      <v-icon start color="primary">mdi-truck-plus</v-icon>
       Enter Arrived Stock
     </v-card-title>
     <v-divider />
@@ -87,6 +87,8 @@ async function save() {
         :loading="!materials.length"
         return-object
         clearable
+        hint="Client-specific label stock is grouped by client in this list."
+        persistent-hint
       >
         <template #item="{ item, props }">
           <v-list-item
@@ -98,8 +100,11 @@ async function save() {
         </template>
       </v-select>
 
-      <div class="text-caption mb-2 text-medium-contrast">
-        Client-specific label stock is grouped by client in this list.
+      <!-- Section label: same 12px uppercase treatment used across the app. -->
+      <div
+        class="text-caption font-weight-bold text-uppercase text-medium-emphasis mt-4 mb-1"
+      >
+        Arrival details
       </div>
 
       <v-text-field
@@ -107,30 +112,37 @@ async function save() {
         type="number"
         min="0"
         step="any"
-        label="Quantity received (cases)"
+        label="Quantity received"
         :suffix="material?.unit_of_measure || 'cases'"
       />
+      <!-- Short label; the "this batch only" caveat moved into the hint. -->
       <v-text-field
         v-model.number="price"
         type="number"
         min="0"
         step="0.01"
-        label="Price per case for this batch (₹)"
+        label="Price per case"
         prefix="₹"
+        hint="Cost of this batch only — FIFO uses it from here on."
       />
       <v-text-field v-model="date" type="date" label="Arrival date" />
       <v-text-field v-model="note" label="Note (optional)" />
 
-      <v-btn
-        color="success"
-        size="large"
-        block
-        :loading="loading"
-        prepend-icon="mdi-check"
-        @click="save"
-      >
-        Save stock arrival
-      </v-btn>
+      <div class="d-flex ga-2 mt-2">
+        <v-btn variant="tonal" size="large" @click="router.push('/')">
+          Cancel
+        </v-btn>
+        <v-btn
+          color="success"
+          size="large"
+          class="flex-grow-1"
+          :loading="loading"
+          prepend-icon="mdi-check"
+          @click="save"
+        >
+          Save arrival
+        </v-btn>
+      </div>
     </v-card-text>
   </v-card>
 </template>
