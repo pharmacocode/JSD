@@ -9,6 +9,7 @@ import { api, listify } from '@/api'
 import { money, today } from '@/utils/format'
 import { useUiStore } from '@/stores/ui'
 import AuditBadge from '@/components/AuditBadge.vue'
+import BalanceMarkerDialog from '@/components/BalanceMarkerDialog.vue'
 import EmptyState from '@/components/EmptyState.vue'
 
 const route = useRoute()
@@ -23,6 +24,8 @@ const tab = ref('ledger')
 const loading = ref(true)
 
 const payDialog = ref(false)
+// Pending amount + the date it refers to (editable at any time, user request).
+const markerDialog = ref(false)
 const payAmount = ref(null)
 const payDate = ref(today())
 const payNote = ref('')
@@ -47,6 +50,7 @@ async function load() {
 onMounted(load)
 
 const pending = computed(() => ledger.value.pending_amount)
+const markerActive = computed(() => !!client.value?.pending_as_of_date)
 
 const TYPE_COLORS = {
   DELIVERY: 'primary',
@@ -128,7 +132,9 @@ async function deleteEntry(entry) {
           {{ client.contact_number }}
         </v-btn>
 
-        <!-- Large prominent pending amount (spec 4.5) -->
+        <!-- Large prominent pending amount (spec 4.5). The figure is editable
+             at any time together with the date it refers to; ledger entries
+             after that day are added on top automatically. -->
         <v-sheet
           :color="Number(pending) > 0 ? 'error' : 'success'"
           rounded="lg"
@@ -138,6 +144,23 @@ async function deleteEntry(entry) {
           <div class="text-h4 font-weight-bold" style="color: #fff">
             {{ money(pending) }}
           </div>
+          <div class="text-caption mt-1" style="color: #fff">
+            {{
+              markerActive
+                ? `as of ${client.pending_as_of_date} · later transactions added`
+                : 'live sum of the ledger'
+            }}
+          </div>
+          <v-btn
+            size="small"
+            variant="outlined"
+            color="white"
+            class="mt-2"
+            prepend-icon="mdi-calendar-edit"
+            @click="markerDialog = true"
+          >
+            Edit pending amount
+          </v-btn>
         </v-sheet>
 
         <v-btn
@@ -183,6 +206,19 @@ async function deleteEntry(entry) {
     <v-tabs-window v-model="tab">
       <v-tabs-window-item value="ledger">
         <v-card :loading="loading">
+          <v-alert
+            v-if="ledger.marker_active"
+            type="info"
+            variant="tonal"
+            density="compact"
+            class="ma-2"
+          >
+            {{ money(ledger.pending_as_of_amount) }} as of
+            {{ ledger.pending_as_of_date }} — the
+            {{ ledger.superseded_count }} entry(s) dated on/before that day
+            ({{ money(ledger.superseded_total) }}) are already inside it, so only
+            later entries are added on top.
+          </v-alert>
           <EmptyState
             v-if="!ledger.entries.length"
             icon="mdi-book-open"
@@ -217,9 +253,21 @@ async function deleteEntry(entry) {
                     {{ Number(e.amount) >= 0 ? '+' : '' }}{{ money(e.amount) }}
                   </div>
                   <div class="text-caption text-medium-contrast">
-                    bal {{ money(e.running_balance) }}
+                    {{
+                      e.running_balance
+                        ? `bal ${money(e.running_balance)}`
+                        : 'inside the as-of figure'
+                    }}
                   </div>
                   <div class="d-flex justify-end align-center ga-1 mt-1">
+                    <v-chip
+                      v-if="e.is_superseded"
+                      size="x-small"
+                      variant="tonal"
+                      color="grey"
+                    >
+                      as-of
+                    </v-chip>
                     <AuditBadge :record="e" />
                     <v-btn
                       icon="mdi-delete-outline"
@@ -300,6 +348,19 @@ async function deleteEntry(entry) {
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <!-- Pending amount as of a date (editable at any time) -->
+    <BalanceMarkerDialog
+      v-model="markerDialog"
+      title="Pending amount as of a date"
+      amount-label="Pending amount on that date"
+      total-label="Pending amount now"
+      :endpoint="`/clients/${id}/pending/`"
+      :amount="client.pending_as_of_amount"
+      :date="client.pending_as_of_date"
+      :active="markerActive"
+      @saved="load"
+    />
   </div>
 
   <v-progress-circular v-else-if="loading" indeterminate class="d-block mx-auto mt-8" />

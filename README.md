@@ -39,7 +39,7 @@ cd backend
 python -m pip install -r requirements.txt
 python manage.py migrate          # seeds Rent/Diesel/Electricity/Labour
 python manage.py runserver        # http://localhost:8000
-python manage.py test core        # 27 tests (FIFO + COGS + API)
+python manage.py test core        # 57 tests (FIFO + COGS + ledger + markers + home)
 ```
 
 Without `DATABASE_URL` the backend uses local SQLite (dev/tests). Set it to
@@ -99,20 +99,63 @@ SPA routing). Env var:
   `cogs_per_case_snapshot` keeps the full figure as at creation (audit only).
 - **Ledger is the single source of truth:** client pending balance is always a
   live sum of `ClientLedgerEntry.amount` (positive = delivery, negative =
-  payment). Nothing is stored mutably on `Client`.
+  payment), plus the optional *balance marker* described next. No running total
+  is ever stored.
+- **Balance markers ("pending amount as of a date", user request):** the client's
+  pending amount and the vendor's payable can be **edited at any time together
+  with the date they refer to** (`Client.pending_as_of_amount` /
+  `pending_as_of_date`, `Vendor.payable_as_of_amount` / `payable_as_of_date`).
+  The entered figure is what was owed **on** that date: ledger entries, arrived
+  stock and payments dated **strictly after** it are added on top, while
+  everything dated on or before it is already inside the figure — those rows are
+  flagged *superseded* in the ledger (`is_superseded`, no running balance) so the
+  same transaction is never counted twice. API: `GET|POST|DELETE
+  /api/clients/<id>/pending/` and `GET|POST|DELETE /api/vendors/<id>/payable/`;
+  the `GET` accepts `?as_of=YYYY-MM-DD&amount=X` to preview a candidate marker
+  without saving, and `DELETE` clears it (balance returns to the plain
+  transaction sum).
 - **Audit (3.7):** batches, deliveries, ledger entries, and adjustments are
   soft-deleted (`is_deleted`) with `edit_history` JSON; UI shows
   Edited/Deleted badges with expandable history.
 - **Stock adjustments (4.4):** distinct `StockAdjustment` records with a
   mandatory reason — positive adds a zero-price batch, negative consumes the
-  FIFO queue. Existing batches are never silently edited.
+  FIFO queue. The FIFO engine never rewrites what was keyed; a **wrongly keyed
+  arrival is corrected on the Home screen** instead (see the next bullet).
+- **Inward line items are editable (user request):** the Home screen lists the
+  month's arrivals with their underlying batches; each line can be edited in
+  place (received cases, landing price, arrival date) or removed. Editing
+  `quantity_received` shifts `quantity_remaining` by the **same delta**, so
+  already-consumed cases stay consumed and stock in hand, the FIFO queue and the
+  vendor's payable immediately follow the corrected figure (`PATCH
+  /api/batches/<id>/`, audited in `edit_history`). Shrinking a batch below what
+  was already consumed drives the remainder negative — the same convention the
+  FIFO shortfall path uses — so the difference stays visible and can be
+  reconciled with a Stock Adjustment. A corrected price/date feeds FIFO from
+  then on; deliveries already made keep the direct cost frozen at their
+  creation (`base_cogs_per_case_snapshot`).
+- **Home summary (user request):** *Stock in Hand* always shows the red
+  `<n> low` / green `<n> above alert` counts and expands to the per-material
+  detail when tapped. The monthly card is titled **`Summary — MMM, YYYY`** and
+  its tiles — **Cases sold · Revenue · Profit · Overhead** — are clickable: the
+  single chart area below is populated by the selected tile, i.e. cases per SKU
+  (default), revenue per client (highest → lowest) or profit per client, with an
+  **Include overhead** toggle for the profit view. Revenue/profit come from
+  `stats.client_breakdown` (= revenue − frozen direct cost − the client's share
+  of the month's per-case overhead); the profit tile follows the toggle so card
+  and bars always agree. The old "top clients by revenue" doughnut is gone.
+- **Employees are editable (user request):** `Employee` rows (name, role,
+  monthly pay, active) can be edited at any time from Masters → Overheads &
+  Labour (one dialog handles add *and* edit). Retiring someone = setting
+  **Active = off** — they stay in the list so their logged payments keep their
+  month's Labour roll-up intact.
 - **Overhead allocation (6.3):** `month overhead ÷ cases sold that month`
   (including the delivery being created) = overhead per case directly.
   Labour auto-sums `EmployeePayment` rows into the Labour category (manual
   override respected).
 - **Vendors:** the material form picks a vendor from the Vendor master;
   a vendor's **amount owed = value of arrived stock from that vendor's
-  materials − payments recorded to the vendor**.
+  materials − payments recorded to the vendor** — or, when a payable marker is
+  set, that figure plus every purchase/payment after its date.
 
 ### Assumptions confirmed with the user (v1)
 

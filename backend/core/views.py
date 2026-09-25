@@ -1,9 +1,10 @@
 """DRF views for the JSD Group API."""
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db.models import Q, Sum
 from django.utils import timezone
+from django.utils.dateparse import parse_date
 from rest_framework import status, viewsets
 from rest_framework.decorators import action
 from rest_framework.response import Response
@@ -67,6 +68,31 @@ def sync_labour_overhead(month: str):
     _sync(month)
 
 
+def marker_request(request):
+    """
+    Shared parser for the pending/payable "as of" marker payloads:
+    {"amount": "12000", "date": "YYYY-MM-DD"}. Returns (amount, as_of, error);
+    the caller turns `error` into a 400.
+    """
+    try:
+        amount = money(Decimal(str(request.data.get("amount"))))
+    except (InvalidOperation, TypeError, ValueError):
+        return None, None, "amount is required"
+    raw_date = request.data.get("date") or request.data.get("as_of") or ""
+    as_of = parse_date(str(raw_date))
+    if as_of is None:
+        return None, None, "date is required (YYYY-MM-DD)"
+    return amount, as_of, None
+
+
+def marker_preview_amount(request):
+    """?amount= for a preview GET (0 when absent/invalid)."""
+    try:
+        return money(Decimal(str(request.query_params.get("amount"))))
+    except (InvalidOperation, TypeError, ValueError):
+        return Decimal("0")
+
+
 class ClientViewSet(viewsets.ModelViewSet):
     queryset = Client.objects.all().prefetch_related("sku_prices__sku")
     serializer_class = ClientSerializer
@@ -104,24 +130,38 @@ class ClientViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_201_CREATED,
             )
 
-        entries = (
-            client.ledger_entries.filter(is_deleted=False)
-            .select_related("related_delivery__sku")
-            .order_by("date", "id")
-        )
-        # Running balance computed chronologically (oldest first).
+        entries = client.ledger_entries_chronological()
+        as_of = client.pending_as_of_date
+        # Running balance computed chronologically (oldest first). With a
+        # pending marker the walk starts from the entered figure and entries
+        # dated on/before the marked date are flagged as superseded (they are
+        # already inside that figure and must not be counted twice).
         balances = {}
-        running = Decimal("0")
+        superseded = set()
+        running = money(client.pending_as_of_amount) if as_of else Decimal("0")
         for e in entries:
+            if as_of is not None and e.date <= as_of:
+                superseded.add(e.id)
+                continue
             running += e.amount
             balances[e.id] = str(money(running))
-        ordered = list(reversed(list(entries)))
+        ordered = list(reversed(entries))
         serializer = ClientLedgerEntrySerializer(
-            ordered, many=True, context={"balances": balances}
+            ordered,
+            many=True,
+            context={"balances": balances, "superseded": superseded},
+        )
+        superseded_total = sum(
+            (e.amount for e in entries if e.id in superseded), Decimal("0")
         )
         return Response(
             {
                 "pending_amount": str(client.pending_amount),
+                "pending_as_of_amount": str(money(client.pending_as_of_amount)),
+                "pending_as_of_date": as_of.isoformat() if as_of else None,
+                "marker_active": as_of is not None,
+                "superseded_count": len(superseded),
+                "superseded_total": str(money(superseded_total)),
                 "entries": serializer.data,
             }
         )
@@ -155,6 +195,60 @@ class ClientViewSet(viewsets.ModelViewSet):
             },
             status=status.HTTP_201_CREATED,
         )
+
+    @action(detail=True, methods=["get", "post", "delete"], url_path="pending")
+    def pending(self, request, pk=None):
+        """
+        Pending-amount marker (user request): the pending figure is editable at
+        any time, together with the date it refers to. Ledger entries dated
+        strictly after that date are added on top of it; older ones are already
+        inside it.
+
+        GET    -> breakdown; ?as_of=YYYY-MM-DD&amount=X previews without saving.
+        POST   -> {"amount": "12000", "date": "2026-09-25"} saves the marker.
+        DELETE -> clears the marker (pending = plain live ledger sum again).
+        """
+        client = self.get_object()
+        if request.method == "POST":
+            amount, as_of, error = marker_request(request)
+            if error:
+                return Response(
+                    {"detail": error}, status=status.HTTP_400_BAD_REQUEST
+                )
+            client.pending_as_of_amount = amount
+            client.pending_as_of_date = as_of
+            client.save(
+                update_fields=["pending_as_of_amount", "pending_as_of_date"]
+            )
+            return self._pending_payload(client)
+        if request.method == "DELETE":
+            client.pending_as_of_amount = Decimal("0")
+            client.pending_as_of_date = None
+            client.save(
+                update_fields=["pending_as_of_amount", "pending_as_of_date"]
+            )
+            return self._pending_payload(client)
+        if "as_of" in request.query_params:
+            return self._pending_payload(
+                client,
+                parse_date(request.query_params.get("as_of") or ""),
+                marker_preview_amount(request),
+            )
+        return self._pending_payload(client)
+
+    @staticmethod
+    def _pending_payload(client, as_of=None, amount=None):
+        """
+        Marker breakdown + the resulting live pending. Called with no arguments
+        it reflects the client's stored marker; with `as_of`/`amount` it previews
+        a candidate marker.
+        """
+        if as_of is None and amount is None:
+            as_of = client.pending_as_of_date
+            amount = client.pending_as_of_amount if as_of else None
+        data = client.pending_breakdown(as_of, amount)
+        data["pending_amount"] = str(client.pending_amount)
+        return Response(data)
 
     @action(detail=True, methods=["get"])
     def deliveries(self, request, pk=None):
@@ -357,6 +451,59 @@ class VendorViewSet(viewsets.ModelViewSet):
                 "payments": VendorPaymentSerializer(qs, many=True).data,
             }
         )
+
+    @action(detail=True, methods=["get", "post", "delete"], url_path="payable")
+    def payable(self, request, pk=None):
+        """
+        Payable marker (user request): what we owe this vendor is editable at any
+        time, together with the date it refers to. Arrived stock and payments
+        dated strictly after that date are added on top of the entered figure.
+
+        GET    -> breakdown; ?as_of=YYYY-MM-DD&amount=X previews without saving.
+        POST   -> {"amount": "12000", "date": "2026-09-25"} saves the marker.
+        DELETE -> clears the marker (payable = purchases − payments again).
+        """
+        vendor = self.get_object()
+        if request.method == "POST":
+            amount, as_of, error = marker_request(request)
+            if error:
+                return Response(
+                    {"detail": error}, status=status.HTTP_400_BAD_REQUEST
+                )
+            vendor.payable_as_of_amount = amount
+            vendor.payable_as_of_date = as_of
+            vendor.save(
+                update_fields=["payable_as_of_amount", "payable_as_of_date"]
+            )
+            return self._payable_payload(vendor)
+        if request.method == "DELETE":
+            vendor.payable_as_of_amount = Decimal("0")
+            vendor.payable_as_of_date = None
+            vendor.save(
+                update_fields=["payable_as_of_amount", "payable_as_of_date"]
+            )
+            return self._payable_payload(vendor)
+        if "as_of" in request.query_params:
+            return self._payable_payload(
+                vendor,
+                parse_date(request.query_params.get("as_of") or ""),
+                marker_preview_amount(request),
+            )
+        return self._payable_payload(vendor)
+
+    @staticmethod
+    def _payable_payload(vendor, as_of=None, amount=None):
+        """
+        Marker breakdown + the resulting amount owed. Called with no arguments it
+        reflects the vendor's stored marker; with `as_of`/`amount` it previews a
+        candidate marker.
+        """
+        if as_of is None and amount is None:
+            as_of = vendor.payable_as_of_date
+            amount = vendor.payable_as_of_amount if as_of else None
+        data = vendor.payable_breakdown(as_of, amount)
+        data["amount_owed"] = str(vendor.amount_owed)
+        return Response(data)
 
 
 class VendorPaymentViewSet(viewsets.ModelViewSet):
@@ -711,10 +858,12 @@ class EmployeePaymentViewSet(viewsets.ModelViewSet):
 
 class DashboardView(APIView):
     """
-    Home screen data (spec 4.1):
-    - stock in hand per material (with alert highlighting flags)
-    - monthly stats for ?month=YYYY-MM: cases sold per SKU, inward
-      material quantities, top clients by revenue, overhead summary.
+    Home screen data (spec 4.1, figures reworked per user request):
+    - stock in hand per material (counts + alert flags for the collapsed panel)
+    - monthly summary for ?month=YYYY-MM: cases sold per SKU, per-client
+      revenue / profit breakdown (drives the metric chart), inward material
+      arrivals with their editable batch line items, overhead summary and the
+      month's profit (with and without overhead).
     """
 
     def get(self, request):
@@ -764,60 +913,109 @@ class DashboardView(APIView):
                 }
             )
 
-        # Inward material stock this month (arrived batches).
-        inward = []
-        for row in (
+        # Inward material arrivals this month: one row per material for the Home
+        # summary, each carrying its underlying batch line items. Those line
+        # items are editable from the Home screen (user request) — correcting
+        # one recalculates stock in hand, FIFO and the vendor payable.
+        arrivals = {}
+        for batch in (
             MaterialBatch.objects.filter(
-                is_deleted=False, arrival_date__year=m_year,
-                arrival_date__month=m_mon
+                is_deleted=False,
+                arrival_date__year=m_year,
+                arrival_date__month=m_mon,
             )
-            .values("material_id", "material__name", "material__unit_of_measure")
-            .annotate(qty=Sum("quantity_received"))
-            .order_by("material__name")
+            .select_related("material")
+            .order_by("material__name", "arrival_date", "id")
         ):
-            inward.append(
+            row = arrivals.setdefault(
+                batch.material_id,
                 {
-                    "material_id": row["material_id"],
-                    "material": row["material__name"],
-                    "unit": row["material__unit_of_measure"],
-                    "quantity": dstr(row["qty"] or 0),
+                    "material_id": batch.material_id,
+                    "material": batch.material.name,
+                    "unit": batch.material.unit_of_measure,
+                    "received": Decimal("0"),
+                    "items": [],
+                },
+            )
+            row["received"] += batch.quantity_received
+            row["items"].append(
+                {
+                    "id": batch.id,
+                    "date": batch.arrival_date.isoformat(),
+                    "quantity_received": dstr(batch.quantity_received),
+                    "quantity_remaining": dstr(batch.quantity_remaining),
+                    "consumed": dstr(batch.consumed_quantity),
+                    "price_per_unit": str(money(batch.price_per_unit)),
+                    "value": str(
+                        money(batch.quantity_received * batch.price_per_unit)
+                    ),
+                    "note": batch.note,
+                    "is_edited": batch.is_edited,
                 }
             )
+        inward = []
+        for row in arrivals.values():
+            row["quantity"] = dstr(row.pop("received"))
+            inward.append(row)
 
-        # Top clients by revenue this month.
-        top_clients = []
-        for row in (
-            StockDelivery.objects.filter(is_deleted=False, **month_filter)
-            .values("client_id", "client__name")
-            .annotate(cases=Sum("qty_cases"))
-            .order_by("-cases")[:5]
-        ):
-            deliveries = StockDelivery.objects.filter(
-                is_deleted=False, **month_filter, client_id=row["client_id"]
-            )
-            revenue = sum(
-                (d.qty_cases * d.selling_price_per_case for d in deliveries),
-                Decimal("0"),
-            )
-            top_clients.append(
-                {
-                    "client_id": row["client_id"],
-                    "client": row["client__name"],
-                    "cases": dstr(row["cases"] or 0),
-                    "revenue": str(money(revenue)),
-                }
-            )
-        top_clients.sort(key=lambda c: Decimal(c["revenue"]), reverse=True)
-
-        # Month totals for the stats cards.
-        deliveries = StockDelivery.objects.filter(
+        # Per-client breakdown this month: revenue, the frozen direct cost
+        # (materials consumed + print) and profit with/without the month's
+        # overhead. Powers the Home metric chart (revenue / profit per client,
+        # highest first) — it replaces the old "top clients" doughnut.
+        overhead_total = cogs.overhead_for_month(month)
+        overhead_per_case_month = cogs.overhead_per_case(month)
+        per_client = {}
+        total_revenue = Decimal("0")
+        total_direct_cost = Decimal("0")
+        total_cases = Decimal("0")
+        for d in StockDelivery.objects.filter(
             is_deleted=False, **month_filter
-        )
-        total_revenue = sum(
-            (d.qty_cases * d.selling_price_per_case for d in deliveries),
-            Decimal("0"),
-        )
-        total_cases = sum((d.qty_cases for d in deliveries), Decimal("0"))
+        ).select_related("client"):
+            revenue = d.qty_cases * d.selling_price_per_case
+            direct_cost = d.qty_cases * d.base_cogs_per_case_snapshot
+            total_revenue += revenue
+            total_direct_cost += direct_cost
+            total_cases += d.qty_cases
+            row = per_client.setdefault(
+                d.client_id,
+                {
+                    "client": d.client.name,
+                    "cases": Decimal("0"),
+                    "revenue": Decimal("0"),
+                    "direct_cost": Decimal("0"),
+                },
+            )
+            row["cases"] += d.qty_cases
+            row["revenue"] += revenue
+            row["direct_cost"] += direct_cost
+
+        client_breakdown = []
+        for client_id, row in per_client.items():
+            # Overhead is a monthly bucket allocated per case sold (spec 6.3),
+            # so each client carries its own share of the month's overhead.
+            overhead = money(row["cases"] * overhead_per_case_month)
+            client_breakdown.append(
+                {
+                    "client_id": client_id,
+                    "client": row["client"],
+                    "cases": dstr(row["cases"]),
+                    "revenue": str(money(row["revenue"])),
+                    "direct_cost": str(money(row["direct_cost"])),
+                    "overhead": str(overhead),
+                    "profit_excl_overhead": str(
+                        money(row["revenue"] - row["direct_cost"])
+                    ),
+                    "profit_incl_overhead": str(
+                        money(row["revenue"] - row["direct_cost"] - overhead)
+                    ),
+                }
+            )
+        client_breakdown.sort(key=lambda c: Decimal(c["revenue"]), reverse=True)
+
+        # Month totals for the summary cards. Direct cost is frozen per delivery;
+        # overhead is the month's live bucket (the same rule the stock pages use).
+        profit_excl_overhead = money(total_revenue - total_direct_cost)
+        profit_incl_overhead = money(profit_excl_overhead - overhead_total)
 
         return Response(
             {
@@ -825,12 +1023,17 @@ class DashboardView(APIView):
                 "stock": materials,
                 "stats": {
                     "cases_sold_per_sku": sold,
+                    "client_breakdown": client_breakdown,
+                    # Backwards-compatible alias: top 5 clients by revenue.
+                    "top_clients": client_breakdown[:5],
                     "inward_materials": inward,
-                    "top_clients": top_clients,
                     "total_cases": dstr(total_cases),
                     "total_revenue": str(money(total_revenue)),
-                    "total_overhead": str(money(cogs.overhead_for_month(month))),
-                    "overhead_per_case": str(money(cogs.overhead_per_case(month))),
+                    "total_direct_cost": str(money(total_direct_cost)),
+                    "total_overhead": str(money(overhead_total)),
+                    "total_profit_excl_overhead": str(profit_excl_overhead),
+                    "total_profit_incl_overhead": str(profit_incl_overhead),
+                    "overhead_per_case": str(money(overhead_per_case_month)),
                 },
             }
         )

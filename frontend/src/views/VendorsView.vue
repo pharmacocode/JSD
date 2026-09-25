@@ -8,6 +8,7 @@ import { ref, watch, onMounted } from 'vue'
 import { api, listify } from '@/api'
 import { useUiStore } from '@/stores/ui'
 import { money, today } from '@/utils/format'
+import BalanceMarkerDialog from '@/components/BalanceMarkerDialog.vue'
 import EmptyState from '@/components/EmptyState.vue'
 
 const ui = useUiStore()
@@ -24,6 +25,8 @@ const saving = ref(false)
 const detail = ref(null) // vendor being viewed
 const payments = ref([])
 const payDialog = ref(false)
+// Payable as of a date (editable at any time, user request).
+const payableDialog = ref(false)
 const payForm = ref({ amount: null, date: today(), note: '' })
 
 async function load() {
@@ -82,6 +85,12 @@ async function openDetail(v) {
   const data = await api.get(`/vendors/${v.id}/payments/`)
   detail.value = data.vendor
   payments.value = data.payments
+}
+
+async function reloadDetail() {
+  if (!detail.value) return
+  await openDetail({ id: detail.value.id })
+  await load()
 }
 
 async function savePayment() {
@@ -226,6 +235,28 @@ async function savePayment() {
             Record payment to vendor
           </v-btn>
 
+          <v-alert
+            v-if="detail.payable_as_of_date"
+            type="info"
+            variant="tonal"
+            density="compact"
+            class="mb-2"
+          >
+            We owed {{ money(detail.payable_as_of_amount) }} as of
+            {{ detail.payable_as_of_date }}; arrived stock and payments after
+            that day are added on top.
+          </v-alert>
+          <v-btn
+            color="primary"
+            variant="tonal"
+            block
+            prepend-icon="mdi-calendar-edit"
+            class="mb-3"
+            @click="payableDialog = true"
+          >
+            Set payable as of date
+          </v-btn>
+
           <div class="text-subtitle-2 mb-1">Payment history</div>
           <v-table density="compact">
             <tbody>
@@ -270,6 +301,20 @@ async function savePayment() {
         </v-card-actions>
       </v-card>
     </v-dialog>
+
+    <!-- Payable as of a date (editable at any time) -->
+    <BalanceMarkerDialog
+      v-if="detail"
+      v-model="payableDialog"
+      title="Vendor payable as of a date"
+      amount-label="Amount we owed on that date"
+      total-label="We owe now"
+      :endpoint="`/vendors/${detail.id}/payable/`"
+      :amount="detail.payable_as_of_amount"
+      :date="detail.payable_as_of_date"
+      :active="!!detail.payable_as_of_date"
+      @saved="reloadDetail"
+    />
   </div>
 </template>
 

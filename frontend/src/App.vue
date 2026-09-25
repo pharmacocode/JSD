@@ -19,8 +19,7 @@ const isRoot = computed(() => route.path === '/')
 const snack = computed(() => ui.toast)
 
 function goBack() {
-  // Multi-step views register their own back behaviour (e.g. Add Delivery
-  // steps back through its steps); otherwise use browser history.
+  // A view may register its own back behaviour; otherwise use browser history.
   if (ui.backAction) {
     ui.backAction()
     return
@@ -54,6 +53,13 @@ function goHome() {
         JSD Group
       </v-app-bar-title>
       <v-spacer />
+      <!-- Vendor branding, top-right of the banner (user request). -->
+      <span
+        class="text-body-2 text-white mr-2 text-no-wrap"
+        style="opacity: 0.9"
+      >
+        Pharmaco &copy;
+      </span>
       <v-btn
         v-if="$vuetify.display.mdAndUp"
         icon="mdi-menu"

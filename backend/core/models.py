@@ -41,6 +41,72 @@ def dstr(value):
     return s or "0"
 
 
+def _split_items(items, as_of):
+    """
+    Split dated movements around an "as of" marker date. Entries dated strictly
+    AFTER the marked date are applied on top of the entered figure; everything
+    on or before it is already inside that figure (superseded, never counted
+    twice). `as_of=None` means no marker -> nothing is superseded.
+    """
+    if as_of is None:
+        return list(items), []
+    applied = [i for i in items if i["date"] > as_of]
+    superseded = [i for i in items if i["date"] <= as_of]
+    return applied, superseded
+
+
+def _item_out(item):
+    """Dated movement -> JSON row shared by the client/vendor marker dialogs."""
+    return {
+        "id": item["id"],
+        "date": item["date"].isoformat(),
+        "entry_type": item.get("entry_type", ""),
+        "label": item["label"],
+        "detail": item.get("detail", ""),
+        "amount": str(money(item["amount"])),
+    }
+
+
+def _ledger_item(entry):
+    """ClientLedgerEntry -> raw movement row (_item_out renders the JSON row)."""
+    detail = ""
+    if entry.related_delivery_id:
+        d = entry.related_delivery
+        detail = f"{d.sku.description} × {d.qty_cases} cases"
+    return {
+        "id": entry.id,
+        "date": entry.date,
+        "entry_type": entry.entry_type,
+        "label": entry.note or entry.get_entry_type_display(),
+        "detail": detail,
+        "amount": entry.amount,
+    }
+
+
+def _marker_payload(as_of, base, applied_total, applied, superseded, pure):
+    """
+    Common shape for both marker dialogs (see BalanceMarkerDialog.vue):
+    entered `amount` + the movements after `as_of` = `total`.
+    """
+    return {
+        "as_of": as_of.isoformat() if as_of else None,
+        "marker_active": as_of is not None,
+        "amount": str(money(base)),
+        "total": str(money(base + applied_total)),
+        "pure_total": str(money(pure)),
+        "after": {
+            "count": len(applied),
+            "total": str(money(applied_total)),
+            "entries": [_item_out(i) for i in applied],
+        },
+        "before": {
+            "count": len(superseded),
+            "total": str(money(pure - applied_total)),
+            "entries": [_item_out(i) for i in superseded],
+        },
+    }
+
+
 class AuditModel(models.Model):
     """
     Base for editable/deletable transactional records (spec Section 3.7).
@@ -117,6 +183,15 @@ class AuditModel(models.Model):
 class Vendor(models.Model):
     name = models.CharField(max_length=200, unique=True)
     contact_number = models.CharField(max_length=30, blank=True, default="")
+    # Payable marker (user request): what we owed this vendor, entered/edited at
+    # any time and valid as of a date the user marks. `payable_as_of_date is
+    # None` => no marker and the payable is simply purchases − payments. With a
+    # marker, arrived stock + payments dated strictly AFTER that date are added
+    # on top of the entered figure (older ones are already inside it).
+    payable_as_of_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0
+    )
+    payable_as_of_date = models.DateField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -126,34 +201,103 @@ class Vendor(models.Model):
         return self.name
 
     @property
-    def total_purchased(self):
-        """Landed value of all arrived stock from this vendor's materials."""
+    def has_payable_marker(self):
+        return self.payable_as_of_date is not None
+
+    def _purchased(self, after=None):
+        """Raw landed value of arrived stock, optionally only after a date."""
         from django.db.models import Sum
 
-        total = (
-            MaterialBatch.objects.filter(
-                material__vendor=self, is_deleted=False
-            ).aggregate(s=Sum(F("quantity_received") * F("price_per_unit")))["s"]
+        qs = MaterialBatch.objects.filter(material__vendor=self, is_deleted=False)
+        if after is not None:
+            qs = qs.filter(arrival_date__gt=after)
+        return (
+            qs.aggregate(s=Sum(F("quantity_received") * F("price_per_unit")))["s"]
             or Decimal("0")
         )
-        return money(total)
+
+    def _paid(self, after=None):
+        """Raw payments made to this vendor, optionally only after a date."""
+        from django.db.models import Sum
+
+        qs = VendorPayment.objects.filter(vendor=self, is_deleted=False)
+        if after is not None:
+            qs = qs.filter(date__gt=after)
+        return qs.aggregate(s=Sum("amount"))["s"] or Decimal("0")
+
+    @property
+    def total_purchased(self):
+        """Landed value of all arrived stock from this vendor's materials."""
+        return money(self._purchased())
 
     @property
     def total_paid(self):
-        from django.db.models import Sum
-
-        total = (
-            VendorPayment.objects.filter(
-                vendor=self, is_deleted=False
-            ).aggregate(s=Sum("amount"))["s"]
-            or Decimal("0")
-        )
-        return money(total)
+        return money(self._paid())
 
     @property
     def amount_owed(self):
-        """What we still owe: purchases received - payments made (INR)."""
-        return money(self.total_purchased - self.total_paid)
+        """
+        What we still owe (INR). Without a marker: purchases − payments over all
+        time. With a marker: the user's figure as of the marked date, plus every
+        purchase/payment dated strictly after it.
+        """
+        if self.payable_as_of_date is None:
+            return money(self._purchased() - self._paid())
+        return money(
+            self.payable_as_of_amount
+            + self._purchased(self.payable_as_of_date)
+            - self._paid(self.payable_as_of_date)
+        )
+
+    def payable_items(self):
+        """Every payable movement (purchases +, payments −), oldest first."""
+        items = []
+        for b in (
+            MaterialBatch.objects.filter(material__vendor=self, is_deleted=False)
+            .select_related("material")
+            .order_by("arrival_date", "id")
+        ):
+            items.append(
+                {
+                    "id": b.id,
+                    "date": b.arrival_date,
+                    "entry_type": "PURCHASE",
+                    "label": b.material.name,
+                    "detail": f"{dstr(b.quantity_received)} × {b.price_per_unit}",
+                    # Display row only — totals use the exact aggregates below.
+                    "amount": b.quantity_received * b.price_per_unit,
+                }
+            )
+        for p in VendorPayment.objects.filter(vendor=self, is_deleted=False):
+            items.append(
+                {
+                    "id": p.id,
+                    "date": p.date,
+                    "entry_type": "PAYMENT",
+                    "label": p.note or "Payment",
+                    "detail": "",
+                    "amount": -p.amount,
+                }
+            )
+        items.sort(key=lambda i: (i["date"], i["id"]))
+        return items
+
+    def payable_breakdown(self, as_of=None, amount=None):
+        """
+        Payable split for the marker, in the shared marker-dialog payload shape
+        (see Client.pending_breakdown). Pass `as_of`/`amount` to preview a
+        candidate marker without saving it.
+        """
+        items = self.payable_items()
+        applied, superseded = _split_items(items, as_of)
+        pure = self._purchased() - self._paid()
+        if as_of is None:
+            base = Decimal("0")
+            after_total = pure
+        else:
+            base = self.payable_as_of_amount if amount is None else amount
+            after_total = self._purchased(as_of) - self._paid(as_of)
+        return _marker_payload(as_of, base, after_total, applied, superseded, pure)
 
 
 class VendorPayment(models.Model):
@@ -185,6 +329,15 @@ class Client(models.Model):
     opening_pending_amount = models.DecimalField(
         max_digits=12, decimal_places=2, default=0
     )
+    # Pending marker (user request): the pending figure the user enters/edits at
+    # any time, valid as of a date they mark. Ledger entries dated strictly AFTER
+    # that date are added on top (see pending_amount / pending_breakdown); older
+    # ones are already inside the figure. `pending_as_of_date is None` => no
+    # marker and the pending balance is the plain live ledger sum (spec 3.2).
+    pending_as_of_amount = models.DecimalField(
+        max_digits=12, decimal_places=2, default=0
+    )
+    pending_as_of_date = models.DateField(null=True, blank=True)
     created_at = models.DateTimeField(auto_now_add=True)
 
     class Meta:
@@ -208,15 +361,62 @@ class Client(models.Model):
             )
 
     @property
+    def has_pending_marker(self):
+        return self.pending_as_of_date is not None
+
+    def ledger_entries_chronological(self):
+        """
+        Live (non-deleted) ledger entries, oldest first. The ledger tab, the
+        running balances and the marker math all walk this one list.
+        """
+        return list(
+            self.ledger_entries.filter(is_deleted=False)
+            .select_related("related_delivery__sku")
+            .order_by("date", "id")
+        )
+
+    @property
     def pending_amount(self):
-        """Live sum of ledger entries — the single source of truth (spec 3.2)."""
+        """
+        Live pending balance — the ledger sum is the single source of truth
+        (spec 3.2). When the user has marked a pending amount as of a date, that
+        figure replaces everything dated on or before that date and only ledger
+        entries dated strictly after it are added on top.
+        """
         from django.db.models import Sum
 
-        total = (
-            self.ledger_entries.filter(is_deleted=False).aggregate(s=Sum("amount"))["s"]
-            or Decimal("0.00")
-        )
+        qs = self.ledger_entries.filter(is_deleted=False)
+        total = Decimal("0.00")
+        if self.pending_as_of_date is None:
+            total = qs.aggregate(s=Sum("amount"))["s"] or Decimal("0.00")
+        else:
+            later = qs.filter(date__gt=self.pending_as_of_date).aggregate(
+                s=Sum("amount")
+            )["s"] or Decimal("0.00")
+            total = self.pending_as_of_amount + later
         return money(total)
+
+    def pending_breakdown(self, as_of=None, amount=None):
+        """
+        Pending split for the marker, in the payload shape shared by the client
+        and vendor marker dialogs:
+            amount (the entered figure) + after.total (later entries) = total
+        `before` lists the superseded entries and `pure_total` shows what the
+        balance would be with no marker at all. Pass `as_of`/`amount` to preview
+        a candidate marker without saving it.
+        """
+        rows = [_ledger_item(e) for e in self.ledger_entries_chronological()]
+        applied, superseded = _split_items(rows, as_of)
+        pure = sum((r["amount"] for r in rows), Decimal("0"))
+        if as_of is None:
+            base = Decimal("0")
+            after_total = pure
+        else:
+            base = self.pending_as_of_amount if amount is None else amount
+            after_total = sum((r["amount"] for r in applied), Decimal("0"))
+        return _marker_payload(
+            as_of, base, after_total, applied, superseded, pure
+        )
 
 
 class ClientSKUPrice(models.Model):
@@ -423,6 +623,11 @@ class MaterialBatch(AuditModel):
             f"({self.quantity_remaining}/{self.quantity_received})"
         )
 
+    @property
+    def consumed_quantity(self):
+        """Cases already taken out of this batch by FIFO (received − remaining)."""
+        return qty(self.quantity_received - self.quantity_remaining)
+
     def _audit_snapshot(self):
         return {
             "material": self.material_id,
@@ -434,7 +639,37 @@ class MaterialBatch(AuditModel):
         }
 
     def save(self, *args, **kwargs):
-        # Audit handled by AuditModel.save -> _run_audit using _audit_snapshot.
+        """
+        Audit handled by AuditModel.save -> _run_audit using _audit_snapshot.
+
+        User request: the inward-material line items on the Home screen are
+        editable. When `quantity_received` is corrected, `quantity_remaining`
+        moves by the SAME delta, so:
+        - cases already consumed stay consumed (the consumed quantity is the
+          anchor, not the received quantity),
+        - stock in hand, the FIFO queue, the vendor payable and shortfall checks
+          all follow the new figure immediately,
+        - shrinking a batch below what was already consumed drives the remainder
+          negative — the same convention the FIFO shortfall path uses — so the
+          discrepancy stays visible and can be reconciled by a Stock Adjustment.
+
+        The FIFO engine itself only ever changes `quantity_remaining`, so its
+        bookkeeping saves are a no-op here (delta = 0).
+        """
+        if self._state.adding:
+            if self.quantity_remaining is None:
+                self.quantity_remaining = self.quantity_received
+        elif self.pk:
+            previous = (
+                type(self)
+                .objects.filter(pk=self.pk)
+                .values_list("quantity_received", flat=True)
+                .first()
+            )
+            if previous is not None and previous != self.quantity_received:
+                self.quantity_remaining = qty(
+                    self.quantity_remaining + (self.quantity_received - previous)
+                )
         super().save(*args, **kwargs)
 
 
@@ -574,12 +809,15 @@ class StockDelivery(AuditModel):
 
 # ---------------------------------------------------------------------------
 # 4.4 StockAdjustment — signed adjustment record layered on top of the FIFO
-# queue (confirmed with user — assumption 2). We deliberately do NOT edit
-# MaterialBatch rows silently. A positive adjustment is booked as a new
-# zero-price MaterialBatch (enters FIFO queue at the back, oldest-first order
-# preserved); a negative adjustment consumes from the oldest batches using the
-# same FIFO walker as deliveries (so negative stock is possible and visible).
+# queue (confirmed with user — assumption 2). A positive adjustment is booked as
+# a new zero-price MaterialBatch (enters FIFO queue at the back, oldest-first
+# order preserved); a negative adjustment consumes from the oldest batches using
+# the same FIFO walker as deliveries (so negative stock is possible and visible).
 # Both directions are recorded here with a mandatory reason for the audit view.
+# Note (user request): a wrongly keyed arrival is now corrected on the Home
+# screen by editing the MaterialBatch line item itself — that is an audited,
+# deliberate edit (see MaterialBatch.save), while unaccounted differences still
+# go through a StockAdjustment with a reason.
 # ---------------------------------------------------------------------------
 class StockAdjustment(models.Model):
     material = models.ForeignKey(

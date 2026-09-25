@@ -24,7 +24,9 @@ const error = ref('')
 const catDialog = ref(false)
 const catName = ref('')
 const empDialog = ref(false)
-const empForm = ref({ name: '', role: '', monthly_pay: 0, active: true })
+// One dialog for both add and edit — `empForm.id` decides which (user request:
+// employee details used to be create-only and could not be corrected).
+const empForm = ref(blankEmployee())
 const payDialog = ref(false)
 const payForm = ref({ employee: null, amount_paid: null, date: '', note: '' })
 
@@ -108,13 +110,53 @@ async function removeCategory(c) {
   await load()
 }
 
+function blankEmployee() {
+  return { id: null, name: '', role: '', monthly_pay: 0, active: true }
+}
+
+/** Open the dialog in add mode (no argument) or edit mode (employee row). */
+function openEmployee(employee = null) {
+  empForm.value = employee
+    ? {
+        id: employee.id,
+        name: employee.name,
+        role: employee.role || '',
+        monthly_pay: Number(employee.monthly_pay || 0),
+        active: employee.active !== false,
+      }
+    : blankEmployee()
+  empDialog.value = true
+}
+
 async function saveEmployee() {
-  const payload = { ...empForm.value, monthly_pay: String(empForm.value.monthly_pay) }
-  if (empForm.value.id) await api.put(`/employees/${empForm.value.id}/`, payload)
-  else await api.post('/employees/', payload)
-  empDialog.value = false
-  empForm.value = { name: '', role: '', monthly_pay: 0, active: true }
-  employees.value = listify(await api.get('/employees/'))
+  error.value = ''
+  if (!empForm.value.name?.trim()) {
+    error.value = 'Employee name is required.'
+    return
+  }
+  saving.value = true
+  try {
+    const payload = {
+      name: empForm.value.name.trim(),
+      role: empForm.value.role || '',
+      monthly_pay: String(empForm.value.monthly_pay || 0),
+      active: empForm.value.active !== false,
+    }
+    if (empForm.value.id) {
+      await api.put(`/employees/${empForm.value.id}/`, payload)
+      ui.notify(`${payload.name} updated`)
+    } else {
+      await api.post('/employees/', payload)
+      ui.notify(`${payload.name} added`)
+    }
+    empDialog.value = false
+    empForm.value = blankEmployee()
+    employees.value = listify(await api.get('/employees/'))
+  } catch (e) {
+    error.value = e.message
+  } finally {
+    saving.value = false
+  }
 }
 
 async function savePayment() {
@@ -180,7 +222,7 @@ async function deletePayment(p) {
               <div class="d-flex align-center mb-2">
                 <span class="text-subtitle-2">Employees</span>
                 <v-spacer />
-                <v-btn size="x-small" variant="tonal" @click="empDialog = true">
+                <v-btn size="x-small" variant="tonal" @click="openEmployee()">
                   Add employee
                 </v-btn>
                 <v-btn size="x-small" variant="tonal" class="ml-1" @click="payDialog = true">
@@ -196,8 +238,30 @@ async function deletePayment(p) {
                       <span class="text-caption text-medium-contrast">
                         {{ e.role }}
                       </span>
+                      <v-chip
+                        v-if="!e.active"
+                        size="x-small"
+                        variant="tonal"
+                        class="ml-1"
+                      >
+                        inactive
+                      </v-chip>
                     </td>
                     <td class="text-right">{{ money(e.monthly_pay) }}/mo</td>
+                    <td style="width: 40px">
+                      <v-btn
+                        icon="mdi-pencil-outline"
+                        size="x-small"
+                        variant="text"
+                        title="Edit employee"
+                        @click="openEmployee(e)"
+                      />
+                    </td>
+                  </tr>
+                  <tr v-if="!employees.length">
+                    <td colspan="3" class="text-medium-contrast">
+                      No employees yet — use Add employee.
+                    </td>
                   </tr>
                 </tbody>
               </v-table>
@@ -284,10 +348,12 @@ async function deletePayment(p) {
       </v-card>
     </v-dialog>
 
-    <!-- Add employee -->
+    <!-- Add / edit employee (details stay editable — user request) -->
     <v-dialog v-model="empDialog" max-width="400">
       <v-card>
-        <v-card-title>Add employee</v-card-title>
+        <v-card-title>
+          {{ empForm.id ? 'Edit employee' : 'Add employee' }}
+        </v-card-title>
         <v-card-text>
           <v-text-field v-model="empForm.name" label="Name" />
           <v-text-field v-model="empForm.role" label="Role" />
@@ -297,11 +363,24 @@ async function deletePayment(p) {
             prefix="₹"
             label="Monthly pay"
           />
+          <v-switch
+            v-model="empForm.active"
+            color="primary"
+            label="Active"
+            hide-details
+            density="compact"
+          />
+          <div class="text-caption text-medium-contrast mt-1">
+            Inactive employees stay in the list — their logged payments keep
+            their month's Labour total intact.
+          </div>
         </v-card-text>
         <v-card-actions>
           <v-spacer />
           <v-btn variant="text" @click="empDialog = false">Cancel</v-btn>
-          <v-btn color="primary" @click="saveEmployee">Save</v-btn>
+          <v-btn color="primary" :loading="saving" @click="saveEmployee">
+            Save
+          </v-btn>
         </v-card-actions>
       </v-card>
     </v-dialog>

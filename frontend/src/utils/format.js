@@ -24,14 +24,22 @@ export function monthKey(date = new Date()) {
   return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}`
 }
 
+const MONTHS = [
+  'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
+  'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
+]
+
 export function monthLabel(key) {
   if (!key) return ''
   const [y, m] = key.split('-')
-  const names = [
-    'Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun',
-    'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec',
-  ]
-  return `${names[Number(m) - 1]} ${y}`
+  return `${MONTHS[Number(m) - 1]} ${y}`
+}
+
+/** 'Sep, 2026' — heading format for the Home summary (user request). */
+export function monthLong(key) {
+  if (!key) return ''
+  const [y, m] = key.split('-')
+  return `${MONTHS[Number(m) - 1]}, ${y}`
 }
 
 export function fmtDate(d) {

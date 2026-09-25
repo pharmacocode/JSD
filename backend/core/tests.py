@@ -571,5 +571,445 @@ class APITests(TestCase):
         self.assertIn("rolling_30d_avg_cases_per_day", resp.data)
 
 
+class ClientPendingMarkerTests(TestCase):
+    """
+    User request: the client's pending amount is editable at any time, together
+    with the date it refers to. Ledger entries dated strictly after the marked
+    day are added on top; everything on or before it is already inside the
+    entered figure (superseded, never counted twice).
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.client_obj = Client.objects.create(name="Marker Client")
+        self.older = ClientLedgerEntry.objects.create(
+            client=self.client_obj,
+            entry_type="DELIVERY",
+            amount=D("1000"),
+            date=date(2026, 9, 10),
+        )
+        self.later = ClientLedgerEntry.objects.create(
+            client=self.client_obj,
+            entry_type="DELIVERY",
+            amount=D("500"),
+            date=date(2026, 9, 30),
+        )
+        self.url = f"/api/clients/{self.client_obj.id}/pending/"
+
+    def test_preview_splits_entries_without_saving(self):
+        # 2,500 marked as of 25 Sep -> only the 30 Sep delivery is added on top.
+        resp = self.api.get(self.url, {"as_of": "2026-09-25", "amount": "2500"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["amount"], "2500.00")
+        self.assertEqual(resp.data["after"]["count"], 1)
+        self.assertEqual(resp.data["after"]["total"], "500.00")
+        self.assertEqual(resp.data["before"]["count"], 1)
+        self.assertEqual(resp.data["before"]["total"], "1000.00")
+        self.assertEqual(resp.data["total"], "3000.00")
+        self.assertEqual(resp.data["pure_total"], "1500.00")
+        self.client_obj.refresh_from_db()
+        self.assertIsNone(self.client_obj.pending_as_of_date)  # preview only
+
+    def test_marker_is_settable_editable_and_clearable(self):
+        resp = self.api.post(
+            self.url, {"amount": "2500", "date": "2026-09-25"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["pending_amount"], "3000.00")
+        self.client_obj.refresh_from_db()
+        self.assertEqual(self.client_obj.pending_as_of_date, date(2026, 9, 25))
+        self.assertEqual(self.client_obj.pending_amount, D("3000"))
+
+        # Editable at any time: same endpoint, new figure + new date.
+        resp = self.api.post(
+            self.url, {"amount": "1200", "date": "2026-09-09"}, format="json"
+        )
+        self.assertEqual(resp.data["amount"], "1200.00")
+        self.assertEqual(resp.data["after"]["count"], 2)  # both are later now
+        self.assertEqual(resp.data["pending_amount"], "2700.00")
+
+        # Clearing returns to the plain live ledger sum.
+        resp = self.api.delete(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.data["marker_active"])
+        self.assertEqual(resp.data["pending_amount"], "1500.00")
+        self.client_obj.refresh_from_db()
+        self.assertIsNone(self.client_obj.pending_as_of_date)
+        self.assertEqual(self.client_obj.pending_amount, D("1500"))
+
+    def test_entry_on_the_marked_day_is_inside_the_figure(self):
+        ClientLedgerEntry.objects.create(
+            client=self.client_obj,
+            entry_type="PAYMENT",
+            amount=D("-200"),
+            date=date(2026, 9, 25),
+        )
+        self.client_obj.pending_as_of_amount = D("2500")
+        self.client_obj.pending_as_of_date = date(2026, 9, 25)
+        self.client_obj.save()
+        # 10 Sep delivery + the 25 Sep payment sit inside the 2,500 figure;
+        # only the 30 Sep delivery is added -> 3,000.
+        self.assertEqual(self.client_obj.pending_amount, D("3000"))
+
+    def test_amount_and_date_are_required(self):
+        resp = self.api.post(self.url, {"date": "2026-09-25"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(resp.data["detail"], "amount is required")
+        resp = self.api.post(self.url, {"amount": "100"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("date", resp.data["detail"])
+
+    def test_ledger_flags_superseded_entries_and_restarts_balance(self):
+        self.client_obj.pending_as_of_amount = D("2500")
+        self.client_obj.pending_as_of_date = date(2026, 9, 25)
+        self.client_obj.save()
+        resp = self.api.get(f"/api/clients/{self.client_obj.id}/ledger/")
+        rows = {r["id"]: r for r in resp.data["entries"]}
+        self.assertTrue(rows[self.older.id]["is_superseded"])
+        self.assertIsNone(rows[self.older.id]["running_balance"])
+        self.assertFalse(rows[self.later.id]["is_superseded"])
+        self.assertEqual(rows[self.later.id]["running_balance"], "3000.00")
+        self.assertEqual(resp.data["superseded_count"], 1)
+        self.assertEqual(resp.data["superseded_total"], "1000.00")
+        self.assertEqual(resp.data["pending_as_of_date"], "2026-09-25")
+
+    def test_client_payload_exposes_marker_fields(self):
+        resp = self.api.get(f"/api/clients/{self.client_obj.id}/")
+        self.assertEqual(resp.data["pending_as_of_amount"], "0.00")
+        self.assertIsNone(resp.data["pending_as_of_date"])
+        # A plain PATCH writes the marker too (fields are editable).
+        resp = self.api.patch(
+            f"/api/clients/{self.client_obj.id}/",
+            {"pending_as_of_amount": "2500.00", "pending_as_of_date": "2026-09-25"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["pending_amount"], "3000.00")
+
+
+class VendorPayableMarkerTests(TestCase):
+    """
+    User request (vendor side): what we owe a vendor is editable at any time,
+    together with the date it refers to. Arrived stock and payments dated
+    strictly after the marked day are added on top of the entered figure.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.vendor = Vendor.objects.create(name="Marker Vendor")
+        self.material = make_material("Cap for marker", "5", vendor=self.vendor)
+        make_batch(self.material, "100", "5", date(2026, 9, 10))  # 500
+        make_batch(self.material, "200", "5", date(2026, 9, 30))  # 1000
+        VendorPayment.objects.create(
+            vendor=self.vendor, amount=D("300"), date=date(2026, 9, 20)
+        )
+        VendorPayment.objects.create(
+            vendor=self.vendor, amount=D("100"), date=date(2026, 10, 5)
+        )
+        self.url = f"/api/vendors/{self.vendor.id}/payable/"
+
+    def test_without_marker_payable_is_purchases_minus_payments(self):
+        self.assertEqual(self.vendor.amount_owed, D("1100"))  # 1500 − 400
+
+    def test_marker_adds_only_later_movements(self):
+        resp = self.api.post(
+            self.url, {"amount": "250", "date": "2026-09-25"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["amount"], "250.00")
+        # After 25 Sep: 1,000 purchase (30 Sep) − 100 payment (5 Oct).
+        self.assertEqual(resp.data["after"]["count"], 2)
+        self.assertEqual(resp.data["after"]["total"], "900.00")
+        self.assertEqual(resp.data["before"]["count"], 2)  # 10 Sep + 20 Sep
+        self.assertEqual(resp.data["total"], "1150.00")
+        self.assertEqual(resp.data["amount_owed"], "1150.00")
+        self.vendor.refresh_from_db()
+        self.assertEqual(self.vendor.payable_as_of_date, date(2026, 9, 25))
+        self.assertEqual(self.vendor.amount_owed, D("1150"))
+        # Lifetime tiles keep showing all-time totals.
+        self.assertEqual(self.vendor.total_purchased, D("1500"))
+        self.assertEqual(self.vendor.total_paid, D("400"))
+
+    def test_movement_on_the_marked_day_is_inside_the_figure(self):
+        VendorPayment.objects.create(
+            vendor=self.vendor, amount=D("300"), date=date(2026, 9, 25)
+        )
+        self.vendor.payable_as_of_amount = D("250")
+        self.vendor.payable_as_of_date = date(2026, 9, 25)
+        self.vendor.save()
+        self.assertEqual(self.vendor.amount_owed, D("1150"))
+
+    def test_soft_deleted_movements_are_ignored(self):
+        batch = make_batch(self.material, "50", "5", date(2026, 10, 10))
+        batch.soft_delete()
+        payment = VendorPayment.objects.create(
+            vendor=self.vendor, amount=D("50"), date=date(2026, 10, 10)
+        )
+        payment.is_deleted = True
+        payment.save()
+        self.vendor.payable_as_of_amount = D("250")
+        self.vendor.payable_as_of_date = date(2026, 9, 25)
+        self.vendor.save()
+        self.assertEqual(self.vendor.amount_owed, D("1150"))
+
+    def test_clear_marker_restores_purchases_minus_payments(self):
+        self.vendor.payable_as_of_amount = D("250")
+        self.vendor.payable_as_of_date = date(2026, 9, 25)
+        self.vendor.save()
+        resp = self.api.delete(self.url)
+        self.assertEqual(resp.status_code, 200)
+        self.assertFalse(resp.data["marker_active"])
+        self.assertEqual(resp.data["amount_owed"], "1100.00")
+        self.vendor.refresh_from_db()
+        self.assertIsNone(self.vendor.payable_as_of_date)
+
+    def test_vendor_payload_exposes_marker_fields(self):
+        resp = self.api.get(f"/api/vendors/{self.vendor.id}/")
+        self.assertEqual(resp.data["payable_as_of_amount"], "0.00")
+        self.assertIsNone(resp.data["payable_as_of_date"])
+        self.assertEqual(resp.data["amount_owed"], "1100.00")
+
+
+class EmployeeEditTests(TestCase):
+    """
+    User request: employee details were create-only from the UI — name, role,
+    monthly pay and active flag must be editable at any time.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.employee = Employee.objects.create(
+            name="Ramesh", role="Helper", monthly_pay=D("12000")
+        )
+        self.url = f"/api/employees/{self.employee.id}/"
+
+    def test_employee_details_can_be_edited(self):
+        resp = self.api.put(
+            self.url,
+            {
+                "name": "Ramesh Kumar",
+                "role": "Supervisor",
+                "monthly_pay": "15000",
+                "active": True,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.employee.refresh_from_db()
+        self.assertEqual(self.employee.name, "Ramesh Kumar")
+        self.assertEqual(self.employee.role, "Supervisor")
+        self.assertEqual(self.employee.monthly_pay, D("15000"))
+
+    def test_single_field_edits_and_deactivation(self):
+        resp = self.api.patch(self.url, {"monthly_pay": "13000"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.employee.refresh_from_db()
+        self.assertEqual(self.employee.monthly_pay, D("13000"))
+        self.assertEqual(self.employee.name, "Ramesh")  # untouched
+
+        resp = self.api.patch(self.url, {"active": False}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.employee.refresh_from_db()
+        self.assertFalse(self.employee.active)
+        # Retired staff stay listed — their payments keep rolling into Labour.
+        listing = self.api.get("/api/employees/")
+        rows = listing.data["results"] if "results" in listing.data else listing.data
+        self.assertEqual([e["name"] for e in rows], ["Ramesh"])
+
+    def test_editing_an_employee_does_not_disturb_the_labour_rollup(self):
+        EmployeePayment.objects.create(
+            employee=self.employee, month="2026-09", amount_paid=D("5000")
+        )
+        self.api.patch(self.url, {"monthly_pay": "13000"}, format="json")
+        labour = MonthlyOverhead.objects.get(month="2026-09", category__name="Labour")
+        self.assertEqual(labour.amount, D("5000"))
+
+
+class InwardLineItemEditTests(TestCase):
+    """
+    User request: the inward-material line items on the Home screen are
+    editable; correcting one moves every derived figure with it — stock in
+    hand, the FIFO queue, the vendor payable and the dashboard rows.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.vendor = Vendor.objects.create(name="Arrival Vendor")
+        self.mat = make_material(
+            "Bottle API", "10", vendor=self.vendor, stock_alert_qty=D("20")
+        )
+        self.batch = make_batch(self.mat, "100", "10", date(2026, 9, 5))
+        self.url = f"/api/batches/{self.batch.id}/"
+
+    def test_increasing_received_raises_stock_and_payable(self):
+        resp = self.api.patch(
+            self.url, {"quantity_received": "150"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.quantity_received, D("150"))
+        self.assertEqual(self.batch.quantity_remaining, D("150"))
+        self.assertEqual(self.mat.stock_in_hand, D("150"))
+        self.assertEqual(self.vendor.amount_owed, D("1500"))  # 150 × 10
+        self.assertTrue(self.batch.is_edited)  # the edit is audited
+        # DRF decimal fields render with the field's 4-dp precision.
+        self.assertEqual(resp.data["consumed"], "0.0000")
+        self.assertEqual(resp.data["material_unit"], "cases")
+
+    def test_reducing_keeps_what_was_already_consumed(self):
+        consume_fifo(self.mat, D("40"))
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.quantity_remaining, D("60"))
+        resp = self.api.patch(
+            self.url, {"quantity_received": "80", "price_per_unit": "11"}, format="json"
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.batch.refresh_from_db()
+        # The 40 consumed cases stay consumed: 80 − 40 = 40 in hand.
+        self.assertEqual(self.batch.quantity_remaining, D("40"))
+        self.assertEqual(self.batch.consumed_quantity, D("40"))
+        self.assertEqual(self.mat.stock_in_hand, D("40"))
+        self.assertEqual(self.vendor.amount_owed, D("880"))  # 80 × 11
+        self.assertFalse(self.mat.is_below_alert)  # 40 >= alert 20
+
+    def test_reducing_below_consumed_goes_visible_negative(self):
+        consume_fifo(self.mat, D("90"))
+        resp = self.api.patch(self.url, {"quantity_received": "50"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.quantity_remaining, D("-40"))
+        self.assertEqual(self.mat.stock_in_hand, D("-40"))
+        self.assertTrue(self.mat.is_below_alert)  # reconciliable via adjustment
+
+    def test_corrected_price_drives_fifo_cost_from_then_on(self):
+        self.api.patch(self.url, {"price_per_unit": "12"}, format="json")
+        _consumption, cost, _short = consume_fifo(self.mat, D("10"))
+        self.assertEqual(cost, D("120"))  # new landed price used by FIFO
+
+    def test_soft_deleted_arrival_leaves_stock_and_payable(self):
+        resp = self.api.delete(self.url)
+        self.assertEqual(resp.status_code, 204)
+        self.assertEqual(self.mat.stock_in_hand, D("0"))
+        self.assertEqual(self.vendor.amount_owed, D("0"))
+        batches = self.api.get(f"/api/materials/{self.mat.id}/batches/")
+        self.assertEqual(batches.data["batches"], [])
+
+
+class DashboardSummaryTests(TestCase):
+    """
+    User request: the Home summary shows profit too, one chart area is driven by
+    the selected metric (cases per SKU / revenue per client / profit per client,
+    with an overhead toggle), and each inward row carries its editable line
+    items. These tests pin the figures behind those charts.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.alpha = Client.objects.create(name="Alpha")
+        self.beta = Client.objects.create(name="Beta")
+        self.mat = make_material("Bottle API", "10")
+        make_batch(self.mat, "100", "10", date(2026, 9, 1))
+        self.sku = SKU.objects.create(description="Serum 500ml", qty_per_case=D("1"))
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.mat, qty_per_case=D("1")
+        )
+        self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.alpha.id,
+                "sku": self.sku.id,
+                "qty_cases": "2",
+                "selling_price_per_case": "500",
+                "date": "2026-09-10",
+            },
+            format="json",
+        )
+        self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.beta.id,
+                "sku": self.sku.id,
+                "qty_cases": "5",
+                "selling_price_per_case": "400",
+                "date": "2026-09-12",
+            },
+            format="json",
+        )
+        MonthlyOverhead.objects.create(
+            category=OverheadCategory.objects.get(name="Rent"),
+            month="2026-09",
+            amount=D("350"),
+        )
+
+    def stats(self):
+        return self.api.get("/api/dashboard/?month=2026-09").data["stats"]
+
+    def test_totals_include_profit_with_and_without_overhead(self):
+        stats = self.stats()
+        self.assertEqual(stats["total_cases"], "7")
+        self.assertEqual(D(stats["total_revenue"]), D("3000"))  # 2×500 + 5×400
+        self.assertEqual(D(stats["total_direct_cost"]), D("70"))  # 7 × 10 FIFO
+        self.assertEqual(D(stats["total_overhead"]), D("350"))
+        self.assertEqual(D(stats["total_profit_excl_overhead"]), D("2930"))
+        self.assertEqual(D(stats["total_profit_incl_overhead"]), D("2580"))
+        # 350 overhead across 7 cases = 50/case.
+        self.assertEqual(D(stats["overhead_per_case"]), D("50.00"))
+
+    def test_client_breakdown_is_high_to_low_and_adds_up(self):
+        stats = self.stats()
+        rows = stats["client_breakdown"]
+        self.assertEqual([r["client"] for r in rows], ["Beta", "Alpha"])
+        self.assertEqual(D(rows[0]["revenue"]), D("2000"))
+        self.assertEqual(D(rows[1]["revenue"]), D("1000"))
+        self.assertEqual(D(rows[0]["cases"]), D("5"))
+        self.assertEqual(D(rows[0]["overhead"]), D("250"))  # 5 × 50
+        # The bars add up to the summary cards (cards drive the charts).
+        self.assertEqual(
+            sum((D(r["profit_incl_overhead"]) for r in rows), D("0")),
+            D(stats["total_profit_incl_overhead"]),
+        )
+        self.assertEqual(
+            sum((D(r["profit_excl_overhead"]) for r in rows), D("0")),
+            D(stats["total_profit_excl_overhead"]),
+        )
+
+    def test_later_overhead_edits_move_profit_live(self):
+        MonthlyOverhead.objects.filter(
+            month="2026-09", category__name="Rent"
+        ).update(amount=D("1050"))
+        stats = self.stats()
+        self.assertEqual(D(stats["total_overhead"]), D("1050"))
+        self.assertEqual(D(stats["total_profit_incl_overhead"]), D("1880"))
+        self.assertEqual(D(stats["total_profit_excl_overhead"]), D("2930"))
+        self.assertEqual(D(stats["overhead_per_case"]), D("150.00"))
+
+    def test_cases_sold_per_sku_feeds_the_default_chart(self):
+        rows = self.stats()["cases_sold_per_sku"]
+        self.assertEqual(rows[0]["sku"], "Serum 500ml")
+        self.assertEqual(rows[0]["cases"], "7")
+        self.assertEqual(D(rows[0]["revenue"]), D("3000"))
+
+    def test_inward_rows_carry_editable_line_items(self):
+        stats = self.stats()
+        row = stats["inward_materials"][0]
+        self.assertEqual(row["material"], "Bottle API")
+        self.assertEqual(row["quantity"], "100")
+        self.assertEqual(len(row["items"]), 1)
+        item = row["items"][0]
+        self.assertEqual(item["quantity_received"], "100")
+        self.assertEqual(item["quantity_remaining"], "93")  # 7 consumed
+        self.assertEqual(item["consumed"], "7")
+        self.assertEqual(item["price_per_unit"], "10.00")
+
+        # Correcting the line item recalculates the row and stock in hand.
+        self.api.patch(
+            f"/api/batches/{item['id']}/", {"quantity_received": "50"}, format="json"
+        )
+        payload = self.api.get("/api/dashboard/?month=2026-09").data
+        self.assertEqual(payload["stats"]["inward_materials"][0]["quantity"], "50")
+        stock = {s["name"]: s for s in payload["stock"]}
+        self.assertEqual(stock["Bottle API"]["stock_in_hand"], "43")  # 50 − 7
+
+
 
 

@@ -39,6 +39,9 @@ class ClientSKUPriceSerializer(serializers.ModelSerializer):
 class ClientLedgerEntrySerializer(serializers.ModelSerializer):
     running_balance = serializers.SerializerMethodField()
     delivery_ref = serializers.SerializerMethodField()
+    # True when the client's pending "as of" marker supersedes this entry
+    # (dated on/before the marked date, so already inside the entered figure).
+    is_superseded = serializers.SerializerMethodField()
 
     class Meta:
         model = ClientLedgerEntry
@@ -52,12 +55,16 @@ class ClientLedgerEntrySerializer(serializers.ModelSerializer):
             "note",
             "date",
             "running_balance",
+            "is_superseded",
             "is_edited",
             "is_deleted",
             "edit_history",
             "created_at",
         ]
         read_only_fields = ["is_edited", "is_deleted", "edit_history"]
+
+    def get_is_superseded(self, obj):
+        return obj.id in self.context.get("superseded", set())
 
     def get_delivery_ref(self, obj):
         if obj.related_delivery_id:
@@ -96,6 +103,10 @@ class ClientSerializer(serializers.ModelSerializer):
             "google_maps_url",
             "contact_number",
             "opening_pending_amount",
+            # Pending marker — editable at any time via the client detail screen
+            # (POST/DELETE /clients/<id>/pending/) or a plain PATCH.
+            "pending_as_of_amount",
+            "pending_as_of_date",
             "created_at",
             "pending_amount",
             "sku_prices",
@@ -150,6 +161,10 @@ class VendorSerializer(serializers.ModelSerializer):
             "id",
             "name",
             "contact_number",
+            # Payable marker — editable at any time via the vendor detail screen
+            # (POST/DELETE /vendors/<id>/payable/) or a plain PATCH.
+            "payable_as_of_amount",
+            "payable_as_of_date",
             "amount_owed",
             "total_purchased",
             "total_paid",
@@ -186,6 +201,14 @@ class VendorPaymentSerializer(serializers.ModelSerializer):
 
 class MaterialBatchSerializer(serializers.ModelSerializer):
     material_name = serializers.CharField(source="material.name", read_only=True)
+    material_unit = serializers.CharField(
+        source="material.unit_of_measure", read_only=True
+    )
+    # Cases already consumed by this batch's FIFO walk (received − remaining).
+    # Read-only: it follows whatever `quantity_received` is edited to.
+    consumed = serializers.DecimalField(
+        source="consumed_quantity", max_digits=12, decimal_places=4, read_only=True
+    )
 
     class Meta:
         model = MaterialBatch
@@ -193,8 +216,10 @@ class MaterialBatchSerializer(serializers.ModelSerializer):
             "id",
             "material",
             "material_name",
+            "material_unit",
             "quantity_received",
             "quantity_remaining",
+            "consumed",
             "price_per_unit",
             "arrival_date",
             "note",

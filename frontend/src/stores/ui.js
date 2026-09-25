@@ -3,9 +3,8 @@ import { monthKey } from '@/utils/format'
 
 /**
  * Shared UI state: the currently selected month (Home stats, Overheads),
- * lightweight toast feedback, and an overridable header back action so
- * multi-step screens (Add Delivery) can walk back through their own steps
- * instead of leaving the page.
+ * lightweight toast feedback, and an optional overridable header back action
+ * that any view can register (leaving it unset falls back to browser history).
  */
 export const useUiStore = defineStore('ui', {
   state: () => ({
