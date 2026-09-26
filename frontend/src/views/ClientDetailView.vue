@@ -31,18 +31,24 @@ const payDate = ref(today())
 const payNote = ref('')
 const saving = ref(false)
 const error = ref('')
+// Lifetime revenue/profit stats (GET /clients/<id>/lifetime/).
+const lifetime = ref(null)
+// "with" = profit after direct costs + this client's share of overhead.
+const ohMode = ref('with')
 
 async function load() {
   loading.value = true
   try {
-    const [c, l, d] = await Promise.all([
+    const [c, l, d, lt] = await Promise.all([
       api.get(`/clients/${id}/`),
       api.get(`/clients/${id}/ledger/`),
       api.get(`/clients/${id}/deliveries/`),
+      api.get(`/clients/${id}/lifetime/`),
     ])
     client.value = c
     ledger.value = l
     deliveries.value = listify(d)
+    lifetime.value = lt
   } finally {
     loading.value = false
   }
@@ -51,6 +57,14 @@ onMounted(load)
 
 const pending = computed(() => ledger.value.pending_amount)
 const markerActive = computed(() => !!client.value?.pending_as_of_date)
+
+const lifetimeProfit = computed(() => {
+  const lt = lifetime.value
+  if (!lt) return '0'
+  return ohMode.value === 'with'
+    ? lt.profit_with_overhead
+    : lt.profit_without_overhead
+})
 
 const TYPE_COLORS = {
   DELIVERY: 'primary',
@@ -173,6 +187,61 @@ async function deleteEntry(entry) {
         >
           Record Payment
         </v-btn>
+      </v-card-text>
+    </v-card>
+
+    <!-- Lifetime revenue & profit (with/without overhead toggle) -->
+    <v-card class="mb-3">
+      <v-card-title class="d-flex align-center flex-wrap">
+        Lifetime
+        <v-spacer />
+        <v-btn-toggle v-model="ohMode" mandatory density="compact" color="primary">
+          <v-btn value="with">With overhead</v-btn>
+          <v-btn value="without">Without overhead</v-btn>
+        </v-btn-toggle>
+      </v-card-title>
+      <v-divider />
+      <v-card-text v-if="lifetime">
+        <v-table density="compact">
+          <tbody>
+            <tr>
+              <td>Revenue</td>
+              <td class="text-right font-weight-bold">
+                {{ money(lifetime.revenue) }}
+              </td>
+            </tr>
+            <tr>
+              <td>Direct cost (FIFO materials + print)</td>
+              <td class="text-right">- {{ money(lifetime.direct_cost) }}</td>
+            </tr>
+            <tr v-if="ohMode === 'with'">
+              <td>Overhead share</td>
+              <td class="text-right">- {{ money(lifetime.overhead) }}</td>
+            </tr>
+          </tbody>
+        </v-table>
+
+        <v-sheet
+          :color="Number(lifetimeProfit) >= 0 ? 'success' : 'error'"
+          rounded="lg"
+          class="mt-3 pa-3 text-center"
+        >
+          <div class="text-caption" style="color: #fff">
+            Lifetime profit —
+            {{ ohMode === 'with' ? 'with overhead' : 'without overhead' }}
+          </div>
+          <div class="text-h5 font-weight-bold" style="color: #fff">
+            {{ money(lifetimeProfit) }}
+          </div>
+        </v-sheet>
+
+        <div class="text-caption text-medium-emphasis mt-2 text-center">
+          {{ lifetime.delivery_count }} deliveries · {{ lifetime.cases }} cases —
+          recomputed from current prices on every load
+        </div>
+      </v-card-text>
+      <v-card-text v-else>
+        <v-progress-linear indeterminate />
       </v-card-text>
     </v-card>
 

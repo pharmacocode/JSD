@@ -20,10 +20,8 @@ const error = ref('')
 
 onMounted(async () => {
   skus.value = listify(await api.get('/skus/'))
-  if (skus.value.length) {
-    sku.value = skus.value[0].id
-    await load()
-  }
+  // Default to the aggregate report — any single SKU is one click away.
+  sku.value = 'all'
 })
 
 async function load() {
@@ -45,6 +43,12 @@ async function load() {
 }
 
 watch([sku, granularity], load)
+
+// "All SKUs" is prepended so the aggregate report is one click away.
+const skuItems = computed(() => [
+  { id: 'all', description: 'All SKUs' },
+  ...skus.value,
+])
 
 const chartLabels = computed(() => rows.value.map((r) => r.bucket))
 const chartDatasets = computed(() => [
@@ -77,7 +81,7 @@ function inwardSummary(row) {
       <v-card-text>
         <v-select
           v-model="sku"
-          :items="skus"
+          :items="skuItems"
           item-title="description"
           item-value="id"
           label="SKU"
@@ -104,7 +108,7 @@ function inwardSummary(row) {
         <EmptyState
           v-else-if="!loading"
           icon="mdi-chart-timeline-variant"
-          text="No data for this SKU yet."
+          text="No data for this selection yet."
         />
 
         <v-card variant="tonal" color="primary" class="mt-3" v-if="rows.length">

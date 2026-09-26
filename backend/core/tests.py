@@ -5,7 +5,9 @@ audit rules (3.7), ledger integrity (3.2), and API flows (4.2).
 
 from datetime import date
 from decimal import Decimal
+from io import StringIO
 
+from django.core.management import call_command
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -721,6 +723,90 @@ class APITests(TestCase):
         row = next(r for r in resp.data["rows"] if r["bucket"] == "2026-09-10")
         self.assertEqual(row["sold_cases"], "2")
         self.assertIn("rolling_30d_avg_cases_per_day", resp.data)
+
+    def test_report_all_skus_aggregates_every_sku(self):
+        """sku=all buckets sold quantities across every SKU (user request)."""
+        sku2 = SKU.objects.create(
+            description="1L API", qty_per_case=D("12"), volume_ml=1000
+        )
+        SKUMaterialRequirement.objects.create(
+            sku=sku2, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=sku2, selling_price_per_case=D("500")
+        )
+        for sku_id, qty, day in (
+            (self.sku.id, "2", "2026-09-10"),
+            (sku2.id, "3", "2026-09-12"),
+        ):
+            resp = self.api.post(
+                "/api/deliveries/",
+                {
+                    "client": self.client_obj.id,
+                    "sku": sku_id,
+                    "qty_cases": qty,
+                    "date": day,
+                },
+                format="json",
+            )
+            self.assertEqual(resp.status_code, 201)
+
+        resp = self.api.get("/api/reports/?sku=all&granularity=day")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["sku"]["description"], "All SKUs")
+        sold = {r["bucket"]: D(r["sold_cases"]) for r in resp.data["rows"]}
+        self.assertEqual(sold.get("2026-09-10"), D("2"))
+        self.assertEqual(sold.get("2026-09-12"), D("3"))
+        # 'all' is the only extra value — a missing/unknown sku still 400s.
+        self.assertEqual(self.api.get("/api/reports/").status_code, 400)
+        self.assertEqual(
+            self.api.get("/api/reports/?sku=999999").status_code, 400
+        )
+        # The single-SKU view still works and shows only its own sales.
+        resp = self.api.get(f"/api/reports/?sku={self.sku.id}&granularity=day")
+        sold = {r["bucket"]: D(r["sold_cases"]) for r in resp.data["rows"]}
+        self.assertEqual(sold.get("2026-09-10"), D("2"))
+        self.assertNotIn("2026-09-12", sold)
+
+    def test_client_lifetime_revenue_and_profit_toggle(self):
+        """Lifetime stats: revenue, direct cost, overhead share, both profits."""
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku.id,
+                "qty_cases": "2",
+                "date": "2026-09-10",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        rent = OverheadCategory.objects.create(name="Rent Lifetime")
+        MonthlyOverhead.objects.create(
+            category=rent, month="2026-09", amount=D("60")
+        )
+
+        resp = self.api.get(f"/api/clients/{self.client_obj.id}/lifetime/")
+        self.assertEqual(resp.status_code, 200)
+        data = resp.data
+        self.assertEqual(data["delivery_count"], 1)
+        self.assertEqual(D(data["cases"]), D("2"))
+        # 2 cases x Rs300 selling price.
+        self.assertEqual(D(data["revenue"]), D("600.00"))
+        # Direct: 2 cases x 1 bottle x Rs240 FIFO (no print config).
+        self.assertEqual(D(data["direct_cost"]), D("480.00"))
+        # Overhead: Rs60 for the month / 2 cases sold = Rs30/case x 2 cases,
+        # i.e. the client carries its own share of the month's overhead.
+        self.assertEqual(D(data["overhead"]), D("60.00"))
+        self.assertEqual(D(data["profit_without_overhead"]), D("120.00"))
+        self.assertEqual(D(data["profit_with_overhead"]), D("60.00"))
+        # Soft-deleted deliveries never count towards lifetime figures.
+        StockDelivery.objects.filter(client=self.client_obj).update(
+            is_deleted=True
+        )
+        resp = self.api.get(f"/api/clients/{self.client_obj.id}/lifetime/")
+        self.assertEqual(D(resp.data["revenue"]), D("0.00"))
+        self.assertEqual(D(resp.data["profit_with_overhead"]), D("0.00"))
 
 
 class ClientPendingMarkerTests(TestCase):
@@ -1585,6 +1671,121 @@ class MultiSKUDeliveryTests(TestCase):
         self.assertIn("cogs", resp.data)
         self.assertEqual(resp.data["default_selling_price"], "300.00")
         self.assertIn("shortfall", resp.data)
+
+
+class BackfillNegativeStockCommandTests(TestCase):
+    """
+    Approved fix-up tool: deliveries recorded BEFORE the negative-stock rule
+    could leave their shortfall unrecorded (stock stopped at 0 instead of
+    showing the true negative figure, or nothing was booked when the material
+    had no batches at all). `backfill_negative_stock` reports those gaps
+    read-only and books them only with --apply.
+    """
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(name="Legacy Co")
+        self.sku = SKU.objects.create(
+            description="Legacy 500ml", qty_per_case=D("24"), volume_ml=500
+        )
+        self.bottle = make_material("Legacy Bottle", "240")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+
+    def _legacy_exhausted_queue(self, qty="15"):
+        """
+        Pre-fix state: 10 cases in stock, a 15-case delivery consumed the
+        positive 10 and the excess 5 was DROPPED (stock stopped at 0) — today
+        the same delivery books -5 on the batch.
+        """
+        batch = make_batch(self.bottle, "10", "240")
+        create_delivery(
+            self.client_obj,
+            self.sku,
+            D(qty),
+            delivery_date=date(2026, 9, 5),
+            force=True,
+        )
+        batch.refresh_from_db()
+        batch.quantity_remaining = D("0")
+        batch.save(skip_audit=True)
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+        return batch
+
+    def _run(self, *args):
+        out = StringIO()
+        call_command("backfill_negative_stock", *args, stdout=out)
+        return out.getvalue()
+
+    def test_dry_run_reports_the_gap_and_writes_nothing(self):
+        batch = self._legacy_exhausted_queue()
+        report = self._run()
+        self.assertIn("DRY RUN", report)
+        self.assertIn("Legacy Bottle", report)
+        self.assertIn("unrecorded shortfall 5", report)
+        self.assertIn(f"would push the oldest batch #{batch.id}", report)
+        batch.refresh_from_db()
+        self.assertEqual(batch.quantity_remaining, D("0"))
+        self.assertEqual(self.bottle.batches.count(), 1)
+        self.assertEqual(StockDelivery.objects.count(), 1)
+
+    def test_apply_books_the_gap_on_the_oldest_batch_and_is_idempotent(self):
+        batch = self._legacy_exhausted_queue()
+        report = self._run("--apply")
+        self.assertIn("[APPLY]", report)
+        batch.refresh_from_db()
+        self.assertEqual(batch.quantity_remaining, D("-5"))  # 15 - 10
+        self.assertEqual(self.bottle.stock_in_hand, D("-5"))
+        # Booking the gap raised "already booked" by exactly the gap, so a
+        # second pass finds nothing and changes nothing.
+        again = self._run("--apply")
+        self.assertIn("No unrecorded stock shortfalls", again)
+        batch.refresh_from_db()
+        self.assertEqual(batch.quantity_remaining, D("-5"))
+        self.assertEqual(self.bottle.batches.count(), 1)
+
+    def test_apply_creates_a_deficit_carrier_when_there_are_no_batches(self):
+        StockDelivery.objects.create(
+            client=self.client_obj,
+            sku=self.sku,
+            qty_cases=D("10"),
+            selling_price_per_case=D("300"),
+            date=date(2026, 9, 5),
+        )
+        self.assertIn("would create a zero-received deficit carrier batch", self._run())
+        report = self._run("--apply")
+        carrier = self.bottle.batches.get()
+        self.assertEqual(carrier.quantity_received, D("0"))  # not an arrival
+        self.assertEqual(carrier.quantity_remaining, D("-10"))
+        self.assertEqual(carrier.arrival_date, date(2026, 9, 5))  # delivery date
+        self.assertEqual(carrier.price_per_unit, D("240"))  # master display price
+        self.assertEqual(self.bottle.stock_in_hand, D("-10"))
+        self.assertIn("deficit carrier batch", report)
+
+    def test_healthy_ledger_reports_nothing_and_apply_changes_nothing(self):
+        make_batch(self.bottle, "10", "240")
+        create_delivery(
+            self.client_obj, self.sku, D("6"), delivery_date=date(2026, 9, 5)
+        )
+        report = self._run("--apply")
+        self.assertIn("No unrecorded stock shortfalls", report)
+        self.assertEqual(self.bottle.batches.count(), 1)
+        self.assertEqual(self.bottle.stock_in_hand, D("4"))
+
+    def test_soft_deleted_delivery_is_not_counted_as_demand(self):
+        batch = self._legacy_exhausted_queue()
+        StockDelivery.objects.get().soft_delete()  # user removed the delivery
+        report = self._run("--apply")
+        # The deleted delivery no longer creates a demand, so the 10 already
+        # booked turns the gap negative — nothing is booked on the ledger.
+        self.assertIn("No unrecorded stock shortfalls", report)
+        batch.refresh_from_db()
+        self.assertEqual(batch.quantity_remaining, D("0"))
+        self.assertEqual(self.bottle.batches.count(), 1)
+
 
 
 

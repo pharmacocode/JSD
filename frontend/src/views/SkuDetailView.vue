@@ -3,7 +3,7 @@
  * SKU detail (spec 4.6): material requirements (qty/bottle, decimals),
  * print cost config, and cost breakup toggle per bottle / per case.
  */
-import { ref, onMounted, watch } from 'vue'
+import { ref, onMounted, watch, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { api, listify } from '@/api'
 import { useUiStore } from '@/stores/ui'
@@ -17,6 +17,9 @@ const sku = ref(null)
 const materials = ref([])
 const reqDialog = ref(false)
 const reqForm = ref({ material: null, qty_per_case: 1 })
+const selectedReqMaterial = computed(() =>
+  materials.value.find((m) => m.id === reqForm.value.material)
+)
 const print = ref({ paper_cost: 0, print_cost_per_paper: 0, labels_per_paper: 1, wastage_percent: 0 })
 const hasPrint = ref(false)
 const breakup = ref(null)
@@ -287,7 +290,8 @@ async function savePrint() {
             type="number"
             step="0.0001"
             label="Qty per case of SKU (decimals allowed)"
-            hint="e.g. 1 case of bottles, 1.08 cases of labels per case"
+            :suffix="selectedReqMaterial?.unit_of_measure ? `${selectedReqMaterial.unit_of_measure} / case` : 'per case'"
+            hint="e.g. 1 case of bottles, 1.08 sheets of sticker labels per case"
             persistent-hint
           />
         </v-card-text>

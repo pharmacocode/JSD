@@ -56,7 +56,8 @@ async function save() {
       arrival_date: date.value,
       note: note.value,
     })
-    ui.notify(`Stock received: ${qty.value} × ${material.value.name}`)
+    const unit = material.value.unit_of_measure || 'cases'
+    ui.notify(`Stock received: ${qty.value} ${unit} × ${material.value.name}`)
     router.push('/')
   } catch (e) {
     error.value = e.message
@@ -87,15 +88,11 @@ async function save() {
         :loading="!materials.length"
         return-object
         clearable
-        hint="Client-specific label stock is grouped by client in this list."
-        persistent-hint
       >
         <template #item="{ item, props }">
           <v-list-item
             v-bind="props"
-            :subtitle="`${item.raw.category}${
-              item.raw.client_name ? ' · ' + item.raw.client_name : ''
-            } · in hand: ${item.raw.stock_in_hand}`"
+            :subtitle="`in hand: ${item.raw.stock_in_hand} ${item.raw.unit_of_measure || ''}`"
           />
         </template>
       </v-select>
@@ -121,9 +118,10 @@ async function save() {
         type="number"
         min="0"
         step="0.01"
-        label="Price per case"
+        :label="`Price per ${material?.unit_of_measure || 'case'}`"
         prefix="₹"
-        hint="Cost of this batch only — FIFO uses it from here on."
+        hint="Cost of this batch only — price per case or sheet. FIFO uses it from here on."
+        persistent-hint
       />
       <v-text-field
         v-model="date"

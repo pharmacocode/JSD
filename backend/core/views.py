@@ -263,6 +263,52 @@ class ClientViewSet(viewsets.ModelViewSet):
         serializer = StockDeliverySerializer(qs, many=True)
         return Response(serializer.data)
 
+    @action(detail=True, methods=["get"])
+    def lifetime(self, request, pk=None):
+        """
+        Lifetime revenue & profit for this client (Client Detail, user
+        request). Computed over every non-deleted delivery at READ time so
+        it always reflects current prices:
+          revenue  = qty_cases x selling price
+          direct   = cogs.dynamic_costs_for() — current FIFO material + print
+          overhead = this client's share: per delivery, qty_cases x that
+                     month's overhead-per-case (spec 6.3), i.e. the client
+                     carries overhead only for the months it bought in.
+        profit_with_overhead    = revenue - direct - overhead
+        profit_without_overhead = revenue - direct
+        """
+        client = self.get_object()
+        deliveries = list(client.deliveries.filter(is_deleted=False))
+        revenue = sum(
+            (d.qty_cases * d.selling_price_per_case for d in deliveries),
+            Decimal("0"),
+        )
+        direct = sum(
+            (row["direct"] for row in cogs.dynamic_costs_for(deliveries).values()),
+            Decimal("0"),
+        )
+        # Overhead rate per delivery month, memoized — many deliveries share
+        # a month and each rate is a small aggregate of its own.
+        rates = {}
+        overhead = Decimal("0")
+        for d in deliveries:
+            month = d.date.strftime("%Y-%m")
+            if month not in rates:
+                rates[month] = cogs.overhead_per_case(month)
+            overhead += d.qty_cases * rates[month]
+        cases = sum((d.qty_cases for d in deliveries), Decimal("0"))
+        return Response(
+            {
+                "delivery_count": len(deliveries),
+                "cases": dstr(cases),
+                "revenue": str(money(revenue)),
+                "direct_cost": str(money(direct)),
+                "overhead": str(money(overhead)),
+                "profit_with_overhead": str(money(revenue - direct - overhead)),
+                "profit_without_overhead": str(money(revenue - direct)),
+            }
+        )
+
 
 class ClientSKUPriceViewSet(viewsets.ModelViewSet):
     queryset = ClientSKUPrice.objects.all()
@@ -1301,24 +1347,29 @@ class ReportView(APIView):
     """
     Reports/Stats (spec 4.7): per-SKU sold & inward quantities by
     day/week/month + rolling 30-day average. Query params:
-      sku=<id> (required), granularity=day|week|month, start, end
+      sku=<id> or sku=all (required), granularity=day|week|month, start, end
     Only sold/inward stats — no P&L, GST, or exports in v1 (spec 9).
     """
 
     def get(self, request):
-        sku = SKU.objects.filter(pk=request.query_params.get("sku")).first()
-        if sku is None:
+        # sku=<id> for a single SKU, sku=all to aggregate every SKU
+        # (user request: an "All SKUs" option in Reports).
+        sku_param = request.query_params.get("sku")
+        all_skus = sku_param == "all"
+        sku = None if all_skus else SKU.objects.filter(pk=sku_param).first()
+        if sku is None and not all_skus:
             return Response(
-                {"detail": "sku query param is required"},
+                {"detail": "sku query param is required (an sku id or 'all')"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         granularity = request.query_params.get("granularity", "day")
         if granularity not in ("day", "week", "month"):
             granularity = "day"
 
-        deliveries = StockDelivery.objects.filter(
-            is_deleted=False, sku=sku
-        ).order_by("date")
+        deliveries = StockDelivery.objects.filter(is_deleted=False)
+        if sku is not None:
+            deliveries = deliveries.filter(sku=sku)
+        deliveries = deliveries.order_by("date")
         start = request.query_params.get("start")
         end = request.query_params.get("end")
         if start:
@@ -1336,11 +1387,20 @@ class ReportView(APIView):
             b["sold_cases"] += d.qty_cases
             b["revenue"] += d.qty_cases * d.selling_price_per_case
 
-        # Inward: batch arrivals of each material this SKU requires,
-        # bucketed the same way so sold vs inward sits side by side.
+        # Inward: batch arrivals of the materials this SKU requires (every
+        # material when sku=all), bucketed the same way so sold vs inward
+        # sits side by side. qty_per_case is per-SKU knowledge, so it is
+        # null in the all-SKUs view.
         inward_buckets = {}
-        for req in sku.requirements.select_related("material"):
-            batches = req.material.batches.filter(is_deleted=False)
+        if sku is not None:
+            material_rows = [
+                (req.material, req.qty_per_case)
+                for req in sku.requirements.select_related("material")
+            ]
+        else:
+            material_rows = [(m, None) for m in Material.objects.all()]
+        for material, qty_per_case in material_rows:
+            batches = material.batches.filter(is_deleted=False)
             if start:
                 batches = batches.filter(arrival_date__gte=start)
             if end:
@@ -1349,13 +1409,15 @@ class ReportView(APIView):
                 key = _bucket_key(b.arrival_date, granularity)
                 slot = inward_buckets.setdefault(key, {})
                 entry = slot.setdefault(
-                    str(req.material.id),
+                    str(material.id),
                     {
-                        "material_id": req.material.id,
-                        "material": req.material.name,
-                        "unit": req.material.unit_of_measure,
+                        "material_id": material.id,
+                        "material": material.name,
+                        "unit": material.unit_of_measure,
                         "quantity": Decimal("0"),
-                        "qty_per_case": str(req.qty_per_case),
+                        "qty_per_case": (
+                            str(qty_per_case) if qty_per_case is not None else None
+                        ),
                     },
                 )
                 entry["quantity"] += b.quantity_received
@@ -1390,14 +1452,20 @@ class ReportView(APIView):
         today = timezone.now().date()
         window_start = today - timedelta(days=30)
         recent = StockDelivery.objects.filter(
-            is_deleted=False, sku=sku, date__gte=window_start
+            is_deleted=False, date__gte=window_start
         )
+        if sku is not None:
+            recent = recent.filter(sku=sku)
         recent_total = sum((d.qty_cases for d in recent), Decimal("0"))
         rolling = recent_total / Decimal("30")
 
         return Response(
             {
-                "sku": {"id": sku.id, "description": sku.description},
+                "sku": (
+                    {"id": sku.id, "description": sku.description}
+                    if sku is not None
+                    else {"id": None, "description": "All SKUs"}
+                ),
                 "granularity": granularity,
                 "rows": rows,
                 "rolling_30d_avg_cases_per_day": str(

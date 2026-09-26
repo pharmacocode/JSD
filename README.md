@@ -135,6 +135,21 @@ SPA routing). Env var:
   *Stock in Hand* marks such materials **SHORT** with an `<n> negative`
   count, and the deficit clears either via a **Stock Adjustment** or a
   **backdated (retrospective) arrival** on *Enter Arrived Stock*.
+- **Legacy shortfall backfill (one-off fix-up, user approved):** deliveries
+  recorded *before* the negative-stock rule could leave their excess demand
+  **unrecorded** — stock stopped at 0 instead of showing the true negative
+  figure, and a material with no batches at all got no booking whatsoever.
+  `python manage.py backfill_negative_stock` finds every such gap
+  (`demand − already booked`, per material) and **writes nothing** by default;
+  add `--apply` to book it into the batch ledger exactly like `consume_fifo`
+  does today — the **oldest live batch** is pushed further negative, or a
+  zero-received deficit *carrier* batch is created (master display price,
+  dated to the material's latest contributing delivery). The command ignores
+  soft-deleted deliveries and adjustments, and is **idempotent** — once a gap
+  is booked "already booked" rises by exactly the gap, so a re-run reports a
+  clean ledger. Because a hand-edited batch (Home keyed edit) or an upward
+  reconciliation also moves "already booked", a material already reconciled by
+  hand can still appear: **review the dry-run report before using `--apply`**.
 - **Inward line items are editable (user request):** the Home screen lists the
   month's arrivals with their underlying batches; each line can be edited in
   place (received cases, landing price, arrival date) or removed. Editing

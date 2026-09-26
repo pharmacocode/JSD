@@ -128,7 +128,7 @@ async function save() {
           v-for="m in materials"
           :key="m.id"
           :title="m.name"
-          :subtitle="`${m.category}${m.client_name ? ' · ' + m.client_name : ''} · ${m.vendor_name || 'no vendor'}`"
+          :subtitle="m.vendor_name ? `Vendor: ${m.vendor_name}` : 'No vendor assigned'"
           :to="`/masters/materials/${m.id}`"
         >
           <template #append>
@@ -164,25 +164,6 @@ async function save() {
           </v-alert>
           <v-text-field v-model="form.name" label="Name *" />
           <v-select
-            v-model="form.category"
-            :items="['Bottle', 'Cap', 'Label', 'Other']"
-            label="Category"
-          />
-          <v-switch
-            v-model="form.is_client_specific"
-            color="primary"
-            label="Client-specific (custom labels)"
-            density="compact"
-          />
-          <v-select
-            v-if="form.is_client_specific"
-            v-model="form.client"
-            :items="clients"
-            item-title="name"
-            item-value="id"
-            label="Client *"
-          />
-          <v-select
             v-model="form.vendor"
             :items="vendors"
             item-title="name"
@@ -196,12 +177,14 @@ async function save() {
             v-model.number="form.current_price_per_unit"
             type="number"
             prefix="₹"
-            label="Display price per case (costing uses batches)"
+            :label="`Display price per ${form.unit_of_measure || 'case'} (costing uses batches)`"
+            hint="Price per case or sheet — actual costing uses batches."
+            persistent-hint
           />
           <v-text-field
             v-model.number="form.stock_alert_qty"
             type="number"
-            label="Stock alert qty (cases)"
+            :label="`Stock alert qty (${form.unit_of_measure || 'cases'})`"
           />
           <v-text-field
             v-model.number="form.wastage_percent"
@@ -210,7 +193,9 @@ async function save() {
           />
           <v-text-field
             v-model="form.unit_of_measure"
-            label="Unit (cases — quantities are case-based)"
+            label="Unit (e.g. cases, sheets)"
+            hint="e.g. cases for bottles/caps, sheets for sticker sheets."
+            persistent-hint
           />
         </v-card-text>
         <v-card-actions>
