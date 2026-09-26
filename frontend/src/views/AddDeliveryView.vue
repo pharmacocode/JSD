@@ -239,6 +239,18 @@ function reset() {
         >
           Stock negative — fix via Stock Adjustment or backdated arrival
         </v-chip>
+        <!-- A SKU with no linked materials consumes no stock at all, so the
+             delivery is correct but stock stays where it was — flag it here
+             too so the confirmation is not silently misleading. -->
+        <v-chip
+          v-if="result.skus_without_requirements?.length"
+          color="info"
+          size="small"
+          class="ml-2"
+        >
+          No raw materials linked — stock untouched
+          ({{ result.skus_without_requirements.join(', ') }})
+        </v-chip>
       </v-alert>
       <v-card class="mb-3">
         <v-list density="compact">
@@ -667,6 +679,26 @@ function reset() {
           <strong>{{ s.material }}</strong> — short by
           {{ num(s.short_by) }} {{ s.unit }} (need {{ num(s.required) }}, have
           {{ num(s.available) }})
+        </div>
+      </v-alert>
+
+      <!-- No raw-material requirements: such a SKU consumes NO stock, so it
+           can never report a shortfall and its COGS has no material part. Say
+           so up front instead of leaving the user wondering why stock never
+           moves (user report). -->
+      <v-alert
+        v-if="preview?.skus_without_requirements?.length"
+        type="info"
+        variant="tonal"
+        density="compact"
+        class="mb-3"
+      >
+        <div class="font-weight-bold mb-1">No raw-material requirements</div>
+        <div class="text-body-2">
+          <strong>{{ preview.skus_without_requirements.join(', ') }}</strong> —
+          no materials are linked to this SKU, so this delivery will not move
+          any stock (bottles, labels…) and its COGS has no material cost. Link
+          the materials in <strong>Masters → SKU Master</strong>.
         </div>
       </v-alert>
 

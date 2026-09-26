@@ -784,6 +784,13 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                 "client_pending_amount": result["client_pending_amount"],
                 "payment": result["payment"],
                 "stock_shortfall_flag": delivery.stock_shortfall_flag,
+                # No material requirements on this SKU => this delivery
+                # consumed no stock (it can never go negative) — surfaced so
+                # the screen can warn rather than stay silent.
+                "no_material_requirements": result["no_material_requirements"],
+                "skus_without_requirements": (
+                    [sku.description] if result["no_material_requirements"] else []
+                ),
             },
             status=status.HTTP_201_CREATED,
         )
@@ -899,6 +906,10 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                 "client_pending_amount": result["client_pending_amount"],
                 "payment": result["payment"],
                 "stock_shortfall_flag": result["stock_shortfall_flag"],
+                # SKUs in this run that have no material requirements — they
+                # consumed no stock at all (see create_deliveries).
+                "no_material_requirements": result["no_material_requirements"],
+                "skus_without_requirements": result["skus_without_requirements"],
             },
             status=status.HTTP_201_CREATED,
         )
@@ -965,6 +976,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                     "details": result["details"],
                 },
                 "shortfall": result["shortfall"],
+                "no_material_requirements": result["no_material_requirements"],
                 "default_selling_price": (
                     str(csp.selling_price_per_case) if csp else None
                 ),

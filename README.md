@@ -149,7 +149,19 @@ SPA routing). Env var:
   Add-Delivery preview; carriers are excluded from the inward list). Home's
   *Stock in Hand* marks such materials **SHORT** with an `<n> negative`
   count, and the deficit clears either via a **Stock Adjustment** or a
-  **backdated (retrospective) arrival** on *Enter Arrived Stock*.
+  **backdated (retrospective) arrival** on *Enter Arrived Stock*. (A delivery
+  whose SKU requires no materials consumes nothing — see the next bullet.)
+- **A delivery only moves stock that the SKU actually requires (user report):**
+  FIFO consumes the materials a SKU resolves to per client, so a SKU with **no
+  linked materials** consumes nothing: stock stays exactly where it was (it can
+  never go negative) and the shortfall check can never fire — which looks like
+  broken stock tracking. The Add-Delivery **preview** and both delivery
+  responses now name those SKUs (`no_material_requirements` /
+  `skus_without_requirements`) and the screen shows an *info* banner ("No
+  raw-material requirements … link the materials in Masters → SKU Master"), so
+  a COGS with zero material cost is never silently accepted. A per-case
+  requirement of `0` (or less) can no longer be saved — it is rejected with
+  *Quantity per case must be greater than zero.*
 - **Legacy shortfall backfill (one-off fix-up, user approved):** deliveries
   recorded *before* the negative-stock rule could leave their excess demand
   **unrecorded** — stock stopped at 0 instead of showing the true negative

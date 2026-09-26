@@ -1949,6 +1949,161 @@ class BackfillNegativeStockCommandTests(TestCase):
         self.assertEqual(batch.quantity_remaining, D("0"))
         self.assertEqual(self.bottle.batches.count(), 1)
 
+class RequirementlessSkuStockTests(TestCase):
+    """
+    User report: "stock shows 0 and does not go negative even after registering
+    the deliveries".
+
+    Root cause: the deliveries were for SKUs that carry NO material
+    requirements, so FIFO consumed nothing at all — no batch could be pushed
+    negative and the shortfall check could never fire, leaving every screen
+    silent. The FIFO/negative-stock engine itself is correct (see
+    NegativeStockMarkingTests); these tests pin the warning that now NAMES the
+    requirement-less SKUs, plus the guard that stops a zero/negative per-case
+    requirement from being saved in the first place.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.client_obj = Client.objects.create(name="Reported Client")
+        self.bottle = make_material("Bottle 500ml", "10")
+        make_batch(self.bottle, "50", "10", arrival=date(2026, 9, 1))
+        # The reported case: a SKU with no linked materials at all.
+        self.sku_plain = SKU.objects.create(
+            description="500ml no materials", qty_per_case=D("24"), volume_ml=500
+        )
+        self.sku_linked = SKU.objects.create(
+            description="500ml linked", qty_per_case=D("24"), volume_ml=500
+        )
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku_linked, material=self.bottle, qty_per_case=D("1")
+        )
+        for sku in (self.sku_plain, self.sku_linked):
+            ClientSKUPrice.objects.create(
+                client=self.client_obj,
+                sku=sku,
+                selling_price_per_case=D("300"),
+            )
+
+    def bulk(self, lines, **overrides):
+        payload = {
+            "client": self.client_obj.id,
+            "date": "2026-09-20",
+            "lines": lines,
+            **overrides,
+        }
+        return self.api.post("/api/deliveries/bulk/", payload, format="json")
+
+    def preview(self, lines):
+        return self.api.post(
+            "/api/deliveries/preview/",
+            {"client": self.client_obj.id, "date": "2026-09-20", "lines": lines},
+            format="json",
+        )
+    def test_delivery_for_requirementless_sku_moves_no_stock_and_says_so(self):
+        resp = self.bulk([{"sku": self.sku_plain.id, "qty_cases": "5"}])
+        self.assertEqual(resp.status_code, 201)
+        # The blind spot is now named in the response.
+        self.assertTrue(resp.data["no_material_requirements"])
+        self.assertEqual(
+            resp.data["skus_without_requirements"], ["500ml no materials"]
+        )
+        # No consumption, so no negative stock and no shortfall could fire.
+        self.assertFalse(resp.data["stock_shortfall_flag"])
+        self.assertEqual(resp.data["lines"][0]["base_cogs_per_case"], "0.00")
+        self.assertEqual(self.bottle.stock_in_hand, D("50"))
+
+    def test_preview_names_the_requirementless_line_only(self):
+        resp = self.preview(
+            [
+                {"sku": self.sku_plain.id, "qty_cases": "5"},
+                {"sku": self.sku_linked.id, "qty_cases": "4"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["no_material_requirements"])
+        self.assertEqual(
+            resp.data["skus_without_requirements"], ["500ml no materials"]
+        )
+        self.assertEqual(resp.data["shortfall"], [])
+        plain, linked = resp.data["lines"]
+        self.assertTrue(plain["no_material_requirements"])
+        self.assertFalse(linked["no_material_requirements"])
+        self.assertEqual(plain["details"]["materials"], [])
+        self.assertEqual(len(linked["details"]["materials"]), 1)
+
+    def test_linked_sku_is_not_flagged_and_still_consumes_stock(self):
+        resp = self.preview([{"sku": self.sku_linked.id, "qty_cases": "4"}])
+        self.assertFalse(resp.data["no_material_requirements"])
+        self.assertEqual(resp.data["skus_without_requirements"], [])
+
+        resp = self.bulk([{"sku": self.sku_linked.id, "qty_cases": "4"}])
+        self.assertEqual(resp.status_code, 201)
+        self.assertFalse(resp.data["no_material_requirements"])
+        self.assertEqual(resp.data["skus_without_requirements"], [])
+        self.assertEqual(self.bottle.stock_in_hand, D("46"))
+
+    def test_single_sku_paths_carry_the_same_flag(self):
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku_plain.id,
+                "qty_cases": "3",
+                "date": "2026-09-20",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertTrue(resp.data["no_material_requirements"])
+        self.assertEqual(
+            resp.data["skus_without_requirements"], ["500ml no materials"]
+        )
+        self.assertEqual(resp.data["cogs"]["details"]["materials"], [])
+        self.assertEqual(self.bottle.stock_in_hand, D("50"))
+
+        resp = self.api.post(
+            "/api/deliveries/preview/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku_plain.id,
+                "qty_cases": "3",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["no_material_requirements"])
+
+    def test_requirement_quantity_must_be_positive(self):
+        for bad in ("0", "-2"):
+            resp = self.api.post(
+                "/api/sku-requirements/",
+                {
+                    "sku": self.sku_plain.id,
+                    "material": self.bottle.id,
+                    "qty_per_case": bad,
+                },
+                format="json",
+            )
+            self.assertEqual(resp.status_code, 400, bad)
+            self.assertIn("greater than zero", str(resp.data["qty_per_case"]))
+        # Nothing was saved: the SKU is still requirement-less.
+        self.assertFalse(self.sku_plain.requirements.exists())
+
+        resp = self.api.post(
+            "/api/sku-requirements/",
+            {
+                "sku": self.sku_plain.id,
+                "material": self.bottle.id,
+                "qty_per_case": "1",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(self.sku_plain.requirements.count(), 1)
+
+
+
 
 
 

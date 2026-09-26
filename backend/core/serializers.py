@@ -260,6 +260,18 @@ class SKUMaterialRequirementSerializer(serializers.ModelSerializer):
             "qty_per_case",
         ]
 
+    def validate_qty_per_case(self, value):
+        """
+        A requirement of 0 (or less) per case silently consumes nothing — the
+        SKU ships, stock never moves and no shortfall can ever be reported (or,
+        when negative, stock would be ADDED). Rejected up front.
+        """
+        if value <= 0:
+            raise serializers.ValidationError(
+                "Quantity per case must be greater than zero."
+            )
+        return value
+
 
 class SKUPrintCostSerializer(serializers.ModelSerializer):
     class Meta:

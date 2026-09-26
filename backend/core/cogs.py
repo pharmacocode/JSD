@@ -352,7 +352,13 @@ def estimate_cogs(sku, client, qty_cases: Decimal, delivery_date, preview=True):
       returns the real weighted cost from the batches consumed.
 
     Returns dict: {month, per_case, details:{materials, print, overhead},
-    shortfall, consumption, has_unrecorded_shortfall}
+    shortfall, consumption, has_unrecorded_shortfall,
+    no_material_requirements}
+
+    `no_material_requirements` = the SKU resolved to NO materials at all, so
+    nothing can be consumed and no shortfall can ever be reported (user report:
+    a delivery for such a SKU silently ships with zero material cost and stock
+    that never moves). Callers surface it as a warning.
     """
     month = month_key(delivery_date)
     qty_cases = Decimal(qty_cases)
@@ -422,6 +428,11 @@ def estimate_cogs(sku, client, qty_cases: Decimal, delivery_date, preview=True):
         "per_case": str(money(total_per_case)),
         "per_case_base": str(money(base_per_case)),
         "overhead_per_case": str(money(oh_per_case)),
+        # A SKU with no resolved requirements consumes NOTHING: stock is never
+        # touched (so it can never go negative) and check_shortfall() can never
+        # report a shortfall. Flagged so the API/UI can warn instead of
+        # silently recording a delivery with zero material cost.
+        "no_material_requirements": not material_lines,
         "details": {
             "materials": material_lines,
             "print": print_breakdown,
@@ -554,10 +565,15 @@ def preview_deliveries(client, lines, delivery_date):
 
     Returns {"month", "lines": [per-line breakdown], "cogs": {aggregate
     per-case + overhead pool}, "totals": {cases, base_cogs, cogs},
-    "shortfall": [shortfall rows summed per material across the lines]}.
+    "shortfall": [shortfall rows summed per material across the lines],
+    "no_material_requirements" / "skus_without_requirements": the lines whose
+    SKU resolved to no materials at all — they consume no stock and can never
+    show a shortfall, so the screen must warn instead of quoting a cost that
+    silently ignores materials.
     """
     month = month_key(delivery_date)
     total_cases = sum((Decimal(line["qty_cases"]) for line in lines), ZERO)
+    skus_without_requirements = []
     if total_cases <= 0:
         return {
             "month": month,
@@ -576,6 +592,8 @@ def preview_deliveries(client, lines, delivery_date):
                 "cogs": str(money(0)),
             },
             "shortfall": [],
+            "no_material_requirements": False,
+            "skus_without_requirements": [],
         }
 
     # 1. Requirements per line + the combined requirement per material.
@@ -607,6 +625,9 @@ def preview_deliveries(client, lines, delivery_date):
     print_cost_total = ZERO
     for line, rows in zip(lines, per_line_reqs):
         qty_cases = Decimal(line["qty_cases"])
+        if not rows:
+            # No materials resolved for this SKU — nothing will be consumed.
+            skus_without_requirements.append(line["sku"].description)
         material_lines = []
         line_material_cost = ZERO
         for material, required, per_case in rows:
@@ -647,6 +668,8 @@ def preview_deliveries(client, lines, delivery_date):
                 "per_case": str(money(base_per_case + oh_per_case)),
                 "total_cogs": str(money((base_per_case + oh_per_case) * qty_cases)),
                 "details": {"materials": material_lines, "print": print_breakdown},
+                # Per-line: this SKU consumes nothing (no requirements).
+                "no_material_requirements": not rows,
             }
         )
 
@@ -685,6 +708,10 @@ def preview_deliveries(client, lines, delivery_date):
         "shortfall": check_shortfall_many(
             client, [(line["sku"], line["qty_cases"]) for line in lines]
         ),
+        # Lines that will consume no stock at all (no requirements configured
+        # on the SKU) — warned about on the Add-Delivery screen.
+        "no_material_requirements": bool(skus_without_requirements),
+        "skus_without_requirements": skus_without_requirements,
     }
 
 
@@ -967,6 +994,7 @@ def create_deliveries(
         raise DeliveryShortfall(shortfall)
     # 3. Create the lines in order through the single-line path.
     created = []
+    skus_without_requirements = []
     for line in normalised:
         delivery, _line_result = create_delivery(
             client,
@@ -977,6 +1005,10 @@ def create_deliveries(
             note=note,
             force=force,
         )
+        # A SKU with no requirements consumes no stock and can never report a
+        # shortfall — collected here so the response can say so out loud.
+        if _line_result["no_material_requirements"]:
+            skus_without_requirements.append(line["sku"].description)
         created.append((delivery, line))
 
     # 4. Live figures are read only AFTER every line exists, so the delivery
@@ -1045,6 +1077,12 @@ def create_deliveries(
         "stock_shortfall_flag": any(
             delivery.stock_shortfall_flag for delivery, _line in created
         ),
+        # User report: a delivery for a SKU with no material requirements
+        # consumes no stock (so stock can never go negative) and never trips
+        # the shortfall check — the response names those SKUs so the screen can
+        # warn instead of staying silent.
+        "no_material_requirements": bool(skus_without_requirements),
+        "skus_without_requirements": skus_without_requirements,
     }
 
 
