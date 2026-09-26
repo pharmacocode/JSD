@@ -110,6 +110,103 @@ def check_shortfall(sku, client, qty_cases: Decimal):
     return check_shortfall_many(client, [(sku, Decimal(qty_cases))])
 
 
+def legacy_booked_consumption(material) -> Decimal:
+    """
+    Consumption already recorded in a material's batch ledger:
+    sum(quantity_received - quantity_remaining) over EVERY batch row
+    (soft-deleted rows included — deleting a wrongly keyed arrival must
+    not erase the consumption that was booked against it).
+
+    Shared read-only helper: the legacy backfill command and the Home
+    dashboard badge use this exact formula so the two can never disagree.
+    """
+    from django.db.models import Sum
+
+    from .models import MaterialBatch
+
+    agg = MaterialBatch.objects.filter(material=material).aggregate(
+        received=Sum("quantity_received"), remaining=Sum("quantity_remaining")
+    )
+    received = agg["received"] or ZERO
+    remaining = agg["remaining"] or ZERO
+    return received - remaining
+
+
+def legacy_demand_by_material():
+    """
+    Expected consumption per material from live (non soft-deleted) records
+    only — the same quantities FIFO consumption would take:
+      * deliveries: qty_cases x qty_per_case, resolved per client (a
+        generic label resolves to that client's own label material),
+        rounded per line exactly like consume_fifo,
+      * negative stock adjustments: |quantity|.
+    Also returns the latest contributing event date per material.
+
+    Shared read-only helper (see legacy_booked_consumption): the backfill
+    command and the dashboard badge both read through here. Writes nothing.
+    """
+    from .models import StockAdjustment, StockDelivery
+
+    demand = {}
+    last_event = {}
+
+    deliveries = (
+        StockDelivery.objects.filter(is_deleted=False)
+        .select_related("sku", "client")
+        .prefetch_related("sku__requirements__material")
+        .order_by("date", "id")
+    )
+    for delivery in deliveries:
+        for material, qty_per_case in resolve_requirements(
+            delivery.sku, delivery.client
+        ):
+            line_demand = round_qty(delivery.qty_cases * qty_per_case)
+            if line_demand == 0:
+                continue
+            demand[material.id] = demand.get(material.id, ZERO) + line_demand
+            last_event[material.id] = delivery.date
+
+    for adjustment in StockAdjustment.objects.filter(is_deleted=False):
+        if adjustment.quantity >= 0:
+            continue
+        size = abs(adjustment.quantity)
+        demand[adjustment.material_id] = (
+            demand.get(adjustment.material_id, ZERO) + size
+        )
+        if adjustment.date >= (
+            last_event.get(adjustment.material_id) or adjustment.date
+        ):
+            last_event[adjustment.material_id] = adjustment.date
+
+    return demand, last_event
+
+
+def legacy_shortfall_gaps(demand_by_material=None):
+    """
+    Read-only per-material gap table: {material_id: {
+    demand, booked, gap }} where gap = max(round_qty(demand - booked), 0).
+
+    A gap > 0 means deliveries/negative adjustments recorded MORE demand
+    than the batch ledger ever booked — the pre-negative-stock signature
+    (stock sits at 0 instead of the true negative). Healthy ledgers yield
+    gap 0 everywhere. Writes nothing; the backfill command books gaps with
+    --apply, the dashboard only displays them.
+    """
+    from .models import Material
+
+    if demand_by_material is None:
+        demand_by_material, _last_event = legacy_demand_by_material()
+    gaps = {}
+    for material in Material.objects.all().only("id"):
+        demand = demand_by_material.get(material.id, ZERO)
+        booked = legacy_booked_consumption(material)
+        gap = round_qty(demand - booked)
+        if gap < ZERO:
+            gap = ZERO
+        gaps[material.id] = {"demand": demand, "booked": booked, "gap": gap}
+    return gaps
+
+
 def check_shortfall_many(client, lines):
     """
     Multi-SKU sufficiency check (spec 4.2 step 4) without mutating the DB.

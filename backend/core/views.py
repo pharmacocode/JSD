@@ -1121,9 +1121,17 @@ class DashboardView(APIView):
         m_year, m_mon = (int(p) for p in month.split("-"))
         month_filter = {"date__year": m_year, "date__month": m_mon}
 
-        # Stock in hand panel.
+        # Stock in hand panel. `stock_in_hand` is the LIVE batch-ledger sum;
+        # `unrecorded_shortfall` is the demand-vs-booked gap (pre-negative-stock
+        # legacy signature: demand recorded on deliveries that the ledger never
+        # booked, so stock sits at 0 instead of the true negative). Same math
+        # as the backfill command (cogs.legacy_*), read-only here.
+        demand_by_material, _last_event = cogs.legacy_demand_by_material()
+        gaps = cogs.legacy_shortfall_gaps(demand_by_material)
         materials = []
         for m in Material.objects.all().order_by("name"):
+            row = gaps.get(m.id, {})
+            gap = row.get("gap", cogs.ZERO)
             materials.append(
                 {
                     "id": m.id,
@@ -1133,6 +1141,10 @@ class DashboardView(APIView):
                     "stock_in_hand": dstr(m.stock_in_hand),
                     "stock_alert_qty": dstr(m.stock_alert_qty),
                     "below_alert": m.is_below_alert,
+                    "demand": dstr(row.get("demand", cogs.ZERO)),
+                    "booked": dstr(row.get("booked", cogs.ZERO)),
+                    "unrecorded_shortfall": dstr(gap),
+                    "has_unrecorded_shortfall": gap > cogs.ZERO,
                     "is_client_specific": m.is_client_specific,
                     "client": m.client_id,
                     "client_name": m.client.name if m.client else None,

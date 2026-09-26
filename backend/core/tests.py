@@ -633,6 +633,59 @@ class APITests(TestCase):
             "Bottle API",
             [r["material"] for r in dash["stats"]["inward_materials"]],
         )
+        # Fully booked ledger -> no unrecorded gap on the badge.
+        self.assertFalse(row["has_unrecorded_shortfall"])
+        self.assertEqual(row["unrecorded_shortfall"], "0")
+
+    def test_dashboard_flags_legacy_unrecorded_shortfall(self):
+        """Pre-negative-stock signature: demand the ledger never booked."""
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku.id,
+                "qty_cases": "10",
+                "date": "2026-09-10",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        # Simulate a pre-negative-stock delivery: the demand exists but the
+        # ledger never booked it (rows gone -> booked 0, stock back to 0).
+        MaterialBatch.objects.filter(material=self.bottle).delete()
+        dash = self.api.get("/api/dashboard/?month=2026-09").data
+        row = next(r for r in dash["stock"] if r["name"] == "Bottle API")
+        # Stock sits at 0 (nothing booked) but the badge exposes the gap.
+        self.assertEqual(row["stock_in_hand"], "0")
+        self.assertTrue(row["has_unrecorded_shortfall"])
+        self.assertEqual(row["demand"], "10")
+        self.assertEqual(row["booked"], "0")
+        self.assertEqual(row["unrecorded_shortfall"], "10")
+
+    def test_dashboard_badge_clean_and_ignores_requirement_less_sku(self):
+        """Healthy ledger -> badge absent; requirement-less SKU never a gap."""
+        dash = self.api.get("/api/dashboard/?month=2026-09").data
+        row = next(r for r in dash["stock"] if r["name"] == "Bottle API")
+        self.assertFalse(row["has_unrecorded_shortfall"])
+        self.assertEqual(row["unrecorded_shortfall"], "0")
+        bare = SKU.objects.create(description="Bare API", qty_per_case=D("24"))
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=bare, selling_price_per_case=D("300")
+        )
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": bare.id,
+                "qty_cases": "5",
+                "date": "2026-09-11",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        dash = self.api.get("/api/dashboard/?month=2026-09").data
+        row = next(r for r in dash["stock"] if r["name"] == "Bottle API")
+        self.assertFalse(row["has_unrecorded_shortfall"])
 
     def test_delivery_auto_fills_price_and_snapshot(self):
         resp = self.api.post(

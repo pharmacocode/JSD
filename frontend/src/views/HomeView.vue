@@ -472,13 +472,25 @@ async function deleteItem(item) {
                 >
                   LOW
                 </v-chip>
+                <v-chip
+                  v-if="s.has_unrecorded_shortfall"
+                  color="warning"
+                  size="x-small"
+                  variant="flat"
+                  class="ml-1"
+                  :title="`Delivered ${num(s.demand)} but only ${num(s.booked)} booked — run the legacy backfill or add the missing arrival`"
+                >
+                  UNRECORDED −{{ num(s.unrecorded_shortfall) }}
+                </v-chip>
               </template>
             </v-list-item>
           </v-list>
           <div class="text-caption text-medium-emphasis pa-3 pt-2">
             Red = below the alert quantity · green = at or above it · SHORT =
             negative stock (delivered beyond stock in hand) — clear it with a
-            Stock Adjustment or a backdated arrival. Tap a material to open
+            Stock Adjustment or a backdated arrival. UNRECORDED −n = delivered
+            demand the batch ledger never booked (pre-negative-stock entries) —
+            run the legacy backfill to book it. Tap a material to open
             its batches.
           </div>
         </div>

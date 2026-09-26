@@ -177,6 +177,10 @@ SPA routing). Env var:
   clean ledger. Because a hand-edited batch (Home keyed edit) or an upward
   reconciliation also moves "already booked", a material already reconciled by
   hand can still appear: **review the dry-run report before using `--apply`**.
+  The Home stock panel shows the same gap read-only next to the live figure
+  (`demand` / `booked` / `UNRECORDED −n` badge) so a silent pre-fix gap can
+  never hide — booking the backfill (or recording the missing arrival)
+  clears the badge.
 - **Inward line items are editable (user request):** the Home screen lists the
   month's arrivals with their underlying batches; each line can be edited in
   place (received cases, landing price, arrival date) or removed. Editing
