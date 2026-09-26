@@ -26,7 +26,7 @@ Key rules:
   deliveries land in that month.
 """
 
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.db.models import Sum
@@ -708,6 +708,81 @@ def timezone_now_date():
     return timezone.now().date()
 
 
+def _payment_payload(entry):
+    """
+    API shape for a payment captured with a delivery (None => no payment was
+    entered, so the frontend simply shows nothing).
+    """
+    if entry is None:
+        return None
+    return {
+        "id": entry.id,
+        "amount": str(money(abs(entry.amount))),  # positive as the user typed it
+        "date": entry.date.isoformat(),
+        "note": entry.note,
+    }
+
+
+def create_delivery_payment(
+    client, payment, delivery_date, default_note: str = "", related_delivery=None
+):
+    """
+    Optional payment entered together with a delivery (user request: the payment
+    can be noted on the delivery screen and is then captured as a transaction
+    under the client).
+
+    `payment` = {"amount": Decimal|str, "date"?: "YYYY-MM-DD", "note"?: str} or
+    None. A blank / absent / zero amount means "no payment" — the delivery is
+    saved on credit exactly as before, so the field never gets in the way. A
+    positive amount writes a normal PAYMENT ledger entry (stored negative, the
+    same shape the Client Detail "Record Payment" dialog writes), so the money
+    lands in the client's ledger and the pending balance drops immediately.
+
+    Called from INSIDE the caller's transaction (create_delivery /
+    create_deliveries), so a bad amount rolls the whole delivery back with it.
+
+    Returns the created ClientLedgerEntry, or None when no payment was entered.
+    Raises ValueError (-> HTTP 400) for a non-numeric or negative amount.
+    """
+    from django.utils.dateparse import parse_date
+
+    if not payment:
+        return None
+    raw_amount = payment.get("amount")
+    if raw_amount in (None, ""):
+        return None
+    try:
+        amount = money(Decimal(str(raw_amount)))
+    except (InvalidOperation, TypeError, ValueError):
+        raise ValueError("Payment amount must be a number.")
+    if amount < ZERO:
+        raise ValueError("Payment amount cannot be negative.")
+    if amount == ZERO:
+        return None  # nothing handed over -> plain credit delivery
+
+    # The payment normally happens on the delivery date itself; the user can
+    # still date it differently (e.g. money received a day later).
+    payment_date = payment.get("date") or delivery_date
+    if isinstance(payment_date, str):
+        try:
+            parsed = parse_date(payment_date)
+        except ValueError:
+            parsed = None
+        if parsed is None:
+            raise ValueError("Payment date must be a valid date (YYYY-MM-DD).")
+        payment_date = parsed
+
+    note = str(payment.get("note") or "").strip()
+    return ClientLedgerEntry.objects.create(
+        client=client,
+        entry_type="PAYMENT",
+        amount=-amount,  # payments decrease pending (spec 3.2)
+        note=note or default_note,
+        date=payment_date,
+        related_delivery=related_delivery,
+    )
+
+
 @transaction.atomic
 def create_delivery(
     client,
@@ -717,6 +792,7 @@ def create_delivery(
     delivery_date=None,
     note: str = "",
     force: bool = False,
+    payment=None,
 ):
     """
     Orchestration for the Add-Delivery flow (spec 4.2 / 3.8):
@@ -727,6 +803,8 @@ def create_delivery(
       4. Save delivery — the snapshot columns record the figures as at
          creation for the AUDIT trail (displayed costs stay dynamic).
       5. Create linked ClientLedgerEntry (DELIVERY, +qty*price).
+      6. Optional payment (`payment`) handed over at the same moment -> PAYMENT
+         ledger entry under the client (blank -> nothing, plain credit as before).
 
     Returns (delivery, result_dict). Atomic.
     """
@@ -775,9 +853,21 @@ def create_delivery(
         date=delivery_date,
     )
 
+    # 6. Optional payment recorded with the delivery (user request): booked
+    #    here — after the DELIVERY entry, before any figure is read — so
+    #    client_pending_amount below already reflects it.
+    payment_entry = create_delivery_payment(
+        client,
+        payment,
+        delivery_date,
+        default_note=f"Payment with delivery: {qty_cases} x {sku.description}",
+        related_delivery=delivery,
+    )
+
     result["delivery_id"] = delivery.id
     result["client_pending_amount"] = str(client.pending_amount)
     result["total_amount"] = str(amount)
+    result["payment"] = _payment_payload(payment_entry)
     # Figures as at creation (so the month's case count includes this one):
     # the actual cost just consumed + the month's live overhead. From here on
     # every screen recomputes costs dynamically (dynamic_costs_for).
@@ -793,7 +883,12 @@ def create_delivery(
 
 @transaction.atomic
 def create_deliveries(
-    client, lines, delivery_date=None, note: str = "", force: bool = False
+    client,
+    lines,
+    delivery_date=None,
+    note: str = "",
+    force: bool = False,
+    payment=None,
 ):
     """
     Multi-SKU delivery (spec 4.2): one client, one date, one note — saved as
@@ -805,8 +900,13 @@ def create_deliveries(
     `lines` = [{"sku": sku, "qty_cases": Decimal,
                 "selling_price_per_case": Decimal | None}, ...]
 
+    `payment` = optional payment captured with the delivery (same shape as
+    create_delivery). It is booked ONCE for the whole run — not per SKU line —
+    so the client's ledger shows the money handed over a single time.
+
     Atomic: the aggregated stock check runs BEFORE anything is written, and a
-    failure on any line rolls the whole delivery back — never half-saved.
+    failure on any line (or on the payment) rolls the whole delivery back —
+    never half-saved.
 
     Returns (deliveries, result_dict). Raises DeliveryShortfall (-> 409) or
     ValueError (-> 400).
@@ -913,6 +1013,19 @@ def create_deliveries(
             }
         )
 
+    # 5. Optional payment for the whole run (user request): ONE PAYMENT entry
+    #    instead of one per SKU line, booked after every line exists so the
+    #    pending figure returned below already includes it.
+    payment_entry = create_delivery_payment(
+        client,
+        payment,
+        delivery_date,
+        default_note=(
+            f"Payment with delivery: {round_qty(total_cases)} cases "
+            f"across {len(created)} SKU line(s)"
+        ),
+    )
+
     month = month_key(delivery_date)
     base_per_case = base_total / total_cases if total_cases > 0 else ZERO
     oh_per_case = overhead_per_case(month)
@@ -928,6 +1041,7 @@ def create_deliveries(
         "total_amount": str(money(total_amount)),
         "total_cogs_current": str(money(total_cogs)),
         "client_pending_amount": str(client.pending_amount),
+        "payment": _payment_payload(payment_entry),
         "stock_shortfall_flag": any(
             delivery.stock_shortfall_flag for delivery, _line in created
         ),

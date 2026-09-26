@@ -1673,6 +1673,169 @@ class MultiSKUDeliveryTests(TestCase):
         self.assertIn("shortfall", resp.data)
 
 
+class DeliveryPaymentAtEntryTests(TestCase):
+    """
+    User request: a payment can be noted right on the Add-Delivery screen. It is
+    OPTIONAL — left blank the delivery is saved on credit exactly as before —
+    and when an amount is given it is captured as a normal PAYMENT transaction
+    under the client, so the pending balance drops immediately and the money
+    shows up in the client's ledger next to the delivery it came with.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.client_obj = Client.objects.create(name="Paying Client")
+        self.sku = SKU.objects.create(
+            description="500ml P", qty_per_case=D("24"), volume_ml=500
+        )
+        self.bottle = make_material("Bottle payable")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        make_batch(self.bottle, "100", "10", arrival=date(2026, 9, 1))
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+
+    def bulk(self, lines, **overrides):
+        payload = {
+            "client": self.client_obj.id,
+            "date": "2026-09-20",
+            "note": "Route 1",
+            "lines": lines,
+            **overrides,
+        }
+        return self.api.post("/api/deliveries/bulk/", payload, format="json")
+
+    def test_payment_entered_with_delivery_becomes_a_client_transaction(self):
+        resp = self.bulk(
+            [{"sku": self.sku.id, "qty_cases": "4"}],  # 4 x 300 = 1200
+            payment={"amount": "500", "date": "2026-09-20", "note": "Cash"},
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertEqual(resp.data["total_amount"], "1200.00")
+        # The response reports the payment and the pending AFTER it.
+        self.assertEqual(resp.data["payment"]["amount"], "500.00")
+        self.assertEqual(resp.data["payment"]["date"], "2026-09-20")
+        self.assertEqual(resp.data["payment"]["note"], "Cash")
+        self.assertEqual(resp.data["client_pending_amount"], "700.00")
+
+        payments = ClientLedgerEntry.objects.filter(entry_type="PAYMENT")
+        # ONE payment for the whole run, however many SKU lines it carried.
+        self.assertEqual(payments.count(), 1)
+        entry = payments.get()
+        self.assertEqual(entry.client_id, self.client_obj.id)
+        self.assertEqual(entry.amount, D("-500"))  # stored negative (spec 3.2)
+        self.assertEqual(entry.date, date(2026, 9, 20))
+        self.assertEqual(entry.note, "Cash")
+        # A multi-SKU run has no single delivery row to point the money at.
+        self.assertIsNone(entry.related_delivery_id)
+        # …and it is a real line on the client's ledger.
+        ledger = self.api.get(f"/api/clients/{self.client_obj.id}/ledger/").data
+        self.assertEqual(ledger["pending_amount"], "700.00")
+        self.assertEqual(
+            [e["entry_type"] for e in ledger["entries"]], ["PAYMENT", "DELIVERY"]
+        )
+
+    def test_payment_is_optional_blank_and_zero_mean_no_payment(self):
+        resp = self.bulk([{"sku": self.sku.id, "qty_cases": "4"}])
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNone(resp.data["payment"])
+        self.assertEqual(resp.data["client_pending_amount"], "1200.00")
+        self.assertEqual(StockDelivery.objects.count(), 1)
+        # Blank / zero amounts coming from the UI must not create an entry
+        # either — "optional" has to mean optional in every shape.
+        for blank in ({"amount": ""}, {"amount": "0"}, {"amount": None}):
+            resp = self.bulk(
+                [{"sku": self.sku.id, "qty_cases": "1"}], payment=blank
+            )
+            self.assertEqual(resp.status_code, 201)
+            self.assertIsNone(resp.data["payment"])
+        self.assertEqual(
+            ClientLedgerEntry.objects.filter(entry_type="PAYMENT").count(), 0
+        )
+        self.assertEqual(D(self.client_obj.pending_amount), D("2100"))  # 1200 + 3x300
+
+
+    def test_payment_date_defaults_to_the_delivery_date(self):
+        resp = self.bulk(
+            [{"sku": self.sku.id, "qty_cases": "1"}], payment={"amount": "300"}
+        )
+        self.assertEqual(resp.status_code, 201)
+        entry = ClientLedgerEntry.objects.get(entry_type="PAYMENT")
+        self.assertEqual(entry.date, date(2026, 9, 20))  # the delivery date
+        # A default note is written so the ledger row is self-explanatory.
+        self.assertIn("Payment with delivery", entry.note)
+        self.assertEqual(resp.data["payment"]["date"], "2026-09-20")
+
+    def test_flat_payment_keys_are_accepted_too(self):
+        resp = self.bulk(
+            [{"sku": self.sku.id, "qty_cases": "1"}],
+            payment_amount="300",
+            payment_date="2026-09-22",
+            payment_note="UPI",
+        )
+        self.assertEqual(resp.status_code, 201)
+        entry = ClientLedgerEntry.objects.get(entry_type="PAYMENT")
+        self.assertEqual(entry.amount, D("-300"))
+        self.assertEqual(entry.date, date(2026, 9, 22))
+        self.assertEqual(entry.note, "UPI")
+        self.assertEqual(resp.data["client_pending_amount"], "0.00")
+
+    def test_single_sku_delivery_links_the_payment_to_the_delivery(self):
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku.id,
+                "qty_cases": "2",  # 2 x 300 = 600
+                "date": "2026-09-20",
+                "payment": {"amount": "100", "date": "2026-09-21"},
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        entry = ClientLedgerEntry.objects.get(entry_type="PAYMENT")
+        # Single-SKU delivery -> the money points at the delivery it came with.
+        self.assertEqual(entry.related_delivery_id, resp.data["delivery"]["id"])
+        self.assertEqual(entry.date, date(2026, 9, 21))  # dated by the user
+        self.assertEqual(resp.data["payment"]["amount"], "100.00")
+        self.assertEqual(resp.data["client_pending_amount"], "500.00")
+
+    def test_a_payment_larger_than_the_delivery_is_an_advance(self):
+        # Nothing blocks the client paying more than this delivery is worth —
+        # it just reduces (here: over-reduces) the running pending balance.
+        resp = self.bulk(
+            [{"sku": self.sku.id, "qty_cases": "1"}],  # 300
+            payment={"amount": "500", "note": "Advance"},
+        )
+        self.assertEqual(resp.status_code, 201)
+        self.assertIsNotNone(resp.data["payment"])
+        self.assertEqual(resp.data["client_pending_amount"], "-200.00")
+        self.assertEqual(D(self.client_obj.pending_amount), D("-200"))
+
+    def test_bad_payment_amount_rejects_the_whole_delivery(self):
+        for bad in ("abc", "-5"):
+            resp = self.bulk(
+                [{"sku": self.sku.id, "qty_cases": "1"}], payment={"amount": bad}
+            )
+            self.assertEqual(resp.status_code, 400)
+        # Atomic: no delivery, no ledger entry, no consumed stock survived.
+        self.assertEqual(StockDelivery.objects.count(), 0)
+        self.assertEqual(ClientLedgerEntry.objects.count(), 0)
+        self.assertEqual(stock_available(self.bottle), D("100"))
+
+        # A malformed payment date is rejected just as loudly.
+        resp = self.bulk(
+            [{"sku": self.sku.id, "qty_cases": "1"}],
+            payment={"amount": "100", "date": "20-09-2026"},
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Payment date", resp.data["detail"])
+        self.assertEqual(StockDelivery.objects.count(), 0)
+        self.assertEqual(stock_available(self.bottle), D("100"))
+
+
 class BackfillNegativeStockCommandTests(TestCase):
     """
     Approved fix-up tool: deliveries recorded BEFORE the negative-stock rule

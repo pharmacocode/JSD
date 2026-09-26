@@ -98,6 +98,32 @@ def marker_preview_amount(request):
         return Decimal("0")
 
 
+def delivery_payment_request(request):
+    """
+    Optional payment sent with a delivery (user request: the payment can be
+    noted while entering the delivery).
+
+    Preferred shape: {"payment": {"amount", "date"?, "note"?}} — the flat
+    `payment_amount` / `payment_date` / `payment_note` keys work too. An absent
+    or blank amount returns (None, None): no payment, the delivery is saved on
+    credit exactly as before. Amount/date validation lives in
+    cogs.create_delivery_payment, which turns a bad value into ValueError ->
+    400 inside the delivery's transaction.
+    """
+    raw = request.data.get("payment")
+    if isinstance(raw, dict):
+        amount = raw.get("amount")
+        date_value = raw.get("date")
+        note = raw.get("note", "")
+    else:
+        amount = request.data.get("payment_amount")
+        date_value = request.data.get("payment_date")
+        note = request.data.get("payment_note", "")
+    if amount in (None, ""):
+        return None, None
+    return {"amount": amount, "date": date_value, "note": note}, None
+
+
 class ClientViewSet(viewsets.ModelViewSet):
     queryset = Client.objects.all().prefetch_related("sku_prices__sku")
     serializer_class = ClientSerializer
@@ -704,6 +730,12 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         if date_value:
             date_value = date_cls.fromisoformat(date_value)
 
+        # Optional payment noted while entering the delivery (user request):
+        # blank -> no payment entry at all, delivery saved on credit as before.
+        payment, error = delivery_payment_request(request)
+        if error:
+            return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             delivery, result = create_delivery(
                 client,
@@ -715,6 +747,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                 delivery_date=date_value,
                 note=request.data.get("note", ""),
                 force=force,
+                payment=payment,
             )
         except DeliveryShortfall as exc:
             # Spec 4.2 step 4: clear warning payload -> Proceed/Cancel UI.
@@ -749,6 +782,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                 "total_amount": result["total_amount"],
                 "total_cogs_current": result["total_cogs_current"],
                 "client_pending_amount": result["client_pending_amount"],
+                "payment": result["payment"],
                 "stock_shortfall_flag": delivery.stock_shortfall_flag,
             },
             status=status.HTTP_201_CREATED,
@@ -759,7 +793,8 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         """
         Multi-SKU delivery (spec 4.2) — one client, one date, one note:
         POST {client, date, note, force,
-              lines: [{sku, qty_cases, selling_price_per_case}]}
+              lines: [{sku, qty_cases, selling_price_per_case}],
+              payment?: {amount, date?, note?}}
 
         Creates one StockDelivery per line (each with its own creation-time
         COGS snapshot — audit only — and generated client-ledger entry)
@@ -767,6 +802,12 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         stock check is aggregated across the lines: a 409 carries the summed
         shortfall list
         and the same request with force=true proceeds ("Proceed anyway").
+
+        `payment` is optional (user request): when an amount is given, the same
+        atomic request writes ONE PAYMENT ledger entry for the client (negative
+        amount, dated the delivery date unless stated otherwise), so the money
+        is captured as a client transaction and the pending balance drops
+        immediately. Omitted/blank => no payment, plain credit delivery.
         """
         from datetime import date as date_cls
 
@@ -815,6 +856,11 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         date_value = date_cls.fromisoformat(date_value) if date_value else None
         force = str(request.data.get("force", "")).lower() in ("1", "true", "yes")
 
+        # Optional payment handed over with this delivery (user request).
+        payment, error = delivery_payment_request(request)
+        if error:
+            return Response({"detail": error}, status=status.HTTP_400_BAD_REQUEST)
+
         try:
             deliveries, result = create_deliveries(
                 client,
@@ -822,6 +868,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                 delivery_date=date_value,
                 note=request.data.get("note", ""),
                 force=force,
+                payment=payment,
             )
         except DeliveryShortfall as exc:
             # Spec 4.2 step 4: clear warning payload -> Proceed/Cancel UI.
@@ -850,6 +897,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                 "total_amount": result["total_amount"],
                 "total_cogs_current": result["total_cogs_current"],
                 "client_pending_amount": result["client_pending_amount"],
+                "payment": result["payment"],
                 "stock_shortfall_flag": result["stock_shortfall_flag"],
             },
             status=status.HTTP_201_CREATED,

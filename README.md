@@ -105,6 +105,21 @@ SPA routing). Env var:
   live sum of `ClientLedgerEntry.amount` (positive = delivery, negative =
   payment), plus the optional *balance marker* described next. No running total
   is ever stored.
+- **Payment noted at delivery entry (user request):** the Add-Delivery screen
+  carries an optional **Payment** section — a switch (off by default), the amount
+  (pre-filled with the full delivery value, still editable), a payment date
+  (follows the delivery date) and a note. Left off, the delivery is saved on
+  credit exactly as before. Filled in, the *same atomic request* writes a normal
+  `PAYMENT` ledger entry under the client (negative amount, dated the delivery
+  date unless stated otherwise, linked to the delivery on the single-SKU path),
+  so the money is captured as a client transaction and the pending balance drops
+  immediately — the delivery and the payment are saved together or not at all.
+  A blank/zero amount simply means "no payment"; a negative or unreadable amount
+  (or unreadable date) rejects the whole delivery with a `400`. API:
+  `payment: {amount, date?, note?}` on `POST /api/deliveries/` and
+  `POST /api/deliveries/bulk/` (flat `payment_amount` / `payment_date` /
+  `payment_note` keys also accepted); both responses return `payment` (`null`
+  when none was entered) and `client_pending_amount` **after** it.
 - **Balance markers ("pending amount as of a date", user request):** the client's
   pending amount and the vendor's payable can be **edited at any time together
   with the date they refer to** (`Client.pending_as_of_amount` /

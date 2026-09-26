@@ -26,6 +26,13 @@ const skus = ref([])
 const lines = ref([])
 const date = ref(today())
 const note = ref('')
+// Optional payment handed over at the delivery (user request): off by default
+// and never required — left alone, the delivery is saved on credit exactly as
+// before. When filled in it is captured as a payment transaction for the client.
+const payNow = ref(false)
+const payAmount = ref('')
+const payDate = ref(today())
+const payNote = ref('')
 const preview = ref(null)
 const shortfall = ref(null)
 const result = ref(null)
@@ -123,8 +130,34 @@ const deliveryValue = computed(() =>
   lines.value.reduce((sum, l) => sum + Number(l.qty) * Number(l.price || 0), 0)
 )
 
+// The money normally changes hands on the delivery date itself, so the payment
+// date follows the delivery date until the user picks one deliberately.
+watch(date, (value, previous) => {
+  if (payDate.value === previous) payDate.value = value
+})
+
+// Switching the payment on pre-fills today's delivery date and the full
+// delivery value — both stay editable, and nothing is sent until submit.
+watch(payNow, (on) => {
+  if (!on) return
+  payDate.value = date.value
+  if (!payAmount.value) payAmount.value = String(deliveryValue.value)
+})
+
+// Client pending balance after this delivery and the optional payment:
+// live pending + this run's value − whatever is handed over now.
+const pendingAfter = computed(
+  () =>
+    Number(client.value?.pending_amount || 0) +
+    deliveryValue.value -
+    (payNow.value ? Number(payAmount.value || 0) : 0)
+)
+
 const canSubmit = computed(() => {
   if (loading.value || !client.value || !lines.value.length) return false
+  // A payment is optional, but once the switch is on it has to be a positive
+  // amount — otherwise the money would look recorded when it was not.
+  if (payNow.value && !(Number(payAmount.value) > 0)) return false
   return lines.value.every(
     (l) =>
       Number(l.qty) > 0 &&
@@ -139,8 +172,10 @@ async function submit(force = false) {
   shortfall.value = null
   loading.value = true
   try {
-    // One atomic request for every line — never a half-saved delivery.
-    result.value = await api.post('/deliveries/bulk/', {
+    // One atomic request for every line — never a half-saved delivery. The
+    // optional payment rides along in the same request, so the delivery and the
+    // client transaction are saved together (or not at all).
+    const payload = {
       client: client.value.id,
       date: date.value,
       note: note.value,
@@ -150,7 +185,15 @@ async function submit(force = false) {
         qty_cases: String(l.qty),
         selling_price_per_case: String(l.price),
       })),
-    })
+    }
+    if (payNow.value && Number(payAmount.value) > 0) {
+      payload.payment = {
+        amount: String(payAmount.value),
+        date: payDate.value,
+        note: payNote.value,
+      }
+    }
+    result.value = await api.post('/deliveries/bulk/', payload)
   } catch (e) {
     if (e.status === 409) {
       shortfall.value = e.data // {detail, shortfall:[...]} -> inline banner
@@ -169,6 +212,10 @@ function reset() {
   skus.value = []
   date.value = today()
   note.value = ''
+  payNow.value = false
+  payAmount.value = ''
+  payDate.value = today()
+  payNote.value = ''
   preview.value = null
   shortfall.value = null
   result.value = null
@@ -232,12 +279,31 @@ function reset() {
               <strong>{{ money(result.total_amount) }}</strong>
             </template>
           </v-list-item>
+          <!-- Payment noted on this screen (optional): shown so the user sees
+               the money landed as a transaction under the client. -->
+          <v-list-item
+            v-if="result.payment"
+            title="Payment recorded with delivery"
+            :subtitle="`${result.payment.date} · ${result.payment.note}`"
+          >
+            <template #append>
+              <strong class="text-success">
+                {{ money(result.payment.amount) }}
+              </strong>
+            </template>
+          </v-list-item>
           <v-list-item title="Total COGS (current)">
             <template #append>
               <strong>{{ money(result.total_cogs_current) }}</strong>
             </template>
           </v-list-item>
-          <v-list-item title="Client pending balance">
+          <v-list-item
+            :title="
+              result.payment
+                ? 'Client pending balance (after payment)'
+                : 'Client pending balance'
+            "
+          >
             <template #append>
               <strong class="text-error">
                 {{ money(result.client_pending_amount) }}
@@ -427,6 +493,89 @@ function reset() {
             />
           </div>
           <v-text-field v-model="note" label="Note (optional)" class="mt-2" />
+        </v-card-text>
+      </v-card>
+
+      <!-- 4. Payment (optional) — user request: the money handed over at the
+           delivery can be noted right here instead of a separate trip to the
+           client's ledger. Left off, the delivery is simply saved on credit. -->
+      <v-card class="mb-3" :disabled="!lines.length">
+        <v-card-title
+          class="d-flex align-center text-subtitle-1 font-weight-bold"
+        >
+          <v-avatar
+            size="24"
+            color="primary"
+            variant="tonal"
+            class="mr-2 text-caption font-weight-bold"
+          >
+            4
+          </v-avatar>
+          Payment (optional)
+        </v-card-title>
+        <v-divider />
+        <v-card-text>
+          <v-switch
+            v-model="payNow"
+            color="success"
+            density="compact"
+            hide-details
+            label="Payment received with this delivery"
+          />
+          <p class="text-caption text-medium-emphasis mt-1 mb-0">
+            Optional — leave this off and the delivery is saved on credit as
+            usual. An amount entered here is captured as a payment transaction
+            under {{ client?.name }} immediately.
+          </p>
+          <template v-if="payNow">
+            <v-text-field
+              v-model="payAmount"
+              type="number"
+              min="0"
+              prefix="₹"
+              label="Amount received"
+              density="comfortable"
+              class="mt-3"
+            />
+            <div class="d-flex flex-wrap ga-2">
+              <v-chip
+                size="small"
+                variant="tonal"
+                @click="payAmount = String(deliveryValue)"
+              >
+                Full delivery value · {{ money(deliveryValue) }}
+              </v-chip>
+              <v-chip
+                v-if="payAmount"
+                size="small"
+                variant="text"
+                @click="payAmount = ''"
+              >
+                Clear
+              </v-chip>
+            </div>
+            <v-text-field
+              v-model="payDate"
+              type="date"
+              label="Payment date"
+              density="comfortable"
+              class="mt-2"
+            />
+            <v-text-field
+              v-model="payNote"
+              label="Payment note (optional)"
+              hint="Stored on the payment entry in the client's ledger"
+              persistent-hint
+              density="comfortable"
+            />
+            <p class="text-caption mt-2 mb-0">
+              Delivery value {{ money(deliveryValue) }} ·
+              <template v-if="Number(payAmount) > 0">
+                paying {{ money(payAmount) }} now ·
+              </template>
+              pending after this: <strong>{{ money(pendingAfter) }}</strong>
+            </p>
+          </template>
         </v-card-text>
       </v-card>
 
