@@ -34,6 +34,7 @@ from django.db.models import Sum
 from .models import (
     Client,
     ClientLedgerEntry,
+    Material,
     MaterialBatch,
     SKUPrintCost,
     StockDelivery,
@@ -99,6 +100,71 @@ def stock_available(material) -> Decimal:
         fifo_batches_for(material).aggregate(s=Sum("quantity_remaining"))["s"]
         or ZERO
     )
+
+
+def settle_deficit(material, arriving) -> list:
+    """
+    Settle a material's outstanding deficit against the stock that has since
+    arrived.
+
+    A negative batch means cases were DELIVERED before the stock that covered
+    them was recorded — it is a promise, not free stock. When that stock later
+    arrives it settles the promise: the oldest positive batches give up the
+    cases they already delivered, and the invented deficit row is retired once
+    it reaches exactly zero.
+
+    Without this, `consume_fifo` (which only ever draws from batches with a
+    POSITIVE balance) would keep taking from the newest arrivals while the
+    deficit sat there forever. Batch history then shows a permanent -N beside
+    arrivals that were in fact already consumed, and the FIFO queue prices the
+    next delivery off stock that has physically gone out.
+
+    Idempotent — a no-op once every deficit is cleared — so it is safe to call
+    on every arrival and every consumption.
+
+    Returns [{deficit_batch_id, source_batch_id, qty}] for reporting.
+    """
+    # The arriving batch is passed in (not re-queried) so its in-memory balance
+    # is the one settled against — the row has just been written.
+    queue = [b for b in fifo_batches_for(material) if b.pk != arriving.pk]
+    queue.append(arriving)
+    queue.sort(key=lambda b: (b.arrival_date, b.pk))
+
+    settlements = []
+    for deficit in [b for b in queue if b.quantity_remaining < 0]:
+        owed = -deficit.quantity_remaining
+        # Oldest stock first — the same order a delivery would have drawn from.
+        for source in queue:
+            if owed <= 0:
+                break
+            if source.pk == deficit.pk or source.quantity_remaining <= 0:
+                continue
+            take = min(source.quantity_remaining, owed)
+            source.quantity_remaining = round_qty(source.quantity_remaining - take)
+            source.save(skip_audit=True)
+            deficit.quantity_remaining = round_qty(deficit.quantity_remaining + take)
+            owed -= take
+            settlements.append(
+                {
+                    "deficit_batch_id": deficit.pk,
+                    "source_batch_id": source.pk,
+                    "qty": str(round_qty(take)),
+                }
+            )
+        if owed <= 0:
+            deficit.quantity_remaining = ZERO
+            # A zero-received row with nothing left to owe is pure clutter —
+            # retire it the same way the delivery rollback retires a carrier.
+            if deficit.quantity_received <= 0:
+                deficit.save(skip_audit=True)
+                deficit.soft_delete()
+            else:
+                deficit.save(skip_audit=True)
+        else:
+            # Partly settled: persist the reduced shortfall, or the in-memory
+            # change would be lost and the same stock settled again next time.
+            deficit.save(skip_audit=True)
+    return settlements
 
 
 def check_shortfall(sku, client, qty_cases: Decimal):

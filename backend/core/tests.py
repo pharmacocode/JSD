@@ -373,6 +373,152 @@ class NegativeStockMarkingTests(TestCase):
         self.assertEqual(self.bottle.stock_in_hand, D("-4"))
         self.assertEqual(self.bottle.batches.get().quantity_remaining, D("-4"))
 
+    def test_backdated_arrival_settles_the_standing_deficit(self):
+        """
+        User report: batch history showed a permanent -170 beside a later
+        arrival of 200 that had in fact already been delivered.
+
+        A deficit means the cases went out BEFORE the stock was recorded, so
+        stock arriving afterwards settles it: the oldest arrival gives up what
+        it already covered and the invented row is retired once nothing is owed.
+        Otherwise `consume_fifo` (which only draws from a POSITIVE balance)
+        would keep handing the same cases out again, and the FIFO queue would
+        price the next delivery off stock that had physically gone.
+        """
+        api = APIClient()
+        create_delivery(
+            self.client_obj, self.sku, D("170"),
+            delivery_date=date(2026, 9, 25), force=True,
+        )  # -> carrier at -170
+        self.assertEqual(self.bottle.stock_in_hand, D("-170"))
+
+        # The stock that was already delivered finally turns up.
+        api.post(
+            "/api/batches/",
+            {
+                "material": self.bottle.id,
+                "quantity_received": "200",
+                "price_per_unit": "240",
+                "arrival_date": "2026-09-30",
+            },
+            format="json",
+        )
+        self.assertEqual(self.bottle.stock_in_hand, D("30"))
+        self.assertEqual(
+            self.bottle.batches.filter(is_deleted=False).count(), 1
+        )  # carrier retired, not left sitting at -170
+
+        api.post(
+            "/api/batches/",
+            {
+                "material": self.bottle.id,
+                "quantity_received": "32",
+                "price_per_unit": "240",
+                "arrival_date": "2026-09-30",
+            },
+            format="json",
+        )
+        self.assertEqual(self.bottle.stock_in_hand, D("62"))
+        api.post(
+            "/api/batches/",
+            {
+                "material": self.bottle.id,
+                "quantity_received": "854",
+                "price_per_unit": "240",
+                "arrival_date": "2026-10-04",
+            },
+            format="json",
+        )
+        self.assertEqual(self.bottle.stock_in_hand, D("916"))
+
+    def test_settlement_does_not_double_count_a_later_delivery(self):
+        """
+        The settled cases must not be handed out a second time: after the
+        arrival settles the deficit, stock in hand is the plain remainder.
+        """
+        api = APIClient()
+        create_delivery(
+            self.client_obj, self.sku, D("10"),
+            delivery_date=date(2026, 9, 5), force=True,
+        )  # -> -10
+        api.post(
+            "/api/batches/",
+            {
+                "material": self.bottle.id,
+                "quantity_received": "25",
+                "price_per_unit": "240",
+                "arrival_date": "2026-09-06",
+            },
+            format="json",
+        )
+        # 25 arrived, 10 of it was already delivered -> 15 left, not 25.
+        self.assertEqual(self.bottle.stock_in_hand, D("15"))
+
+        # And the next delivery draws from those 15 exactly once.
+        create_delivery(
+            self.client_obj, self.sku, D("15"),
+            delivery_date=date(2026, 9, 7), force=True,
+        )
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+        self.assertFalse(
+            self.bottle.batches.filter(
+                is_deleted=False, quantity_remaining__lt=0
+            ).exists()
+        )
+
+    def test_settlement_leaves_a_deficit_that_cannot_be_covered(self):
+        """
+        Arrival smaller than the shortfall: it settles what it can and the
+        rest stays visible as a shortfall rather than being silently cleared.
+        """
+        api = APIClient()
+        create_delivery(
+            self.client_obj, self.sku, D("30"),
+            delivery_date=date(2026, 9, 5), force=True,
+        )  # -> -30
+        api.post(
+            "/api/batches/",
+            {
+                "material": self.bottle.id,
+                "quantity_received": "12",
+                "price_per_unit": "240",
+                "arrival_date": "2026-09-06",
+            },
+            format="json",
+        )
+        # 12 arrived, 12 of the 30 settled -> 18 still owed.
+        self.assertEqual(self.bottle.stock_in_hand, D("-18"))
+        self.assertTrue(
+            self.bottle.batches.filter(
+                is_deleted=False, quantity_remaining__lt=0
+            ).exists()
+        )
+
+    def test_settlement_is_idempotent(self):
+        """
+        Re-running it must not move stock twice.
+        """
+        api = APIClient()
+        create_delivery(
+            self.client_obj, self.sku, D("10"),
+            delivery_date=date(2026, 9, 5), force=True,
+        )
+        batch = api.post(
+            "/api/batches/",
+            {
+                "material": self.bottle.id,
+                "quantity_received": "40",
+                "price_per_unit": "240",
+                "arrival_date": "2026-09-06",
+            },
+            format="json",
+        ).data
+        self.assertEqual(self.bottle.stock_in_hand, D("30"))
+        settled = MaterialBatch.objects.get(pk=batch["id"])
+        cogs_mod.settle_deficit(self.bottle, settled)
+        cogs_mod.settle_deficit(self.bottle, settled)
+        self.assertEqual(self.bottle.stock_in_hand, D("30"))
+
     def test_reconciliation_paths_clear_the_negative(self):
         create_delivery(
             self.client_obj,

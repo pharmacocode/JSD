@@ -218,6 +218,19 @@ SPA routing). Env var:
   is still in stock. Each Home inward row therefore also carries `consumed`
   (what the month's live deliveries drew) and `stock_in_hand` (the live
   balance), so `opening + inward − consumed = in hand` ties out across months.
+- **An arrival settles an earlier shortfall (user report):** a delivery made
+  before its stock was recorded books a **deficit** (a negative batch), meaning
+  those cases are already gone. Until the stock turns up, `consume_fifo` skips
+  any non-positive batch, so the deficit used to sit forever *beside* arrivals
+  that had in fact already been consumed — e.g. 1000 mL_Round showed a standing
+  `-170` next to an arrival of 200 with 168 still "remaining", though 170 of
+  those cases had already been delivered. Recording the arrival now settles the
+  deficit against it (`cogs.settle_deficit`): the batch gives up what it
+  already covered (168 → 0) and the invented row is retired once nothing is
+  owed, so batch history matches reality while **total stock is unchanged**.
+  A partial arrival settles what it can and leaves the rest visible. The same
+  stranded-deficit bug affected 300 mL_Square and 500 mL_Square; both are
+  corrected.
 - **Home is four collapsible panels (user request):** **Stock in Hand**,
   **Summary**, **Deliveries** and **Inward Material**, each expanding on its own
   header. The inward list was reworked from clumped per-material groups into a

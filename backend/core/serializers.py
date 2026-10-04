@@ -2,6 +2,7 @@
 
 from rest_framework import serializers
 
+from .cogs import settle_deficit
 from .models import (
     Client,
     ClientLedgerEntry,
@@ -252,7 +253,13 @@ class MaterialBatchSerializer(serializers.ModelSerializer):
         validated_data.setdefault(
             "quantity_remaining", validated_data["quantity_received"]
         )
-        return super().create(validated_data)
+        batch = super().create(validated_data)
+        # Stock arriving after a delivery was already made against it settles
+        # that deficit, instead of leaving the shortage standing next to the very
+        # stock that covers it (user report: batch history showed a permanent
+        # -170 beside an arrival of 200 that had in fact been delivered).
+        settle_deficit(batch.material, batch)
+        return batch
 
 
 class SKUMaterialRequirementSerializer(serializers.ModelSerializer):
