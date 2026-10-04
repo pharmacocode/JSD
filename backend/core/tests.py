@@ -19,8 +19,10 @@ from .cogs import (
     consume_fifo,
     create_deliveries,
     create_delivery,
+    legacy_demand_by_material,
     stock_available,
 )
+from . import cogs as cogs_mod
 from .models import (
     Client,
     ClientLedgerEntry,
@@ -564,6 +566,229 @@ class VendorTests(TestCase):
         resp = api.get(f"/api/materials/{self.material.id}/")
         self.assertEqual(resp.data["vendor"], self.vendor.id)
         self.assertEqual(resp.data["vendor_name"], "Bottle filler")
+
+
+class DeliveryDeletionCascadeTests(TestCase):
+    """
+    User request: deleting a delivery from the client ledger must remove it
+    from EVERYWHERE — the deliveries list, every dashboard/report figure and
+    the FIFO stock it consumed — while the ledger entry itself survives,
+    greyed out and marked deleted.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.client_obj = Client.objects.create(name="Cascade Client")
+        self.sku = SKU.objects.create(
+            description="500ml Cascade", qty_per_case=D("24"), volume_ml=500
+        )
+        self.bottle = make_material("Bottle Cascade", "240")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+
+    def _deliver(self, cases="3", day="2026-09-10", force=False):
+        payload = {
+            "client": self.client_obj.id,
+            "sku": self.sku.id,
+            "qty_cases": cases,
+            "date": day,
+        }
+        if force:
+            payload["force"] = True
+        resp = self.api.post("/api/deliveries/", payload, format="json")
+        self.assertEqual(resp.status_code, 201)
+        return StockDelivery.objects.get()
+
+    def test_deleting_ledger_entry_voids_delivery_everywhere(self):
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver()
+        entry = delivery.ledger_entries.get()
+        self.assertEqual(self.bottle.stock_in_hand, D("7"))
+        self.assertEqual(self.client_obj.pending_amount, D("900.00"))
+
+        # The user deletes the DELIVERY row in the client ledger.
+        resp = self.api.delete(f"/api/ledger/{entry.id}/")
+        self.assertEqual(resp.status_code, 200)
+
+        # 1. Gone from the deliveries list.
+        delivery.refresh_from_db()
+        self.assertTrue(delivery.is_deleted)
+        rows = self.api.get(f"/api/deliveries/?client={self.client_obj.id}").data
+        self.assertEqual(len(rows["results"]), 0)
+
+        # 2. Gone from the client detail deliveries tab.
+        tab = self.api.get(f"/api/clients/{self.client_obj.id}/deliveries/").data
+        self.assertEqual(len(tab), 0)
+
+        # 3. Stock rolled back to exactly what it was before the delivery.
+        self.assertEqual(self.bottle.stock_in_hand, D("10"))
+
+        # 4. Cash rolled back — the pending amount no longer carries it.
+        self.assertEqual(self.client_obj.pending_amount, D("0.00"))
+
+        # 5. The ledger entry itself is intact, flagged deleted, and shown.
+        entry.refresh_from_db()
+        self.assertTrue(entry.is_deleted)
+        self.assertEqual(ClientLedgerEntry.objects.filter(pk=entry.pk).count(), 1)
+        ledger = self.api.get(f"/api/clients/{self.client_obj.id}/ledger/").data
+        row = next(r for r in ledger["entries"] if r["id"] == entry.id)
+        self.assertTrue(row["is_deleted"])
+        self.assertEqual(ledger["deleted_count"], 1)
+        # It must not drag the running balance along with it.
+        self.assertIsNone(row["running_balance"])
+        self.assertIn("Deleted", row["running_balance_note"])
+
+        # 6. Dashboard figures no longer count it: the month's sold/profit rows are
+        # empty, and the UNRECORDED badge clears because the demand went with
+        # the delivery.
+        dash = self.api.get("/api/dashboard/?month=2026-09").data
+        self.assertEqual(dash["stats"]["cases_sold_per_sku"], [])
+        row = next(r for r in dash["stock"] if r["name"] == "Bottle Cascade")
+        self.assertEqual(row["stock_in_hand"], "10")  # stock came back
+        self.assertEqual(row["demand"], "0")  # demand went away
+        self.assertFalse(row["has_unrecorded_shortfall"])
+
+    def test_deleting_delivery_endpoint_rolls_back_stock(self):
+        """The delivery's own DELETE must roll back, never hard-delete."""
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver()
+        resp = self.api.delete(f"/api/deliveries/{delivery.id}/")
+        self.assertEqual(resp.status_code, 200)
+        # It reports what came back so the UI can say so.
+        self.assertEqual(sum(D(r["qty"]) for r in resp.data["restored"]), D("3"))
+        self.assertFalse(resp.data["skipped"])
+        # Row survives (audit trail), stock is back, ledger entry is gone.
+        self.assertEqual(StockDelivery.objects.filter(pk=delivery.pk).count(), 1)
+        self.assertTrue(StockDelivery.objects.get(pk=delivery.pk).is_deleted)
+        self.assertEqual(self.bottle.stock_in_hand, D("10"))
+        self.assertTrue(delivery.ledger_entries.get().is_deleted)
+
+    def test_delete_is_idempotent_and_never_double_credits_stock(self):
+        """Deleting twice must not hand the same cases back twice."""
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver()
+        self.api.delete(f"/api/deliveries/{delivery.id}/")
+        self.assertEqual(self.bottle.stock_in_hand, D("10"))
+        # Second attempt: the row is filtered out of the queryset, so the API
+        # reports 404 rather than crediting the stock a second time. Asserting
+        # the engine itself is idempotent too, since a cascade from the ledger
+        # can reach an already-deleted delivery.
+        resp = self.api.delete(f"/api/deliveries/{delivery.id}/")
+        self.assertEqual(resp.status_code, 404)
+        delivery.refresh_from_db()
+        self.assertEqual(self.bottle.stock_in_hand, D("10"))
+        again = cogs_mod.void_delivery(delivery)
+        self.assertTrue(again["already_deleted"])
+        self.assertEqual(again["restored"], [])
+        self.assertEqual(self.bottle.stock_in_hand, D("10"))
+
+    def test_rollback_removes_the_deficit_carrier_it_created(self):
+        """A shortfall booking is undone completely — no empty carrier row."""
+        delivery = self._deliver(cases="4", force=True)  # no stock at all
+        carrier = MaterialBatch.objects.filter(material=self.bottle).get()
+        self.assertEqual(carrier.quantity_received, D("0"))
+        self.assertEqual(self.bottle.stock_in_hand, D("-4"))
+
+        self.api.delete(f"/api/deliveries/{delivery.id}/")
+        carrier.refresh_from_db()
+        self.assertTrue(carrier.is_deleted)  # fully unwound
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+
+    def test_rollback_returns_stock_to_the_exact_batches_it_came_from(self):
+        """FIFO order preserved: the oldest batch is topped back up first."""
+        old = make_batch(self.bottle, "10", "240", arrival=date(2026, 8, 1))
+        new = make_batch(self.bottle, "10", "250", arrival=date(2026, 9, 1))
+        delivery = self._deliver(cases="6")
+        # refresh_from_db: the FIFO engine updated its own instances, so the
+        # ones held here are stale until re-read.
+        old.refresh_from_db()
+        new.refresh_from_db()
+        self.assertEqual(old.quantity_remaining, D("4"))
+        self.assertEqual(new.quantity_remaining, D("10"))
+
+        self.api.delete(f"/api/deliveries/{delivery.id}/")
+        old.refresh_from_db()
+        new.refresh_from_db()
+        self.assertEqual(old.quantity_remaining, D("10"))
+        self.assertEqual(new.quantity_remaining, D("10"))  # untouched
+
+    def test_deleting_a_delivery_with_a_linked_payment_removes_both(self):
+        """Cash taken at entry time is part of the same transaction."""
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku.id,
+                "qty_cases": "3",
+                "date": "2026-09-10",
+                "payment": {"amount": "500"},
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        delivery = StockDelivery.objects.get()
+        # 900 delivery - 500 paid = 400 pending.
+        self.assertEqual(self.client_obj.pending_amount, D("400.00"))
+        self.assertEqual(
+            delivery.ledger_entries.filter(is_deleted=False).count(), 2
+        )
+
+        self.api.delete(f"/api/deliveries/{delivery.id}/")
+        self.assertEqual(self.client_obj.pending_amount, D("0.00"))
+        self.assertEqual(
+            delivery.ledger_entries.filter(is_deleted=False).count(), 0
+        )
+        self.assertEqual(
+            delivery.ledger_entries.filter(is_deleted=True).count(), 2
+        )
+
+    def test_deleting_a_standalone_payment_does_not_touch_deliveries(self):
+        """Only DELIVERY rows cascade — a payment is its own transaction."""
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver()
+        payment = self.api.post(
+            f"/api/clients/{self.client_obj.id}/payment/",
+            {"amount": "100"},
+            format="json",
+        )
+        self.assertEqual(payment.status_code, 201)
+        self.api.delete(f"/api/ledger/{payment.data['entry']['id']}/")
+        delivery.refresh_from_db()
+        self.assertFalse(delivery.is_deleted)
+        self.assertEqual(self.bottle.stock_in_hand, D("7"))
+
+    def test_inward_rows_reconcile_the_month(self):
+        """
+        User report: 1000 ml showed as inward in September but not October.
+        Each inward row now carries what the month consumed and the live
+        in-hand figure, so the two months visibly tie together.
+        """
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 30))
+        self._deliver(cases="4", day="2026-10-04")
+        # October has no arrivals of its own...
+        dash = self.api.get("/api/dashboard/?month=2026-10").data
+        self.assertEqual(dash["stats"]["inward_materials"], [])
+        # ...but the material is still in the stock panel with its live balance.
+        row = next(r for r in dash["stock"] if r["name"] == "Bottle Cascade")
+        self.assertEqual(row["stock_in_hand"], "6")
+        # September's inward row shows the reconciliation.
+        dash = self.api.get("/api/dashboard/?month=2026-09").data
+        inward = next(
+            r
+            for r in dash["stats"]["inward_materials"]
+            if r["material"] == "Bottle Cascade"
+        )
+        self.assertEqual(inward["quantity"], "10")
+        self.assertEqual(inward["consumed"], "0")  # consumed in October
+        self.assertEqual(inward["stock_in_hand"], "6")
+        # October's own consumption is scoped to October.
+        demand, _ = legacy_demand_by_material(2026, 10)
+        self.assertEqual(demand[self.bottle.id], D("4"))
 
 
 class APITests(TestCase):

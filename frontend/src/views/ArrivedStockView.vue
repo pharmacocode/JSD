@@ -3,7 +3,7 @@
  * Enter Arrived Stock (spec 4.3): creates a MaterialBatch.
  * Client-specific label materials are grouped by client for clarity.
  */
-import { ref, onMounted, computed } from 'vue'
+import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
 import { api, listify } from '@/api'
 import { useUiStore } from '@/stores/ui'
@@ -41,10 +41,25 @@ const grouped = computed(() => {
   return groups
 })
 
+// Prefill the price from the material master (user request: it should not ask
+// for the price again — fetch it from the master and show it as an editable
+// field). Re-fires whenever the material changes, so switching material
+// always re-fills with that material's master price. The field stays editable
+// because a batch's landed price may legitimately differ from the master.
+watch(material, (m) => {
+  if (m && m.current_price_per_unit !== null && m.current_price_per_unit !== undefined) {
+    price.value = Number(m.current_price_per_unit)
+  }
+})
+
 async function save() {
   error.value = ''
-  if (!material.value || !qty.value || !price.value) {
-    error.value = 'Material, quantity and price are required.'
+  if (!material.value || qty.value === null || qty.value === undefined || qty.value === '') {
+    error.value = 'Material and quantity are required.'
+    return
+  }
+  if (price.value === null || price.value === undefined || price.value === '') {
+    error.value = 'Price is required.'
     return
   }
   loading.value = true
@@ -92,7 +107,7 @@ async function save() {
         <template #item="{ item, props }">
           <v-list-item
             v-bind="props"
-            :subtitle="`in hand: ${item.raw.stock_in_hand} ${item.raw.unit_of_measure || ''}`"
+            :subtitle="`in hand: ${item.raw.stock_in_hand} ${item.raw.unit_of_measure || ''} · master ₹${item.raw.current_price_per_unit}`"
           />
         </template>
       </v-select>
@@ -120,7 +135,11 @@ async function save() {
         step="0.01"
         :label="`Price per ${material?.unit_of_measure || 'case'}`"
         prefix="₹"
-        hint="Cost of this batch only — price per case or sheet. FIFO uses it from here on."
+        :hint="
+          material
+            ? `Prefilled from the material master (₹${material.current_price_per_unit}). Edit it only if this batch landed at a different price — FIFO uses this figure.`
+            : 'Cost of this batch only. FIFO uses it from here on.'
+        "
         persistent-hint
       />
       <v-text-field

@@ -132,7 +132,7 @@ def legacy_booked_consumption(material) -> Decimal:
     return received - remaining
 
 
-def legacy_demand_by_material():
+def legacy_demand_by_material(year=None, month=None):
     """
     Expected consumption per material from live (non soft-deleted) records
     only — the same quantities FIFO consumption would take:
@@ -141,6 +141,13 @@ def legacy_demand_by_material():
         rounded per line exactly like consume_fifo,
       * negative stock adjustments: |quantity|.
     Also returns the latest contributing event date per material.
+
+    Pass `year` + `month` to restrict the walk to ONE calendar month — used by
+    the Home inward panel, which has to reconcile a single month's arrivals
+    against that month's consumption (see the month reconciliation there).
+    Omit them (the default) for the all-time figures the legacy backfill
+    command and the dashboard shortfall badge are built on, so those two keep
+    exactly the scope they have always had.
 
     Shared read-only helper (see legacy_booked_consumption): the backfill
     command and the dashboard badge both read through here. Writes nothing.
@@ -156,6 +163,11 @@ def legacy_demand_by_material():
         .prefetch_related("sku__requirements__material")
         .order_by("date", "id")
     )
+    adjustments = StockAdjustment.objects.filter(is_deleted=False)
+    if year is not None and month is not None:
+        deliveries = deliveries.filter(date__year=year, date__month=month)
+        adjustments = adjustments.filter(date__year=year, date__month=month)
+
     for delivery in deliveries:
         for material, qty_per_case in resolve_requirements(
             delivery.sku, delivery.client
@@ -166,7 +178,7 @@ def legacy_demand_by_material():
             demand[material.id] = demand.get(material.id, ZERO) + line_demand
             last_event[material.id] = delivery.date
 
-    for adjustment in StockAdjustment.objects.filter(is_deleted=False):
+    for adjustment in adjustments:
         if adjustment.quantity >= 0:
             continue
         size = abs(adjustment.quantity)
@@ -366,6 +378,10 @@ def consume_fifo(
                     "qty": str(round_qty(remaining)),
                     "price_per_unit": str(carrier.price_per_unit),
                     "deficit": True,
+                    # Marks the batch as invented FOR THIS CONSUMPTION, so a
+                    # later rollback can delete it instead of leaving an empty
+                    # zero-received row behind.
+                    "carrier": True,
                 }
             )
             total_cost += remaining * carrier.price_per_unit
@@ -832,6 +848,13 @@ def timezone_now_date():
     return timezone.now().date()
 
 
+def _now_iso():
+    """ISO timestamp for audit-trail entries."""
+    from django.utils import timezone
+
+    return timezone.now().isoformat()
+
+
 def _payment_payload(entry):
     """
     API shape for a payment captured with a delivery (None => no payment was
@@ -965,6 +988,10 @@ def create_delivery(
         # … and the full figure as at creation (also audit-only).
         cogs_per_case_snapshot=Decimal(result["per_case"]),
         stock_shortfall_flag=short_flag,
+        # Persist EXACTLY which batches this delivery drew from, so deleting it
+        # later can hand the stock back (see rollback_delivery_stock). Without
+        # this the consumption is unrecoverable once the FIFO walk is done.
+        consumption_log=result["consumption"],
     )
 
     amount = money(Decimal(qty_cases) * selling_price_per_case)
@@ -1003,6 +1030,141 @@ def create_delivery(
     result["overhead_per_case_current"] = str(delivery.overhead_per_case_current)
     result["total_cogs_current"] = str(money(delivery.qty_cases * per_case_current))
     return delivery, result
+
+
+def rollback_delivery_stock(delivery) -> dict:
+    """
+    Reverse the FIFO consumption a delivery booked, using its stored
+    `consumption_log`. Hands the cases back to the exact batches they came
+    from, so stock in hand, the FIFO queue and the COGS figures all return to
+    their pre-delivery state (user request: deleting a mistaken delivery must
+    roll stock back).
+
+    Two shapes, both recorded in the log:
+      - a normal draw from a real batch  -> `quantity_remaining` += qty
+      - a deficit booked on an invented zero-received carrier batch
+        (`carrier: True`) -> the batch goes back to exactly 0, so it is
+        soft-deleted rather than left behind as an empty row. If other
+        deliveries later drew from the same carrier it is NOT deleted, just
+        topped back up, because their bookings still stand.
+
+    Deliveries created before this log existed have an empty one; they are
+    reported via `skipped` so callers can warn instead of silently pretending
+    the rollback was complete.
+    """
+    log = delivery.consumption_log or []
+    restored = []
+    touched_batches = {}
+    carriers_to_drop = []
+
+    for line in log:
+        material_id = line.get("material_id")
+        for entry in line.get("consumed", []):
+            qty_back = Decimal(str(entry.get("qty") or 0))
+            if qty_back <= 0:
+                continue
+            batch = touched_batches.get(entry.get("batch_id"))
+            if batch is None:
+                batch = MaterialBatch.objects.filter(pk=entry.get("batch_id")).first()
+                if batch is None:
+                    continue
+                touched_batches[batch.pk] = batch
+            if entry.get("carrier"):
+                batch.quantity_remaining = round_qty(batch.quantity_remaining + qty_back)
+                if batch.quantity_remaining <= 0:
+                    carriers_to_drop.append(batch)
+                    restored.append(
+                        {
+                            "material_id": material_id,
+                            "material": batch.material.name,
+                            "qty": str(qty_back),
+                            "unit": batch.material.unit_of_measure,
+                        }
+                    )
+                continue
+            # Real batch: give the cases back. Never let a rollback push a
+            # batch above what it actually received.
+            batch.quantity_remaining = min(
+                round_qty(batch.quantity_remaining + qty_back),
+                batch.quantity_received,
+            )
+            restored.append(
+                {
+                    "material_id": material_id,
+                    "material": batch.material.name,
+                    "qty": str(qty_back),
+                    "unit": batch.material.unit_of_measure,
+                }
+            )
+
+    for batch in carriers_to_drop:
+        batch.soft_delete()
+    for batch in touched_batches.values():
+        if batch.is_deleted:
+            continue
+        batch.save(skip_audit=True)
+
+    return {
+        "restored": restored,
+        # No log => pre-dates this feature; the stock cannot be reversed
+        # automatically and the caller must surface that.
+        "skipped": not log,
+    }
+
+
+@transaction.atomic
+def void_delivery(delivery, reason: str = "") -> dict:
+    """
+    Delete a delivery EVERYWHERE it appears (user request): roll its stock
+    back, remove it from the deliveries list and every dashboard/report
+    figure, and soft-delete the ledger entries it created so the client's
+    pending amount is corrected too.
+
+    Nothing is hard-deleted: the delivery and its ledger rows stay in the
+    audit trail, greyed out and marked deleted, per spec 3.7.
+
+    `delivery.voided` makes this idempotent — calling it twice is a no-op
+    rather than a double stock credit.
+    """
+    if delivery.is_deleted:
+        return {
+            "delivery_id": delivery.id,
+            "already_deleted": True,
+            "restored": [],
+            "skipped": False,
+            "ledger_entries_deleted": [],
+        }
+
+    rollback = rollback_delivery_stock(delivery)
+
+    ledger_entries_deleted = []
+    for entry in delivery.ledger_entries.filter(is_deleted=False):
+        entry.soft_delete()
+        ledger_entries_deleted.append(entry.id)
+
+    history = list(delivery.edit_history or [])
+    history.append(
+        {
+            "timestamp": _now_iso(),
+            "action": "deleted",
+            "reason": reason,
+            "stock_restored": rollback["restored"],
+            "stock_rollback_skipped": rollback["skipped"],
+            "ledger_entries_deleted": ledger_entries_deleted,
+            "before": delivery._audit_snapshot(),
+        }
+    )
+    delivery.edit_history = history
+    delivery.is_deleted = True
+    delivery.save(skip_audit=True)
+
+    return {
+        "delivery_id": delivery.id,
+        "already_deleted": False,
+        "restored": rollback["restored"],
+        "skipped": rollback["skipped"],
+        "ledger_entries_deleted": ledger_entries_deleted,
+    }
 
 
 @transaction.atomic

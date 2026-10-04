@@ -510,6 +510,18 @@ class ClientLedgerEntry(models.Model):
         super().save(*args, **kwargs)
 
     def soft_delete(self):
+        """
+        Soft delete + audit entry. Never removes the row.
+
+        Deleting a DELIVERY row from the client ledger must remove the
+        delivery from EVERYWHERE it is counted (user request) — the
+        deliveries list, every dashboard/report figure and the FIFO stock it
+        consumed. `void_delivery` does all of that and is idempotent; the
+        ledger row itself survives, greyed out and marked deleted, and the
+        is_deleted guard stops the two soft-deletes from calling each other.
+        """
+        if self.is_deleted:
+            return
         history = list(self.edit_history or [])
         history.append(
             {
@@ -521,6 +533,13 @@ class ClientLedgerEntry(models.Model):
         self.edit_history = history
         self.is_deleted = True
         self.save(skip_audit=True)
+
+        if self.entry_type == "DELIVERY" and self.related_delivery_id:
+            from . import cogs
+
+            delivery = self.related_delivery
+            if delivery is not None and not delivery.is_deleted:
+                cogs.void_delivery(delivery, reason="Ledger entry deleted")
 
 
 # ---------------------------------------------------------------------------
@@ -765,6 +784,15 @@ class StockDelivery(AuditModel):
     )
     # True if delivery completed despite insufficient raw material stock.
     stock_shortfall_flag = models.BooleanField(default=False)
+    # EXACT FIFO bookings made for this delivery, written ONCE at creation:
+    #   [{"material_id": int, "consumed": [{"batch_id", "qty",
+    #      "price_per_unit", "deficit"?, "carrier"?}]}]
+    # This is what makes a deletion REVERSIBLE — without it the stock this
+    # delivery consumed could never be handed back (user request: deleting a
+    # mistaken delivery rolls stock back everywhere). `carrier: True` marks
+    # the zero-received deficit batch the engine invents when a material has no
+    # batches at all, so a full rollback can remove it again.
+    consumption_log = models.JSONField(default=list, blank=True)
 
     class Meta:
         ordering = ["-date", "-id"]

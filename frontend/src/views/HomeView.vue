@@ -745,6 +745,12 @@ async function deleteItem(item) {
               >
                 {{ row.items.length }} arrivals
               </v-chip>
+              <span
+                v-if="Number(row.consumed) > 0"
+                class="text-caption text-medium-emphasis ml-2"
+              >
+                −{{ num(row.consumed) }} {{ row.unit }} used this month
+              </span>
               <v-spacer />
               <span class="text-body-2 font-weight-medium">
                 {{ num(row.quantity) }} {{ row.unit }}
@@ -832,6 +838,15 @@ async function deleteItem(item) {
                 Editing a line item recalculates stock in hand, the FIFO cost and
                 the vendor's payable. Deliveries already made keep the cost that
                 applied when they were entered.
+              </div>
+              <div class="text-caption text-medium-emphasis mt-1">
+                In hand now:
+                <span class="font-weight-medium">
+                  {{ num(row.stock_in_hand) }} {{ row.unit }}
+                </span>
+                — arrivals are listed by the month they arrived, so a material
+                received in an earlier month shows no inward here even though it
+                is still in stock.
               </div>
             </div>
           </div>

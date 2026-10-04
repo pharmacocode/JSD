@@ -38,6 +38,7 @@ class ClientSKUPriceSerializer(serializers.ModelSerializer):
 
 class ClientLedgerEntrySerializer(serializers.ModelSerializer):
     running_balance = serializers.SerializerMethodField()
+    running_balance_note = serializers.SerializerMethodField()
     delivery_ref = serializers.SerializerMethodField()
     # True when the client's pending "as of" marker supersedes this entry
     # (dated on/before the marked date, so already inside the entered figure).
@@ -55,6 +56,7 @@ class ClientLedgerEntrySerializer(serializers.ModelSerializer):
             "note",
             "date",
             "running_balance",
+            "running_balance_note",
             "is_superseded",
             "is_edited",
             "is_deleted",
@@ -78,6 +80,16 @@ class ClientLedgerEntrySerializer(serializers.ModelSerializer):
         # Computed in the ledger view (context["balances"] keyed by entry id);
         # omitted for plain list endpoints.
         return self.context.get("balances", {}).get(obj.id)
+
+    def get_running_balance_note(self, obj):
+        """
+        Why a row has no running balance, or None. Deleted rows are excluded
+        from the balance walk (they are not part of the live pending), so the
+        UI can say so instead of silently showing "inside the as-of figure".
+        """
+        if self.context.get("deleted") and obj.id in self.context["deleted"]:
+            return "Deleted — excluded from the pending amount"
+        return None
 
     def validate_amount(self, value):
         entry_type = self.initial_data.get("entry_type")

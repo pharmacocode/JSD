@@ -163,6 +163,13 @@ class ClientViewSet(viewsets.ModelViewSet):
 
         entries = client.ledger_entries_chronological()
         as_of = client.pending_as_of_date
+        # Deleted rows are shown greyed out and marked deleted (user request:
+        # the audit trail stays visible), but they must not affect the running
+        # balance or the pending amount — both are live sums that exclude them.
+        deleted_rows = list(
+            client.ledger_entries.filter(is_deleted=True).order_by("-date", "-id")
+        )
+        deleted_ids = {e.id for e in deleted_rows}
         # Running balance computed chronologically (oldest first). With a
         # pending marker the walk starts from the entered figure and entries
         # dated on/before the marked date are flagged as superseded (they are
@@ -176,11 +183,20 @@ class ClientViewSet(viewsets.ModelViewSet):
                 continue
             running += e.amount
             balances[e.id] = str(money(running))
-        ordered = list(reversed(entries))
+        # Live rows newest-first as before; the deleted ones are appended after
+        # them, oldest-first inside that block, so they read as a separate
+        # "deleted" section without disturbing the live running balance.
+        ordered = list(reversed(entries)) + list(
+            reversed(deleted_rows)
+        )
         serializer = ClientLedgerEntrySerializer(
             ordered,
             many=True,
-            context={"balances": balances, "superseded": superseded},
+            context={
+                "balances": balances,
+                "superseded": superseded,
+                "deleted": deleted_ids,
+            },
         )
         superseded_total = sum(
             (e.amount for e in entries if e.id in superseded), Decimal("0")
@@ -193,6 +209,7 @@ class ClientViewSet(viewsets.ModelViewSet):
                 "marker_active": as_of is not None,
                 "superseded_count": len(superseded),
                 "superseded_total": str(money(superseded_total)),
+                "deleted_count": len(deleted_ids),
                 "entries": serializer.data,
             }
         )
@@ -369,7 +386,24 @@ class ClientLedgerEntryViewSet(viewsets.ModelViewSet):
         return qs
 
     def perform_destroy(self, instance):
-        instance.soft_delete()  # never hard-delete (spec 3.7)
+        # Cascades into cogs.void_delivery for DELIVERY rows (stock rolled
+        # back, delivery removed from lists/charts). The ledger row itself is
+        # kept, greyed out and marked deleted.
+        instance.soft_delete()
+
+    def destroy(self, request, *args, **kwargs):
+        entry = self.get_object()
+        related = entry.related_delivery
+        self.perform_destroy(entry)
+        payload = {"entry": ClientLedgerEntrySerializer(entry).data}
+        if related is not None:
+            # Let the caller show exactly what was reversed.
+            related.refresh_from_db()
+            payload["delivery_voided"] = {
+                "delivery_id": related.pk,
+                "is_deleted": related.is_deleted,
+            }
+        return Response(payload, status=status.HTTP_200_OK)
 
     @action(detail=True, methods=["post"])
     def restore(self, request, pk=None):
@@ -707,6 +741,29 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
             qs = qs.filter(is_deleted=False)
         return qs
 
+    def perform_destroy(self, instance):
+        """
+        Deleting a delivery rolls EVERYTHING back (user request): the FIFO
+        stock it consumed is returned to the batches it came from, and the
+        ledger entries it created are soft-deleted so the client's pending
+        amount follows. DRF's default here is a HARD delete, which would
+        destroy the audit trail and silently keep the stock consumed — this
+        is the only correct behaviour for this app.
+        """
+        return cogs.void_delivery(instance, reason="Delivery deleted")
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        # perform_destroy is returned rather than stashed on self: DRF builds
+        # the action from the unbound method, so an attribute set inside it is
+        # not reliably readable here. Returning the payload keeps it explicit.
+        payload = self.perform_destroy(instance)
+        if request.query_params.get("include_deleted"):
+            return Response(StockDeliverySerializer(instance).data)
+        # Report what was rolled back so the UI can say which materials came
+        # back, instead of the stock change being invisible.
+        return Response(payload, status=status.HTTP_200_OK)
+
     def create(self, request, *args, **kwargs):
         from datetime import date as date_cls
 
@@ -983,8 +1040,10 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
             }
         )
 
-    def perform_destroy(self, instance):
-        instance.soft_delete()  # audit-trail delete (spec 3.7)
+    # NOTE: the rolling-back perform_destroy/destroy pair lives at the top of
+    # this class. A second perform_destroy used to sit here and shadow it, which
+    # soft-deleted the delivery while leaving its FIFO consumption booked —
+    # exactly the "deleted but still everywhere" bug.
 
 
 class StockAdjustmentViewSet(viewsets.ModelViewSet):
@@ -1179,6 +1238,24 @@ class DashboardView(APIView):
         # summary, each carrying its underlying batch line items. Those line
         # items are editable from the Home screen (user request) — correcting
         # one recalculates stock in hand, FIFO and the vendor payable.
+        #
+        # Two extra maps back the "month reconciliation" below: how much of
+        # each material this month's LIVE deliveries actually drew out of the
+        # FIFO queue, and each material's current live balance. Both are
+        # computed once here and reused by every row.
+        month_consumption, _ = cogs.legacy_demand_by_material(
+            year=m_year, month=m_mon
+        )
+        material_stock = {
+            m.id: m.stock_in_hand
+            for m in Material.objects.filter(
+                id__in=MaterialBatch.objects.filter(
+                    is_deleted=False,
+                    arrival_date__year=m_year,
+                    arrival_date__month=m_mon,
+                ).values_list("material_id", flat=True)
+            )
+        }
         arrivals = {}
         for batch in (
             MaterialBatch.objects.filter(
@@ -1222,6 +1299,19 @@ class DashboardView(APIView):
         inward = []
         for row in arrivals.values():
             row["quantity"] = dstr(row.pop("received"))
+            # Month reconciliation (user report: "we had 1000 ml stock in
+            # September but not in October — mismatch"). The inward list is
+            # scoped to ARRIVAL DATE, while the stock panel is a live balance,
+            # so a material whose cases arrived in an earlier month shows zero
+            # inward in October even though it is very much in stock. Each row
+            # now also carries how much of it was CONSUMED this month and the
+            # live in-hand figure, so the three numbers reconcile:
+            #   opening + inward - consumed = in hand.
+            mat_id = row["material_id"]
+            row["consumed"] = dstr(month_consumption.get(mat_id, Decimal("0")))
+            row["stock_in_hand"] = dstr(
+                material_stock.get(mat_id, Decimal("0"))
+            )
             inward.append(row)
 
         # Per-client breakdown this month: revenue, the CURRENT direct cost

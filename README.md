@@ -181,6 +181,20 @@ SPA routing). Env var:
   (`demand` / `booked` / `UNRECORDED −n` badge) so a silent pre-fix gap can
   never hide — booking the backfill (or recording the missing arrival)
   clears the badge.
+- **Deleting a delivery rolls everything back (user request):** deleting a
+  `DELIVERY` row in the client ledger — or the delivery itself via
+  `DELETE /api/deliveries/<id>/` — now removes it from **everywhere** it was
+  counted: the deliveries list, the client detail tab, all dashboard/report
+  figures, and the client's pending amount. The FIFO stock it consumed is
+  returned to the **exact batches it came from** (recorded at creation in
+  `StockDelivery.consumption_log`), so stock in hand, the queue and every
+  dynamic cost figure return to their pre-delivery state; a shortfall carrier
+  batch the delivery invented is removed with it, and the whole operation is
+  idempotent (deleting twice cannot credit the stock twice).
+  The **ledger entry itself survives**, greyed out with a `deleted` chip and
+  excluded from the running balance and pending amount — nothing is ever hard
+  deleted (spec 3.7). Only `DELIVERY` rows cascade; a standalone `PAYMENT` is
+  its own transaction and is left alone.
 - **Inward line items are editable (user request):** the Home screen lists the
   month's arrivals with their underlying batches; each line can be edited in
   place (received cases, landing price, arrival date) or removed. Editing
@@ -193,6 +207,17 @@ SPA routing). Env var:
   reconciled with a Stock Adjustment. A corrected price/date feeds FIFO from
   then on and — costs being dynamic everywhere — immediately flows into every
   chart and delivery row; the creation snapshot stays untouched as audit.
+- **Enter Arrived Stock prefills the price (user request):** the price field is
+  filled from the material master's `current_price_per_unit` as soon as a
+  material is picked (the dropdown shows the master price too), and stays
+  **editable** so a batch that landed at a different price can still be keyed
+  in. A zero price is a legitimate value, so only an empty field blocks saving.
+- **Inward rows reconcile the month (user request):** arrivals are grouped by
+  the month they *arrived*, while the stock panel is a live balance — so a
+  material received in September shows no inward line in October even though it
+  is still in stock. Each Home inward row therefore also carries `consumed`
+  (what the month's live deliveries drew) and `stock_in_hand` (the live
+  balance), so `opening + inward − consumed = in hand` ties out across months.
 - **Home summary (user request):** *Stock in Hand* always shows the red
   `<n> low` / green `<n> above alert` counts and expands to the per-material
   detail when tapped. The monthly card is titled **`Summary — MMM, YYYY`** and

@@ -99,8 +99,21 @@ async function recordPayment() {
 }
 
 async function deleteEntry(entry) {
-  if (!confirm('Soft-delete this ledger entry? It stays in the audit trail.')) return
+  const isDelivery = entry.entry_type === 'DELIVERY' && entry.related_delivery
+  const msg = isDelivery
+    ? `Delete this delivery entry?\n\n` +
+      `It will be removed from the deliveries list and every dashboard figure, ` +
+      `the stock it used will be returned to the batches it came from, and the ` +
+      `amount will come off the pending balance.\n\n` +
+      `The ledger entry itself stays, greyed out and marked deleted.`
+    : 'Soft-delete this ledger entry? It stays in the audit trail, greyed out.'
+  if (!confirm(msg)) return
   await api.del(`/ledger/${entry.id}/`)
+  ui.notify(
+    isDelivery
+      ? 'Delivery deleted — stock and pending amount rolled back'
+      : 'Entry deleted — kept in the audit trail',
+  )
   await load()
 }
 </script>
@@ -297,6 +310,8 @@ async function deleteEntry(entry) {
             <v-list-item
               v-for="e in ledger.entries"
               :key="e.id"
+              :class="e.is_deleted ? 'text-medium-emphasis' : ''"
+              :style="e.is_deleted ? 'opacity: 0.55' : ''"
               :title="e.note || e.entry_type"
               :subtitle="`${e.date}${e.delivery_ref ? ' · ' + e.delivery_ref : ''}`"
             >
@@ -325,10 +340,18 @@ async function deleteEntry(entry) {
                     {{
                       e.running_balance
                         ? `bal ${money(e.running_balance)}`
-                        : 'inside the as-of figure'
+                        : e.running_balance_note || 'inside the as-of figure'
                     }}
                   </div>
                   <div class="d-flex justify-end align-center ga-1 mt-1">
+                    <v-chip
+                      v-if="e.is_deleted"
+                      size="x-small"
+                      variant="tonal"
+                      color="grey"
+                    >
+                      deleted
+                    </v-chip>
                     <v-chip
                       v-if="e.is_superseded"
                       size="x-small"
@@ -339,6 +362,7 @@ async function deleteEntry(entry) {
                     </v-chip>
                     <AuditBadge :record="e" />
                     <v-btn
+                      v-if="!e.is_deleted"
                       icon="mdi-delete-outline"
                       size="x-small"
                       variant="text"
