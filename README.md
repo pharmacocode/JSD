@@ -218,6 +218,20 @@ SPA routing). Env var:
   is still in stock. Each Home inward row therefore also carries `consumed`
   (what the month's live deliveries drew) and `stock_in_hand` (the live
   balance), so `opening + inward − consumed = in hand` ties out across months.
+- **Home is four collapsible panels (user request):** **Stock in Hand**,
+  **Summary**, **Deliveries** and **Inward Material**, each expanding on its own
+  header. The inward list was reworked from clumped per-material groups into a
+  flat chronological register (date / material / qty / in hand), with
+  **material filter chips — including "All" — that scope the table and the
+  figures together**, and a four-figure reconciliation above it:
+  `carry forward + inward − delivered = in hand`. Deliveries gets its own
+  chronological register (date / client / SKU / qty) from a new
+  `stats.deliveries` array; tapping a row opens that client. Only live
+  deliveries appear, so a voided one leaves the list and the totals.
+  Stock in hand drops the category / alert-qty / unit-word clutter: the
+  low-vs-healthy state is carried by a **green or red number alone**, and the
+  header shows the three counts as coloured badges with no wording, so nothing
+  overlaps on a phone.
 - **Home summary (user request):** *Stock in Hand* always shows the red
   `<n> low` / green `<n> above alert` counts and expands to the per-material
   detail when tapped. The monthly card is titled **`Summary — MMM, YYYY`** and

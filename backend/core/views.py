@@ -1481,6 +1481,26 @@ class DashboardView(APIView):
         profit_excl_overhead = money(total_revenue - total_direct_cost)
         profit_incl_overhead = money(profit_excl_overhead - overhead_total)
 
+        # Delivery register for the month (user request: a chronological list of
+        # delivery date / client / SKU / qty, separate from the inward register).
+        # Oldest first, with the id as the tie-break so two deliveries on the
+        # same day keep their entry order.
+        delivery_rows = [
+            {
+                "id": d.id,
+                "date": d.date.isoformat(),
+                "client_id": d.client_id,
+                "client": d.client.name,
+                "sku_id": d.sku_id,
+                "sku": d.sku.description,
+                "qty_cases": dstr(d.qty_cases),
+                "selling_price_per_case": str(money(d.selling_price_per_case)),
+                "total_amount": str(money(d.qty_cases * d.selling_price_per_case)),
+                "stock_shortfall_flag": d.stock_shortfall_flag,
+            }
+            for d in sorted(month_deliveries, key=lambda x: (x.date, x.id))
+        ]
+
         return Response(
             {
                 "month": month,
@@ -1491,6 +1511,7 @@ class DashboardView(APIView):
                     # Backwards-compatible alias: top 5 clients by revenue.
                     "top_clients": client_breakdown[:5],
                     "inward_materials": inward,
+                    "deliveries": delivery_rows,
                     "total_cases": dstr(total_cases),
                     "total_revenue": str(money(total_revenue)),
                     "total_direct_cost": str(money(total_direct_cost)),

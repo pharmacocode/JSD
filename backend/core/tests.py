@@ -1682,6 +1682,55 @@ class DashboardSummaryTests(TestCase):
         stock = {s["name"]: s for s in payload["stock"]}
         self.assertEqual(stock["Bottle API"]["stock_in_hand"], "43")  # 50 − 7
 
+    def test_deliveries_register_is_chronological(self):
+        """
+        User request: a delivery list of date / client / SKU / qty, separate
+        from the inward register and in date order.
+        """
+        rows = self.stats()["deliveries"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(
+            [(r["date"], r["client"], r["sku"], r["qty_cases"]) for r in rows],
+            [
+                ("2026-09-10", "Alpha", "Serum 500ml", "2"),
+                ("2026-09-12", "Beta", "Serum 500ml", "5"),
+            ],
+        )
+        # The client id travels with the row so the UI can link to it.
+        self.assertEqual(rows[0]["client_id"], self.alpha.id)
+        self.assertEqual(rows[1]["client_id"], self.beta.id)
+        self.assertEqual(D(rows[0]["total_amount"]), D("1000"))  # 2 × 500
+        self.assertEqual(D(rows[1]["total_amount"]), D("2000"))  # 5 × 400
+
+    def test_deleted_delivery_leaves_the_register(self):
+        """
+        A voided delivery is soft-deleted, so it must disappear from the Home
+        register as well as from the totals.
+        """
+        delivery = StockDelivery.objects.filter(is_deleted=False).order_by("date")[0]
+        cogs_mod.void_delivery(delivery, reason="test")
+        rows = self.stats()["deliveries"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["date"], "2026-09-12")
+        self.assertEqual(D(self.stats()["total_cases"]), D("5"))
+
+    def test_inward_row_reconciles_the_month(self):
+        """
+        User request: carry forward + inward - delivered = in hand. The row
+        carries the month's consumption and the live balance, so the figures tie
+        out even when the cases arrived in an earlier month.
+        """
+        row = self.stats()["inward_materials"][0]
+        inward = D(row["quantity"])
+        delivered = D(row["consumed"])
+        in_hand = D(row["stock_in_hand"])
+        carry_forward = in_hand + delivered - inward
+        self.assertEqual(inward, D("100"))
+        self.assertEqual(delivered, D("7"))
+        self.assertEqual(in_hand, D("93"))
+        self.assertEqual(carry_forward, D("0"))  # nothing carried in
+        self.assertEqual(carry_forward + inward - delivered, in_hand)
+
 
 class MultiSKUDeliveryTests(TestCase):
     """
