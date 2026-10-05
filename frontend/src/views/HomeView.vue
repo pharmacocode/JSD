@@ -7,7 +7,7 @@
  * The month's inward material arrivals sit at the bottom with editable line
  * items — correcting one recalculates stock, FIFO cost and the payable.
  */
-import { ref, watch, onMounted, computed } from 'vue'
+import { ref, watch, onMounted, onActivated, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api'
 import { useUiStore } from '@/stores/ui'
@@ -47,18 +47,50 @@ const deliveryTotals = computed(() => {
 })
 
 async function load() {
+  // Perf plan 2.9: the dashboard is cached per month, so coming back to Home
+  // from another screen paints instantly and only refreshes in the background.
+  const cached = ui.getDashboard(ui.month)
+  if (cached) {
+    data.value = cached
+    loading.value = false
+    error.value = ''
+    refresh()
+    return
+  }
   loading.value = true
   error.value = ''
-  try {
-    data.value = await api.get('/dashboard/', { month: ui.month })
-  } catch (e) {
-    error.value = e.message
-  } finally {
-    loading.value = false
-  }
+  await refresh()
+}
+
+// One in-flight dashboard request per month: a <keep-alive>d view fires
+// onMounted *and* onActivated on its first mount (perf plan 2.10), so without
+// this the dashboard would be fetched twice for the same month.
+const inflight = {}
+async function refresh() {
+  const month = ui.month
+  if (inflight[month]) return inflight[month]
+  const req = (async () => {
+    try {
+      const payload = await api.get('/dashboard/', { month })
+      // Ignore a response that lands after the month changed again.
+      if (month !== ui.month) return
+      data.value = payload
+      ui.setDashboard(month, payload)
+    } catch (e) {
+      error.value = e.message
+    } finally {
+      loading.value = false
+      delete inflight[month]
+    }
+  })()
+  inflight[month] = req
+  return req
 }
 
 onMounted(load)
+// Revived from the <keep-alive> cache: repaint from the cached dashboard and
+// revalidate in the background so Home is never stale after a delivery.
+onActivated(load)
 watch(() => ui.month, load)
 
 const stats = computed(() => data.value.stats || {})

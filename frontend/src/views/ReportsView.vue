@@ -4,13 +4,14 @@
  * day/week/month + rolling 30-day average. Chart + data table.
  * No P&L/GST/export in v1 (spec 9).
  */
-import { ref, onMounted, watch, computed } from 'vue'
-import { api, listify } from '@/api'
+import { ref, onMounted, onActivated, watch, computed } from 'vue'
+import { api } from '@/api'
+import { useRefDataStore } from '@/stores/refdata'
 import { money, num } from '@/utils/format'
 import ChartCanvas from '@/components/ChartCanvas.vue'
 import EmptyState from '@/components/EmptyState.vue'
 
-const skus = ref([])
+const refdata = useRefDataStore()
 const sku = ref(null)
 const granularity = ref('day')
 const rows = ref([])
@@ -18,11 +19,18 @@ const rolling = ref('0')
 const loading = ref(false)
 const error = ref('')
 
-onMounted(async () => {
-  skus.value = listify(await api.get('/skus/'))
+// Shared reference list (perf plan 2.8) — the SKU picker is instant when another
+// screen already fetched the list, then revalidated in the background.
+const skus = computed(() => refdata.skus)
+
+async function loadSkus() {
+  if (refdata.loaded.skus) refdata.fetch('skus', { force: true }).catch(() => {})
+  else await refdata.fetch('skus')
   // Default to the aggregate report — any single SKU is one click away.
-  sku.value = 'all'
-})
+  if (!sku.value) sku.value = 'all'
+}
+onMounted(loadSkus)
+onActivated(loadSkus)
 
 async function load() {
   if (!sku.value) return

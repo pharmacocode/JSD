@@ -4,17 +4,20 @@
  * Positive = add (zero-price batch), negative = remove (FIFO consumption).
  * Accessed from Stock panel / Masters.
  */
-import { ref, onMounted } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, listify } from '@/api'
+import { useRefDataStore } from '@/stores/refdata'
 import { useUiStore } from '@/stores/ui'
 import { today, num } from '@/utils/format'
 
 const route = useRoute()
 const router = useRouter()
+const refdata = useRefDataStore()
 const ui = useUiStore()
 
-const materials = ref([])
+// Material picker source — the shared reference list (perf plan 2.8).
+const materials = computed(() => refdata.materials)
 const material = ref(null)
 const quantity = ref(0)
 const reason = ref('')
@@ -26,9 +29,12 @@ const result = ref(null)
 
 onMounted(async () => {
   try {
-    materials.value = listify(await api.get('/materials/'))
+    // This screen exists to change stock, so always read the current figures —
+    // but go through the shared cache so the picker is already filled on entry
+    // (perf plan 2.8).
+    await refdata.fetch('materials', { force: true })
     if (route.query.material) {
-      const m = materials.value.find(
+      const m = refdata.materials.find(
         (x) => x.id === Number(route.query.material)
       )
       if (m) {
@@ -62,6 +68,8 @@ async function save() {
       reason: reason.value,
       date: date.value,
     })
+    // Stock moved — drop the cached material list so other screens refetch it.
+    refdata.invalidate('materials')
     ui.notify(
       `Adjusted ${material.value.name} by ${quantity.value} ${material.value.unit_of_measure}`
     )

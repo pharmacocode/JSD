@@ -14,6 +14,7 @@ from .views import (
     MaterialViewSet,
     MonthlyOverheadViewSet,
     OverheadCategoryViewSet,
+    PingView,
     ReportView,
     SKUViewSet,
     SKUMaterialRequirementViewSet,
@@ -48,6 +49,7 @@ router.register(
 
 urlpatterns = [
     path("", include(router.urls)),
+    path("ping/", PingView.as_view(), name="ping"),
     path("dashboard/", DashboardView.as_view(), name="dashboard"),
     path("reports/", ReportView.as_view(), name="reports"),
 ]

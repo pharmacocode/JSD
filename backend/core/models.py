@@ -19,6 +19,25 @@ from django.db import models
 from django.db.models import F
 from django.utils import timezone
 
+from . import perfcache
+
+
+class InvalidateQuerySet(models.QuerySet):
+    """
+    QuerySet whose `update()` also drops the performance memo.
+
+    `QuerySet.update()` issues bare SQL — it fires NO post_save signal — so a
+    bulk update would otherwise leave memoized stock/cost values stale until
+    the next request boundary. Production code only writes through models, but
+    tests (and any future bulk edit) use `.update()`, so the safe place to
+    catch it is here.
+    """
+
+    def update(self, **kwargs):
+        result = super().update(**kwargs)
+        perfcache.invalidate()
+        return result
+
 TWO_PLACES = Decimal("0.01")
 FOUR_PLACES = Decimal("0.0001")
 
@@ -321,6 +340,7 @@ class VendorPayment(models.Model):
 # 3.1 Client
 # ---------------------------------------------------------------------------
 class Client(models.Model):
+    objects = InvalidateQuerySet.as_manager()
     name = models.CharField(max_length=200, unique=True)
     # Plain URL — UI opens it in a new tab; no embedding/geocoding (spec 9).
     google_maps_url = models.URLField(blank=True, default="")
@@ -442,6 +462,7 @@ class ClientSKUPrice(models.Model):
 # 3.2 ClientLedgerEntry (append-only audit log with edit/delete support)
 # ---------------------------------------------------------------------------
 class ClientLedgerEntry(models.Model):
+    objects = InvalidateQuerySet.as_manager()
     ENTRY_TYPES = [
         ("DELIVERY", "Delivery"),
         ("PAYMENT", "Payment"),
@@ -474,6 +495,12 @@ class ClientLedgerEntry(models.Model):
 
     class Meta:
         ordering = ["-date", "-id"]
+        indexes = [
+            models.Index(
+                fields=["client", "date", "is_deleted"],
+                name="ledger_client_date_idx",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.client.name} {self.entry_type} {self.amount}"
@@ -546,6 +573,7 @@ class ClientLedgerEntry(models.Model):
 # 3.3 Material (raw material master — "MVP Master")
 # ---------------------------------------------------------------------------
 class Material(models.Model):
+    objects = InvalidateQuerySet.as_manager()
     CATEGORIES = [
         ("Bottle", "Bottle"),
         ("Cap", "Cap"),
@@ -604,13 +632,17 @@ class Material(models.Model):
 
     @property
     def stock_in_hand(self):
-        """Live sum of MaterialBatch.quantity_remaining (excl. soft-deleted)."""
-        from django.db.models import Sum
+        """
+        Live sum of MaterialBatch.quantity_remaining (excl. soft-deleted).
 
-        return (
-            self.batches.filter(is_deleted=False).aggregate(s=Sum("quantity_remaining"))["s"]
-            or Decimal("0.0000")
-        )
+        Read from the per-request grouped `cogs.stock_map()` — one grouped
+        query per request covers EVERY material instead of one aggregate per
+        call. Writes drop the map (signals), and `clear_request_cache()`
+        scopes it to this request, so read-after-write stays correct.
+        """
+        from . import cogs
+
+        return cogs.stock_map().get(self.id, Decimal("0.0000"))
 
     @property
     def is_below_alert(self):
@@ -622,6 +654,7 @@ class Material(models.Model):
 #    3.9 ArrivedStock is just the creation flow for this same table.
 # ---------------------------------------------------------------------------
 class MaterialBatch(AuditModel):
+    objects = InvalidateQuerySet.as_manager()
     material = models.ForeignKey(
         Material, on_delete=models.CASCADE, related_name="batches"
     )
@@ -635,6 +668,12 @@ class MaterialBatch(AuditModel):
 
     class Meta:
         ordering = ["arrival_date", "id"]  # FIFO: oldest first
+        indexes = [
+            models.Index(
+                fields=["material", "arrival_date", "is_deleted"],
+                name="matbatch_arrival_isdeleted_idx",
+            ),
+        ]
 
     def __str__(self):
         return (
@@ -696,6 +735,7 @@ class MaterialBatch(AuditModel):
 # 3.5 SKU + requirements, 3.6 SKUPrintCost
 # ---------------------------------------------------------------------------
 class SKU(models.Model):
+    objects = InvalidateQuerySet.as_manager()
     description = models.CharField(max_length=200, unique=True)
     qty_per_case = models.DecimalField(
         max_digits=12, decimal_places=4, default=Decimal("24")
@@ -717,6 +757,7 @@ class SKUMaterialRequirement(models.Model):
     considered anywhere (user requirement). Decimals allowed (e.g. 1 case
     of bottles, 1.08 sheets of labels per case).
     """
+    objects = InvalidateQuerySet.as_manager()
 
     sku = models.ForeignKey(SKU, on_delete=models.CASCADE, related_name="requirements")
     material = models.ForeignKey(
@@ -738,6 +779,7 @@ class SKUPrintCost(models.Model):
     Per-label cost = (paper_cost + print_cost_per_paper) / labels_per_paper,
     then wastage-adjusted.
     """
+    objects = InvalidateQuerySet.as_manager()
 
     sku = models.OneToOneField(SKU, on_delete=models.CASCADE, related_name="print_cost")
     paper_cost = models.DecimalField(max_digits=12, decimal_places=2, default=0)
@@ -757,6 +799,7 @@ class SKUPrintCost(models.Model):
 # 3.8 StockDelivery
 # ---------------------------------------------------------------------------
 class StockDelivery(AuditModel):
+    objects = InvalidateQuerySet.as_manager()
     client = models.ForeignKey(
         Client, on_delete=models.CASCADE, related_name="deliveries"
     )
@@ -796,6 +839,12 @@ class StockDelivery(AuditModel):
 
     class Meta:
         ordering = ["-date", "-id"]
+        indexes = [
+            models.Index(
+                fields=["date", "is_deleted"],
+                name="delivery_date_isdeleted_idx",
+            ),
+        ]
 
     def __str__(self):
         return f"{self.date} {self.client.name} {self.sku.description} x{self.qty_cases}"
@@ -866,6 +915,7 @@ class StockDelivery(AuditModel):
 # go through a StockAdjustment with a reason.
 # ---------------------------------------------------------------------------
 class StockAdjustment(models.Model):
+    objects = InvalidateQuerySet.as_manager()
     material = models.ForeignKey(
         Material, on_delete=models.CASCADE, related_name="adjustments"
     )
@@ -935,6 +985,7 @@ class OverheadCategory(models.Model):
 
 
 class MonthlyOverhead(models.Model):
+    objects = InvalidateQuerySet.as_manager()
     category = models.ForeignKey(
         OverheadCategory, on_delete=models.CASCADE, related_name="monthly_overheads"
     )

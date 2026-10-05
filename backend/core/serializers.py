@@ -103,9 +103,7 @@ class ClientLedgerEntrySerializer(serializers.ModelSerializer):
 
 
 class ClientSerializer(serializers.ModelSerializer):
-    pending_amount = serializers.DecimalField(
-        max_digits=12, decimal_places=2, read_only=True
-    )
+    pending_amount = serializers.SerializerMethodField()
     sku_prices = ClientSKUPriceSerializer(many=True, read_only=True)
 
     class Meta:
@@ -129,6 +127,16 @@ class ClientSerializer(serializers.ModelSerializer):
         # Opening balance ledger entry is created by Client.save() (model
         # level) so the live pending sum works from day one (spec 3.1/3.2).
         return super().create(validated_data)
+
+    def get_pending_amount(self, obj):
+        # Batch path (the client LIST): the viewset precomputed every pending
+        # in ONE ledger query and stashed the map on the context. Without it
+        # (retrieve/update) fall back to the per-client property — same number
+        # either way.
+        pending_map = self.context.get("pending_map")
+        if pending_map is not None and obj.id in pending_map:
+            return pending_map[obj.id]
+        return str(obj.pending_amount)
 
 
 class MaterialSerializer(serializers.ModelSerializer):

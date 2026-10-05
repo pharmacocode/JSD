@@ -4,17 +4,18 @@
  * and the amount we owe each vendor (arrived stock purchases minus payments).
  * Vendors are selected in the Material form (MVP Master).
  */
-import { ref, watch, onMounted } from 'vue'
-import { api, listify } from '@/api'
+import { ref, computed, onMounted, onActivated } from 'vue'
+import { api } from '@/api'
+import { useRefDataStore } from '@/stores/refdata'
 import { useUiStore } from '@/stores/ui'
 import { money, today } from '@/utils/format'
 import BalanceMarkerDialog from '@/components/BalanceMarkerDialog.vue'
 import EmptyState from '@/components/EmptyState.vue'
 
+const refdata = useRefDataStore()
 const ui = useUiStore()
 
 const search = ref('')
-const vendors = ref([])
 const loading = ref(true)
 const error = ref('')
 
@@ -30,19 +31,33 @@ const payableDialog = ref(false)
 const payForm = ref({ amount: null, date: today(), note: '' })
 
 async function load() {
+  // Perf plan 2.8: vendors are shared through the reference store (the material
+  // form's picker reads the same list), so a revisit is instant.
+  if (refdata.loaded.vendors) {
+    loading.value = false
+    refdata.fetch('vendors', { force: true }).catch(() => {})
+    return
+  }
   loading.value = true
   try {
-    vendors.value = listify(await api.get('/vendors/', { search: search.value }))
+    await refdata.fetch('vendors')
   } finally {
     loading.value = false
   }
 }
 
 onMounted(load)
-let t = null
-watch(search, () => {
-  clearTimeout(t)
-  t = setTimeout(load, 250)
+onActivated(load)
+
+// In-memory filter — same fields the server searched (name / phone).
+const vendors = computed(() => {
+  const q = search.value.trim().toLowerCase()
+  if (!q) return refdata.vendors
+  return refdata.vendors.filter((v) =>
+    [v.name, v.contact_number].some((x) =>
+      (x || '').toLowerCase().includes(q)
+    )
+  )
 })
 
 function openCreate() {
@@ -73,7 +88,7 @@ async function save() {
     else await api.post('/vendors/', payload)
     ui.notify(`Vendor "${form.value.name}" saved`)
     dialog.value = false
-    await load()
+    await refdata.fetch('vendors', { force: true })
   } catch (e) {
     error.value = e.message
   } finally {
@@ -90,7 +105,7 @@ async function openDetail(v) {
 async function reloadDetail() {
   if (!detail.value) return
   await openDetail({ id: detail.value.id })
-  await load()
+  await refdata.fetch('vendors', { force: true })
 }
 
 async function savePayment() {
@@ -110,7 +125,7 @@ async function savePayment() {
     payDialog.value = false
     payForm.value = { amount: null, date: today(), note: '' }
     await openDetail({ id: detail.value.id })
-    await load()
+    await refdata.fetch('vendors', { force: true })
   } catch (e) {
     error.value = e.message
   } finally {

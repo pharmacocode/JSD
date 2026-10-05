@@ -2,23 +2,22 @@
 /**
  * MVP Master (spec 4.6): material list + add/edit with inline stock in hand.
  */
-import { ref, watch, onMounted, computed } from 'vue'
+import { ref, computed, onMounted, onActivated } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, listify } from '@/api'
+import { api } from '@/api'
+import { useRefDataStore } from '@/stores/refdata'
 import { useUiStore } from '@/stores/ui'
 import { num } from '@/utils/format'
 import EmptyState from '@/components/EmptyState.vue'
 
 const router = useRouter()
+const refdata = useRefDataStore()
 const ui = useUiStore()
 
 const search = ref('')
-const materials = ref([])
 const loading = ref(true)
 const dialog = ref(false)
 const editing = ref(null)
-const clients = ref([])
-const vendors = ref([])
 const saving = ref(false)
 const error = ref('')
 
@@ -37,27 +36,44 @@ const blank = () => ({
 const form = ref(blank())
 
 async function load() {
+  // Perf plan 2.8: materials + vendors come from the shared reference store
+  // (also read by the delivery/arrival/adjustment screens), so a revisit is
+  // instant. Warm both lists in parallel rather than one after the other
+  // (perf plan 2.10). The old code also fetched /clients/ here, but nothing on
+  // this screen ever used it — that request is gone.
+  const warm = []
+  if (!refdata.loaded.vendors) warm.push(refdata.fetch('vendors'))
+
+  if (refdata.loaded.materials) {
+    loading.value = false
+    warm.push(refdata.fetch('materials', { force: true }))
+    Promise.all(warm).catch(() => {})
+    return
+  }
   loading.value = true
+  warm.push(refdata.fetch('materials'))
   try {
-    materials.value = listify(
-      await api.get('/materials/', { search: search.value })
-    )
+    await Promise.all(warm)
   } finally {
     loading.value = false
   }
 }
 
-onMounted(async () => {
-  await load()
-  clients.value = listify(await api.get('/clients/'))
-  vendors.value = listify(await api.get('/vendors/'))
+onMounted(load)
+onActivated(load)
+
+// In-memory filter — same field the server searched (name), so typing never
+// fires a request (perf plan 2.7).
+const materials = computed(() => {
+  const q = search.value.trim().toLowerCase()
+  if (!q) return refdata.materials
+  return refdata.materials.filter((m) =>
+    (m.name || '').toLowerCase().includes(q)
+  )
 })
 
-let t = null
-watch(search, () => {
-  clearTimeout(t)
-  t = setTimeout(load, 250)
-})
+// Vendor picker source (cached list from the reference store).
+const vendors = computed(() => refdata.vendors)
 
 function openCreate() {
   editing.value = false
@@ -95,7 +111,7 @@ async function save() {
     else await api.post('/materials/', payload)
     ui.notify(`Material "${form.value.name}" saved`)
     dialog.value = false
-    await load()
+    await refdata.fetch('materials', { force: true })
   } catch (e) {
     error.value = e.message
   } finally {

@@ -26,11 +26,13 @@ Key rules:
   deliveries land in that month.
 """
 
+from datetime import date
 from decimal import Decimal, InvalidOperation
 
 from django.db import transaction
 from django.db.models import Sum
 
+from . import perfcache
 from .models import (
     Client,
     ClientLedgerEntry,
@@ -50,6 +52,94 @@ def month_key(date_obj) -> str:
     return date_obj.strftime("%Y-%m")
 
 
+def month_range(year: int, mon: int) -> dict:
+    """
+    `date__year`/`date__month` compile to EXTRACT(...) SQL, which a normal
+    btree index on `date` cannot serve. The equivalent half-open range
+    (`date >= 1st, date < 1st of next month`) can, so every month-scoped
+    query uses this helper instead.
+    """
+    start = date(year, mon, 1)
+    end = date(year + 1, 1, 1) if mon == 12 else date(year, mon + 1, 1)
+    return {"date__gte": start, "date__lt": end}
+
+
+def client_label_material(client: Client, category: str = "Label"):
+    """Client-owned label material (memoized — resolve_requirements reads it per SKU)."""
+    from .models import Material
+
+    cached_value = perfcache.cached(
+        ("client_label", client.id, category),
+        lambda: Material.objects.filter(
+            is_client_specific=True, client=client, category=category
+        )
+        .order_by("id")
+        .first(),
+    )
+    return cached_value
+
+
+def stock_map() -> dict:
+    """
+    Live stock in hand for EVERY material in ONE grouped query —
+    {material_id: Decimal}. Memoized for the request; every write to a batch
+    drops it (signals), so read-after-write stays correct.
+    Returns a fresh dict — callers may mutate it.
+    """
+    from django.db.models import Sum
+
+    from .models import MaterialBatch
+
+    def compute():
+        rows = (
+            MaterialBatch.objects.filter(is_deleted=False)
+            .values("material_id")
+            .annotate(total=Sum("quantity_remaining"))
+        )
+        return {r["material_id"]: (r["total"] or ZERO) for r in rows}
+
+    return dict(perfcache.cached(("stock_map",), compute))
+
+
+def booked_map() -> dict:
+    """
+    `legacy_booked_consumption` for EVERY material in ONE grouped query —
+    {material_id: received - remaining} over EVERY batch row (soft-deleted
+    included, exactly like the scalar helper). Memoized the same way.
+    Returns a fresh dict.
+    """
+    from django.db.models import Sum
+
+    from .models import MaterialBatch
+
+    def compute():
+        rows = MaterialBatch.objects.values("material_id").annotate(
+            received=Sum("quantity_received"),
+            remaining=Sum("quantity_remaining"),
+        )
+        return {
+            r["material_id"]: (r["received"] or ZERO) - (r["remaining"] or ZERO)
+            for r in rows
+        }
+
+    return dict(perfcache.cached(("booked_map",), compute))
+
+
+def fifo_snapshot(material):
+    """
+    Immutable (remaining, price) pairs of the material's live FIFO queue, in
+    queue order. One query per material per request instead of one per read —
+    `_preview_fifo_unit_cost` walks this on every delivery row otherwise.
+    """
+    return perfcache.cached(
+        ("fifo_snapshot", material.id),
+        lambda: tuple(
+            (b.quantity_remaining, b.price_per_unit)
+            for b in fifo_batches_for(material)
+        ),
+    )
+
+
 def resolve_requirements(sku, client: Client):
     """
     Resolve a SKU's material requirements for a specific client.
@@ -63,31 +153,32 @@ def resolve_requirements(sku, client: Client):
     - A GENERIC label material (category='Label', not client-specific) is
       substituted with this client's own label material when one exists
       (custom labels are per-client stock — spec 3.3 / 4.2 step 4).
+
+    Memoized per (sku, client) for the request: the delivery list resolves
+    the same pair for every row, and this used to cost 2 queries PER ROW.
+    Returns a fresh list — callers may mutate it.
     """
     from .models import Material
 
-    resolved = []
-    for req in sku.requirements.select_related("material"):
-        mat = req.material
-        if mat.is_client_specific:
-            if mat.client_id == client.id:
-                resolved.append((mat, req.qty_per_case))
-            # Client-specific material for a DIFFERENT client never applies
-            # to this delivery — skip rather than consume the wrong labels.
-            continue
-        if mat.category == "Label":
-            client_label = (
-                Material.objects.filter(
-                    is_client_specific=True, client=client, category="Label"
-                )
-                .order_by("id")
-                .first()
-            )
-            if client_label:
-                resolved.append((client_label, req.qty_per_case))
+    def compute():
+        resolved = []
+        for req in sku.requirements.select_related("material"):
+            mat = req.material
+            if mat.is_client_specific:
+                if mat.client_id == client.id:
+                    resolved.append((mat, req.qty_per_case))
+                # Client-specific material for a DIFFERENT client never applies
+                # to this delivery — skip rather than consume the wrong labels.
                 continue
-        resolved.append((mat, req.qty_per_case))
-    return resolved
+            if mat.category == "Label":
+                client_label = client_label_material(client)
+                if client_label:
+                    resolved.append((client_label, req.qty_per_case))
+                    continue
+            resolved.append((mat, req.qty_per_case))
+        return tuple(resolved)
+
+    return list(perfcache.cached(("requirements", sku.id, client.id), compute))
 
 
 def fifo_batches_for(material):
@@ -96,10 +187,9 @@ def fifo_batches_for(material):
 
 
 def stock_available(material) -> Decimal:
-    return (
-        fifo_batches_for(material).aggregate(s=Sum("quantity_remaining"))["s"]
-        or ZERO
-    )
+    # Read from the grouped map — one query per request covers EVERY material
+    # instead of one aggregate per call.
+    return stock_map().get(material.id, ZERO)
 
 
 def settle_deficit(material, arriving) -> list:
@@ -185,17 +275,9 @@ def legacy_booked_consumption(material) -> Decimal:
 
     Shared read-only helper: the legacy backfill command and the Home
     dashboard badge use this exact formula so the two can never disagree.
+    Reads from the grouped `booked_map()` — one query per request.
     """
-    from django.db.models import Sum
-
-    from .models import MaterialBatch
-
-    agg = MaterialBatch.objects.filter(material=material).aggregate(
-        received=Sum("quantity_received"), remaining=Sum("quantity_remaining")
-    )
-    received = agg["received"] or ZERO
-    remaining = agg["remaining"] or ZERO
-    return received - remaining
+    return booked_map().get(material.id, ZERO)
 
 
 def legacy_demand_by_material(year=None, month=None):
@@ -217,7 +299,18 @@ def legacy_demand_by_material(year=None, month=None):
 
     Shared read-only helper (see legacy_booked_consumption): the backfill
     command and the dashboard badge both read through here. Writes nothing.
+
+    Memoized per (year, month) for the request; the call walks every live
+    delivery, so the dashboard must not pay for it twice. Returns fresh dicts.
     """
+    demand, last_event = perfcache.cached(
+        ("legacy_demand", year, month),
+        lambda: _legacy_demand_by_material(year, month),
+    )
+    return dict(demand), dict(last_event)
+
+
+def _legacy_demand_by_material(year=None, month=None):
     from .models import StockAdjustment, StockDelivery
 
     demand = {}
@@ -231,8 +324,8 @@ def legacy_demand_by_material(year=None, month=None):
     )
     adjustments = StockAdjustment.objects.filter(is_deleted=False)
     if year is not None and month is not None:
-        deliveries = deliveries.filter(date__year=year, date__month=month)
-        adjustments = adjustments.filter(date__year=year, date__month=month)
+        deliveries = deliveries.filter(**month_range(year, month))
+        adjustments = adjustments.filter(**month_range(year, month))
 
     for delivery in deliveries:
         for material, qty_per_case in resolve_requirements(
@@ -466,17 +559,31 @@ def overhead_for_month(month: str) -> Decimal:
     """Sum of all overhead categories for a YYYY-MM month (incl. labour)."""
     from .models import MonthlyOverhead
 
-    return (
-        MonthlyOverhead.objects.filter(month=month).aggregate(s=Sum("amount"))["s"]
-        or ZERO
-    )
+    def compute():
+        return (
+            MonthlyOverhead.objects.filter(month=month).aggregate(s=Sum("amount"))[
+                "s"
+            ]
+            or ZERO
+        )
+
+    return perfcache.cached(("overhead_for_month", month), compute)
 
 
 def cases_sold_in_month(month: str, include_cases: Decimal = ZERO) -> Decimal:
     """Total non-deleted cases sold in a YYYY-MM month (+ optional extra)."""
+    return perfcache.cached(
+        ("cases_sold_in_month", month, str(include_cases)),
+        lambda: _cases_sold_in_month(month, include_cases),
+    )
+
+
+def _cases_sold_in_month(month: str, include_cases: Decimal) -> Decimal:
+    from .models import StockDelivery
+
     year, mon = (int(p) for p in month.split("-"))
     qs = StockDelivery.objects.filter(
-        is_deleted=False, date__year=year, date__month=mon
+        is_deleted=False, **month_range(year, mon)
     )
     return (qs.aggregate(s=Sum("qty_cases"))["s"] or ZERO) + Decimal(include_cases)
 
@@ -487,6 +594,13 @@ def overhead_per_case(month: str, additional_cases: Decimal = ZERO) -> Decimal:
     purely per-case). LIVE estimate — recomputed on each new delivery in
     that month (confirmed assumption 1, no month-close lock). 0 if no sales.
     """
+    return perfcache.cached(
+        ("overhead_per_case", month, str(additional_cases)),
+        lambda: _overhead_per_case(month, additional_cases),
+    )
+
+
+def _overhead_per_case(month: str, additional_cases: Decimal) -> Decimal:
     sold = cases_sold_in_month(month, include_cases=additional_cases)
     if sold <= 0:
         return ZERO
@@ -499,7 +613,18 @@ def print_cost_per_case(sku) -> tuple:
     per-case print cost = ((paper_cost + print_cost_per_paper)
     / labels_per_paper) x qty_per_case x (1 + wastage_percent/100).
     Returns (cost, breakdown_dict). Missing config => zero cost.
+
+    Memoized per SKU for the request; the breakdown dict is returned as a
+    fresh copy so callers can never mutate the cached one.
     """
+    cost, breakdown = perfcache.cached(
+        ("print_cost", sku.id),
+        lambda: _print_cost_per_case(sku),
+    )
+    return cost, (dict(breakdown) if breakdown is not None else None)
+
+
+def _print_cost_per_case(sku) -> tuple:
     try:
         pc = sku.print_cost
     except SKUPrintCost.DoesNotExist:
@@ -639,19 +764,21 @@ def _preview_fifo_unit_cost(material, units_needed: Decimal) -> Decimal:
     Non-mutating weighted unit cost if we were to consume `units_needed`
     from the FIFO queue right now (walks batches oldest-first, no writes).
     Falls back to the newest batch price when the queue is empty.
+
+    Walks the memoized `fifo_snapshot()` instead of re-querying the queue
+    every time — `_preview_fifo_unit_cost` ran once per delivery ROW before.
     """
     remaining = Decimal(units_needed)
     total_cost = ZERO
     total_taken = ZERO
     last_price = None
-    for batch in fifo_batches_for(material):
-        last_price = batch.price_per_unit
+    for available, price in fifo_snapshot(material):
+        last_price = price
         if remaining <= 0:
             break
-        available = batch.quantity_remaining
         if available > 0:
             take = min(available, remaining)
-            total_cost += take * batch.price_per_unit
+            total_cost += take * price
             total_taken += take
             remaining -= take
     if remaining > 0:

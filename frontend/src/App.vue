@@ -1,6 +1,7 @@
 <script setup>
 import { ref, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
+import { apiBaseUrlMissing } from '@/api'
 import { useUiStore } from '@/stores/ui'
 
 const route = useRoute()
@@ -13,6 +14,22 @@ const nav = [
   { to: '/clients', label: 'Clients', icon: 'mdi-account-group' },
   { to: '/masters', label: 'Masters', icon: 'mdi-database' },
   { to: '/reports', label: 'Reports', icon: 'mdi-chart-line' },
+]
+
+// Views worth keeping mounted between navigations (perf plan 2.10): read-mostly
+// lists and the dashboard, whose state costs something to rebuild. Data-entry
+// screens (delivery, arrival, adjustment) and form/detail pages are deliberately
+// left out so they mount fresh with clean inputs. Names are matched against the
+// SFC filename through Vue's `__name` inference.
+const cachedViews = [
+  'HomeView',
+  'ClientsView',
+  'MastersView',
+  'MaterialsView',
+  'SkusView',
+  'VendorsView',
+  'ReportsView',
+  'OverheadsView',
 ]
 
 const isRoot = computed(() => route.path === '/')
@@ -102,7 +119,27 @@ function goHome() {
 
     <v-main>
       <v-container fluid class="pa-3 pa-md-5" style="max-width: 1100px">
-        <router-view />
+        <!-- Loud, visible warning when the production build has no backend URL
+             (see api/index.js) — otherwise every screen silently talks to
+             localhost. -->
+        <v-alert
+          v-if="apiBaseUrlMissing"
+          type="error"
+          variant="tonal"
+          density="compact"
+          class="mb-3"
+          title="Backend URL not configured"
+          text="Set VITE_API_BASE_URL to the Render backend URL in Netlify → Site configuration → Environment variables, then redeploy."
+        />
+
+        <!-- Keep the tab-style views alive so returning to them is instant and
+             their filters / scroll survive; everything else mounts fresh
+             (perf plan 2.10). -->
+        <router-view v-slot="{ Component }">
+          <keep-alive :include="cachedViews">
+            <component :is="Component" />
+          </keep-alive>
+        </router-view>
       </v-container>
     </v-main>
 

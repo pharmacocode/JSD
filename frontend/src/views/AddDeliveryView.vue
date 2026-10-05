@@ -12,14 +12,15 @@
  */
 import { ref, computed, watch, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, listify } from '@/api'
+import { api } from '@/api'
+import { useRefDataStore } from '@/stores/refdata'
 import { money, num, today } from '@/utils/format'
 
 const router = useRouter()
+const refdata = useRefDataStore()
 
 const loading = ref(false)
 const search = ref('')
-const clients = ref([])
 const client = ref(null)
 const skus = ref([])
 // One row per selected SKU: { entry, qty, price } (spec 4.2 multi-SKU).
@@ -38,27 +39,24 @@ const shortfall = ref(null)
 const result = ref(null)
 const error = ref('')
 
-// Client search-as-you-type. A token guards against a slow response
-// overwriting a newer one.
-let searchToken = 0
-async function loadClients(q = '') {
-  const token = ++searchToken
-  try {
-    const data = await api.get('/clients/', { search: q || '' })
-    if (token !== searchToken) return // stale response
-    clients.value = listify(data).slice(0, 8)
-  } catch {
-    if (token === searchToken) clients.value = []
-  }
-}
-
-watch(search, (q) => {
-  if (client.value) return
-  loadClients(q)
+// Client picker: the full list is cached once in the shared reference store
+// (perf plan 2.8), so the type-ahead filters in memory — the same fields the
+// server searched (name / phone) — with no request per keystroke. Eight rows
+// are plenty for the picker.
+const clients = computed(() => {
+  const q = search.value.trim().toLowerCase()
+  const rows = q
+    ? refdata.clients.filter((c) =>
+        [c.name, c.contact_number].some((v) =>
+          (v || '').toLowerCase().includes(q)
+        )
+      )
+    : refdata.clients
+  return rows.slice(0, 8)
 })
 
-// Show the picker list immediately instead of waiting for a keystroke.
-onMounted(() => loadClients(''))
+// Fill the picker immediately instead of waiting for a keystroke.
+onMounted(() => refdata.fetch('clients').catch(() => {}))
 
 function pickClient(c) {
   client.value = c
@@ -73,7 +71,6 @@ function changeClient() {
   skus.value = []
   preview.value = null
   search.value = ''
-  loadClients('')
 }
 
 // SKU chips act as toggles: tap to add a line, tap again to remove it.
@@ -194,6 +191,10 @@ async function submit(force = false) {
       }
     }
     result.value = await api.post('/deliveries/bulk/', payload)
+    // The delivery moved stock and changed the client's pending balance — drop
+    // both cached reference lists so the next screen reads fresh figures
+    // (perf plan 2.8).
+    refdata.invalidate('materials', 'clients')
   } catch (e) {
     if (e.status === 409) {
       shortfall.value = e.data // {detail, shortfall:[...]} -> inline banner
@@ -221,7 +222,8 @@ function reset() {
   result.value = null
   error.value = ''
   search.value = ''
-  loadClients('')
+  // Refresh the picker so pending balances reflect the run just saved.
+  refdata.fetch('clients', { force: true }).catch(() => {})
 }
 </script>
 

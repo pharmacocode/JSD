@@ -2,7 +2,7 @@
 
 from decimal import Decimal, InvalidOperation
 
-from django.db.models import Q, Sum
+from django.db.models import F, Q, Sum
 from django.utils import timezone
 from django.utils.dateparse import parse_date
 from rest_framework import status, viewsets
@@ -124,9 +124,55 @@ def delivery_payment_request(request):
     return {"amount": amount, "date": date_value, "note": note}, None
 
 
+def _pending_amount_map(clients):
+    """
+    Live pending balance for every client in `clients` from ONE ledger query.
+
+    Same semantics as `Client.pending_amount` (marker date replaces everything
+    dated on/before it; entries strictly after it are added on top) summed
+    over the grouped rows in Python, because each marked client has its own
+    cutoff date.
+
+    Returns {client_id: "DDDD.DD"} strings — identical to the DecimalField
+    the serializer used before.
+    """
+    from collections import defaultdict
+    from decimal import Decimal
+
+    ids = [c.id for c in clients]
+    if not ids:
+        return {}
+    markers = {c.id: (c.pending_as_of_date, c.pending_as_of_amount) for c in clients}
+    sums = defaultdict(lambda: Decimal("0"))
+    for cid, entry_date, amount in ClientLedgerEntry.objects.filter(
+        is_deleted=False, client_id__in=ids
+    ).values_list("client_id", "date", "amount"):
+        marker_date, _ = markers.get(cid, (None, None))
+        if marker_date is None or entry_date > marker_date:
+            sums[cid] += amount
+    out = {}
+    for c in clients:
+        marker_date, marker_amount = markers[c.id]
+        if marker_date is None:
+            out[c.id] = str(money(sums[c.id]))
+        else:
+            out[c.id] = str(money(marker_amount + sums[c.id]))
+    return out
+
+
 class ClientViewSet(viewsets.ModelViewSet):
     queryset = Client.objects.all().prefetch_related("sku_prices__sku")
     serializer_class = ClientSerializer
+
+    def get_serializer_context(self):
+        context = super().get_serializer_context()
+        if self.action == "list":
+            # ONE ledger query for the whole page instead of 1-2 PER ROW
+            # (the list did 42 queries for 17 clients before).
+            context["pending_map"] = _pending_amount_map(
+                list(self.filter_queryset(self.get_queryset()))
+            )
+        return context
 
     def get_queryset(self):
         qs = super().get_queryset()
@@ -722,10 +768,13 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
     record, spec 5 — displayed costs stay dynamic).
     """
 
-    queryset = StockDelivery.objects.select_related("client", "sku")
+    queryset = StockDelivery.objects.select_related(
+        "client", "sku", "sku__print_cost"
+    )
     serializer_class = StockDeliverySerializer
 
     def get_queryset(self):
+        # Half-open range (indexed) instead of EXTRACT-based year/month.
         qs = super().get_queryset()
         client_id = self.request.query_params.get("client")
         if client_id:
@@ -736,7 +785,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         month = self.request.query_params.get("month")
         if month:
             year, mon = (int(p) for p in month.split("-"))
-            qs = qs.filter(date__year=year, date__month=mon)
+            qs = qs.filter(**cogs.month_range(year, mon))
         if not self.request.query_params.get("include_deleted"):
             qs = qs.filter(is_deleted=False)
         return qs
@@ -1164,6 +1213,21 @@ class EmployeePaymentViewSet(viewsets.ModelViewSet):
         sync_labour_overhead(instance.month)
 
 
+class PingView(APIView):
+    """
+    Keep-alive target (user request): pinged every few minutes so a free-tier
+    host never sleeps. Touches NO database on purpose — its whole job is to
+    prove the process is awake and answering, instantly, even while the
+    database is still warming up.
+    """
+
+    authentication_classes = []
+    permission_classes = []
+
+    def get(self, request):
+        return Response({"ok": True, "time": timezone.now().isoformat()})
+
+
 class DashboardView(APIView):
     """
     Home screen data (spec 4.1, figures reworked per user request):
@@ -1178,7 +1242,13 @@ class DashboardView(APIView):
     def get(self, request):
         month = month_param(request)
         m_year, m_mon = (int(p) for p in month.split("-"))
-        month_filter = {"date__year": m_year, "date__month": m_mon}
+        # A half-open date RANGE (indexed) instead of date__year/date__month
+        # (EXTRACT), which a plain btree index cannot serve.
+        month_filter = cogs.month_range(m_year, m_mon)
+        arrival_filter = {
+            "arrival_date__gte": month_filter["date__gte"],
+            "arrival_date__lt": month_filter["date__lt"],
+        }
 
         # Stock in hand panel. `stock_in_hand` is the LIVE batch-ledger sum;
         # `unrecorded_shortfall` is the demand-vs-booked gap (pre-negative-stock
@@ -1210,27 +1280,24 @@ class DashboardView(APIView):
                 }
             )
 
-        # Cases sold per SKU this month.
+        # Cases sold per SKU this month — one grouped query for cases AND
+        # revenue (the old code re-queried the month's deliveries once per SKU).
         sold = []
         for row in (
             StockDelivery.objects.filter(is_deleted=False, **month_filter)
             .values("sku_id", "sku__description")
-            .annotate(cases=Sum("qty_cases"))
+            .annotate(
+                cases=Sum("qty_cases"),
+                revenue=Sum(F("qty_cases") * F("selling_price_per_case")),
+            )
             .order_by("sku__description")
         ):
-            deliveries = StockDelivery.objects.filter(
-                is_deleted=False, **month_filter, sku_id=row["sku_id"]
-            )
-            revenue = sum(
-                (d.qty_cases * d.selling_price_per_case for d in deliveries),
-                Decimal("0"),
-            )
             sold.append(
                 {
                     "sku_id": row["sku_id"],
                     "sku": row["sku__description"],
                     "cases": dstr(row["cases"] or 0),
-                    "revenue": str(money(revenue)),
+                    "revenue": str(money(row["revenue"] or 0)),
                 }
             )
 
@@ -1251,8 +1318,7 @@ class DashboardView(APIView):
             for m in Material.objects.filter(
                 id__in=MaterialBatch.objects.filter(
                     is_deleted=False,
-                    arrival_date__year=m_year,
-                    arrival_date__month=m_mon,
+                    **arrival_filter,
                 ).values_list("material_id", flat=True)
             )
         }
@@ -1260,8 +1326,7 @@ class DashboardView(APIView):
         for batch in (
             MaterialBatch.objects.filter(
                 is_deleted=False,
-                arrival_date__year=m_year,
-                arrival_date__month=m_mon,
+                **arrival_filter,
             )
             .select_related("material")
             .order_by("material__name", "arrival_date", "id")
@@ -1329,7 +1394,7 @@ class DashboardView(APIView):
         month_deliveries = list(
             StockDelivery.objects.filter(
                 is_deleted=False, **month_filter
-            ).select_related("client", "sku")
+            ).select_related("client", "sku", "sku__print_cost")
         )
         dynamic = cogs.dynamic_costs_for(month_deliveries)
         per_client = {}

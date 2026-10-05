@@ -84,6 +84,52 @@ SPA routing). Env var:
 
 - `VITE_API_BASE_URL=https://<your-render-domain>.onrender.com`
 
+Forgetting this one is the classic slip: `frontend/.env` (which holds the
+localhost default) is git-ignored, so the build would quietly fall back to
+`http://localhost:8000` and every screen would look broken. A production build
+without `VITE_API_BASE_URL` therefore logs a console error **and** shows a red
+"Backend URL not configured" banner at the top of the app (see
+`frontend/src/api/index.js`) instead of failing silently.
+
+## Performance notes
+
+A read-heavy, phone-first app on a free-tier backend, so an internal pass keeps
+screens instant and the API quiet. Nothing here changes the business rules.
+
+### Backend
+
+- **Request-scoped memo cache** (`core/perfcache.py`, wired in
+  `core/middleware.py`): dynamic COGS means every read recomputes costs, so one
+  dashboard/report request used to repeat the same FIFO and config queries many
+  times over. The cache memoises those lookups for the life of a single
+  request, and `core/signals.py` drops it whenever stock, costs or config
+  change — no response is ever served from a stale cache.
+- **Database indexes** (`core/migrations/0007_performance_indexes.py`):
+  additive indexes on the columns the month-scoped dashboards filter and join
+  on (dates, foreign keys, `is_deleted`), so those queries stop scanning whole
+  tables.
+- **Keep-alive ping** (`GET /api/ping/`): a trivial, DB-free endpoint for an
+  external uptime monitor to hit every few minutes, so a sleeping free-tier
+  Render instance is already awake when the first real request arrives.
+
+### Frontend
+
+- **Shared reference-data store** (`src/stores/refdata.js`): clients, SKUs,
+  materials and vendors are fetched **once**, concurrent callers share the
+  in-flight request, and every screen reads the cache and revalidates in the
+  background (stale-while-revalidate). A save calls
+  `refdata.invalidate('materials')` (etc.) so the next read anywhere refetches.
+- **In-memory search**: the Masters lists filter the cached rows as you type —
+  no request per keystroke and no debounce timer.
+- **`<keep-alive>` on the tab views** (`src/App.vue`): Home, Clients, Masters
+  (+ its lists), Reports and Overheads stay mounted, so going back to them
+  repaints instantly with filters and scroll intact; each `onActivated`
+  revalidates in the background, and per-month in-flight guards make sure a
+  first mount never fires the same request twice. Data-entry and form views are
+  deliberately excluded so they always mount fresh and clean.
+- **Per-month dashboard cache** (`src/stores/ui.js`): the Home payload is kept
+  per month, so month switching and returning from another screen are instant.
+
 ## Key business rules (implemented as specified)
 
 - **Everything is per CASE** (bottles are never considered anywhere): material

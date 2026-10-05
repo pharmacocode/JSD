@@ -3,7 +3,7 @@
  * SKU detail (spec 4.6): material requirements (qty/bottle, decimals),
  * print cost config, and cost breakup toggle per bottle / per case.
  */
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, onMounted, computed } from 'vue'
 import { useRoute } from 'vue-router'
 import { api, listify } from '@/api'
 import { useUiStore } from '@/stores/ui'

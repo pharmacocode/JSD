@@ -23,6 +23,7 @@ from .cogs import (
     stock_available,
 )
 from . import cogs as cogs_mod
+from . import perfcache
 from .models import (
     Client,
     ClientLedgerEntry,
@@ -2580,4 +2581,98 @@ class RequirementlessSkuStockTests(TestCase):
 
 
 
+
+
+
+class PerfCacheInvalidationTests(TestCase):
+    """
+    Phase 1.2 regression: a write within a request must never serve stale costs.
+
+    The performance memo (core/perfcache.py) caches cost/stock helpers for the
+    duration of one request. The whole correctness risk is read-after-write
+    staleness — a POST that saves a batch then serialises costs must see the
+    new batch. These tests prove the signal + QuerySet.update() invalidation
+    drops the memo so the next read recomputes, with no manual clear in between.
+    """
+
+    def setUp(self):
+        # Simulate the middleware scoping this thread to a fresh request, so a
+        # previous test can never leak its memo into this one.
+        perfcache.clear_request_cache()
+        self.mat = make_material("Inv Bottle", "100")
+        make_batch(self.mat, "50", "100", arrival=date(2026, 8, 1))
+        self.client_obj = Client.objects.create(name="Inv Client")
+        self.sku = SKU.objects.create(description="Inv SKU", qty_per_case=D("24"))
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.mat, qty_per_case=D("1")
+        )
+
+    def test_cached_computes_once_per_request(self):
+        calls = {"n": 0}
+
+        def compute():
+            calls["n"] += 1
+            return "value"
+
+        self.assertEqual(perfcache.cached(("once",), compute), "value")
+        self.assertEqual(perfcache.cached(("once",), compute), "value")
+        self.assertEqual(calls["n"], 1)
+
+    def test_stock_map_reflects_new_batch_without_reset(self):
+        self.assertEqual(cogs_mod.stock_map()[self.mat.id], D("50"))
+        make_batch(self.mat, "30", "110", arrival=date(2026, 9, 1))
+        self.assertEqual(cogs_mod.stock_map()[self.mat.id], D("80"))
+        self.assertEqual(cogs_mod.stock_available(self.mat), D("80"))
+
+    def test_stock_map_reflects_batch_edit(self):
+        self.assertEqual(cogs_mod.stock_map()[self.mat.id], D("50"))
+        batch = self.mat.batches.order_by("id").first()
+        batch.quantity_remaining = D("20")
+        batch.save()
+        self.assertEqual(cogs_mod.stock_map()[self.mat.id], D("20"))
+
+    def test_queryset_update_invalidates(self):
+        self.assertEqual(cogs_mod.stock_map()[self.mat.id], D("50"))
+        MaterialBatch.objects.filter(material=self.mat).update(
+            quantity_remaining=D("10")
+        )
+        self.assertEqual(cogs_mod.stock_map()[self.mat.id], D("10"))
+
+    def test_overhead_for_month_reflects_edit(self):
+        rent = OverheadCategory.objects.get_or_create(
+            name="Rent", defaults={"is_default": True}
+        )[0]
+        row = MonthlyOverhead.objects.create(
+            category=rent, month="2026-08", amount=D("1000")
+        )
+        self.assertEqual(cogs_mod.overhead_for_month("2026-08"), D("1000"))
+        row.amount = D("2500")
+        row.save()
+        self.assertEqual(cogs_mod.overhead_for_month("2026-08"), D("2500"))
+
+    def test_resolve_requirements_reflects_new_requirement(self):
+        self.assertEqual(
+            len(cogs_mod.resolve_requirements(self.sku, self.client_obj)), 1
+        )
+        extra = make_material("Inv Cap", "5", category="Cap")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=extra, qty_per_case=D("2")
+        )
+        self.assertEqual(
+            len(cogs_mod.resolve_requirements(self.sku, self.client_obj)), 2
+        )
+
+    def test_cases_sold_reflects_new_delivery(self):
+        self.assertEqual(cogs_mod.cases_sold_in_month("2026-09"), D("0"))
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+        create_delivery(
+            self.client_obj,
+            self.sku,
+            D("4"),
+            delivery_date=date(2026, 9, 10),
+            selling_price_per_case=D("300"),
+        )
+        self.assertEqual(cogs_mod.cases_sold_in_month("2026-09"), D("4"))
 

@@ -36,10 +36,13 @@ INSTALLED_APPS = [
     "django.contrib.staticfiles",
     "rest_framework",
     "corsheaders",
-    "core",
+    "core.apps.CoreConfig",
 ]
 
 MIDDLEWARE = [
+    # First: scopes the per-request cost memo (core/perfcache.py) so no request
+    # can ever see values memoized for another.
+    "core.middleware.PerfCacheMiddleware",
     "django.middleware.security.SecurityMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",

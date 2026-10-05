@@ -4,7 +4,7 @@
  * (Rent/Diesel/Electricity/Labour pre-seeded + custom), Labour expands to
  * employee list + payments which auto-roll-up into the month's Labour total.
  */
-import { ref, onMounted, watch, computed } from 'vue'
+import { ref, onMounted, onActivated, watch, computed } from 'vue'
 import { api, listify } from '@/api'
 import { useUiStore } from '@/stores/ui'
 import { money, monthLabel } from '@/utils/format'
@@ -35,15 +35,33 @@ const labourRow = computed(() =>
   overheads.value.find((o) => o.category_name === 'Labour')
 )
 
+// One in-flight load per month: a <keep-alive>d view fires onMounted *and*
+// onActivated on its first mount (perf plan 2.10), and this screen fires four
+// requests per load — the guard keeps that at four, not eight.
+const inflight = {}
+
 async function load() {
+  const month = ui.month
+  if (inflight[month]) return inflight[month]
+  inflight[month] = doLoad(month)
+  try {
+    await inflight[month]
+  } finally {
+    delete inflight[month]
+  }
+}
+
+async function doLoad(month) {
   loading.value = true
   try {
     const [cats, oh, emps, pays] = await Promise.all([
       api.get('/overhead-categories/'),
-      api.get('/overheads/', { month: ui.month }),
+      api.get('/overheads/', { month }),
       api.get('/employees/'),
-      api.get('/employee-payments/', { month: ui.month }),
+      api.get('/employee-payments/', { month }),
     ])
+    // Ignore a response that lands after the month changed again.
+    if (month !== ui.month) return
     categories.value = listify(cats)
     overheads.value = listify(oh)
     employees.value = listify(emps)
@@ -68,6 +86,9 @@ async function load() {
 }
 
 onMounted(load)
+// Revived from the <keep-alive> cache — the in-flight guard above makes this a
+// no-op while the first mount's load is still running.
+onActivated(load)
 watch(() => ui.month, load)
 
 async function saveAmount(row) {

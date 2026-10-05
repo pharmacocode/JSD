@@ -5,14 +5,18 @@
  */
 import { ref, onMounted, computed, watch } from 'vue'
 import { useRouter } from 'vue-router'
-import { api, listify } from '@/api'
+import { api } from '@/api'
+import { useRefDataStore } from '@/stores/refdata'
 import { useUiStore } from '@/stores/ui'
 import { today } from '@/utils/format'
 
 const router = useRouter()
+const refdata = useRefDataStore()
 const ui = useUiStore()
 
-const materials = ref([])
+// Materials come from the shared reference store (perf plan 2.8) so this screen
+// paints instantly once any other list has already fetched them.
+const materials = computed(() => refdata.materials)
 const material = ref(null)
 const qty = ref(null)
 const price = ref(null)
@@ -23,7 +27,9 @@ const error = ref('')
 
 onMounted(async () => {
   try {
-    materials.value = listify(await api.get('/materials/'))
+    // Cache-first paint, then revalidate in the background (perf plan 2.8).
+    if (refdata.loaded.materials) refdata.fetch('materials', { force: true })
+    else await refdata.fetch('materials')
   } catch (e) {
     error.value = e.message
   }
@@ -72,6 +78,9 @@ async function save() {
       note: note.value,
     })
     const unit = material.value.unit_of_measure || 'cases'
+    // Stock moved — drop the cached material list so the next screen (and the
+    // Stock Adjustment picker) refetches the new quantity.
+    refdata.invalidate('materials')
     ui.notify(`Stock received: ${qty.value} ${unit} × ${material.value.name}`)
     router.push('/')
   } catch (e) {

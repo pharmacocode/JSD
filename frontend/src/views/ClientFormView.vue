@@ -6,10 +6,12 @@
 import { ref, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, listify } from '@/api'
+import { useRefDataStore } from '@/stores/refdata'
 import { useUiStore } from '@/stores/ui'
 
 const route = useRoute()
 const router = useRouter()
+const refdata = useRefDataStore()
 const ui = useUiStore()
 const isEdit = computed(() => !!route.params.id)
 
@@ -19,7 +21,8 @@ const form = ref({
   contact_number: '',
   opening_pending_amount: 0,
 })
-const allSkus = ref([])
+// SKU picker source — the shared reference list (perf plan 2.8).
+const allSkus = computed(() => refdata.skus)
 const prices = ref([]) // [{sku, selling_price_per_case}]
 const loading = ref(false)
 const saving = ref(false)
@@ -28,7 +31,7 @@ const error = ref('')
 onMounted(async () => {
   loading.value = true
   try {
-    allSkus.value = listify(await api.get('/skus/'))
+    await refdata.fetch('skus')
     if (isEdit.value) {
       const c = await api.get(`/clients/${route.params.id}/`)
       form.value = {
@@ -95,6 +98,9 @@ async function save() {
     for (const p of existing) {
       if (!keepIds.has(p.id)) await api.del(`/client-prices/${p.id}/`)
     }
+    // The client list (and its pending amounts) changed — invalidate the cache
+    // so Clients / Add Delivery read fresh rows (perf plan 2.8).
+    refdata.invalidate('clients')
     ui.notify(`Client "${form.value.name}" saved`)
     router.push(`/clients/${clientId}`)
   } catch (e) {

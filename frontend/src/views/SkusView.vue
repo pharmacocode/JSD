@@ -1,14 +1,15 @@
 <script setup>
 /** SKU Master list + create/edit (spec 4.6). */
-import { ref, watch, onMounted } from 'vue'
-import { api, listify } from '@/api'
+import { ref, computed, onMounted, onActivated } from 'vue'
+import { api } from '@/api'
+import { useRefDataStore } from '@/stores/refdata'
 import { useUiStore } from '@/stores/ui'
 import { num } from '@/utils/format'
 import EmptyState from '@/components/EmptyState.vue'
 
+const refdata = useRefDataStore()
 const ui = useUiStore()
 const search = ref('')
-const skus = ref([])
 const loading = ref(true)
 const dialog = ref(false)
 const saving = ref(false)
@@ -18,19 +19,31 @@ const blank = () => ({ id: null, description: '', qty_per_case: 24, volume_ml: 5
 const form = ref(blank())
 
 async function load() {
+  // Perf plan 2.8: SKUs are shared through the reference store (also read by the
+  // Reports picker and the client form), so a revisit is instant.
+  if (refdata.loaded.skus) {
+    loading.value = false
+    refdata.fetch('skus', { force: true }).catch(() => {})
+    return
+  }
   loading.value = true
   try {
-    skus.value = listify(await api.get('/skus/', { search: search.value }))
+    await refdata.fetch('skus')
   } finally {
     loading.value = false
   }
 }
 onMounted(load)
+onActivated(load)
 
-let t = null
-watch(search, () => {
-  clearTimeout(t)
-  t = setTimeout(load, 250)
+// In-memory filter — same field the server searched (description), so typing
+// never fires a request.
+const skus = computed(() => {
+  const q = search.value.trim().toLowerCase()
+  if (!q) return refdata.skus
+  return refdata.skus.filter((s) =>
+    (s.description || '').toLowerCase().includes(q)
+  )
 })
 
 function openCreate() {
@@ -62,7 +75,7 @@ async function save() {
     else await api.post('/skus/', payload)
     ui.notify(`SKU "${form.value.description}" saved`)
     dialog.value = false
-    await load()
+    await refdata.fetch('skus', { force: true })
   } catch (e) {
     error.value = e.message
   } finally {

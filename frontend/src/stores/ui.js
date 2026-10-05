@@ -11,10 +11,19 @@ export const useUiStore = defineStore('ui', {
     month: monthKey(), // YYYY-MM
     toast: null, // { text, color }
     backAction: null, // optional () => void set by the active view
+    // Home dashboard payloads keyed by month, so navigating back to Home is
+    // instant (perf plan 2.9) and only re-fetches in the background.
+    dashboard: {},
   }),
   actions: {
     setMonth(m) {
       this.month = m
+    },
+    getDashboard(month) {
+      return this.dashboard[month] || null
+    },
+    setDashboard(month, data) {
+      this.dashboard[month] = data
     },
     notify(text, color = 'success') {
       this.toast = { text, color, at: Date.now() }

@@ -5,10 +5,28 @@
  * so views can render the Proceed/Cancel banner (spec 4.2 step 4).
  */
 
-const BASE = (import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000').replace(
-  /\/+$/,
-  ''
-)
+const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL
+
+/**
+ * `frontend/.env` only holds the localhost development default and is
+ * git-ignored, so a production build (Netlify) knows the backend address *only*
+ * when VITE_API_BASE_URL is set in the site's environment. Without it the
+ * bundle would quietly point at localhost and every screen would look broken —
+ * so flag it loudly (console + the banner in App.vue) instead.
+ */
+export const apiBaseUrlMissing = import.meta.env.PROD && !configuredBaseUrl
+
+if (apiBaseUrlMissing) {
+  // eslint-disable-next-line no-console
+  console.error(
+    '[jsd] VITE_API_BASE_URL is not set for this production build, so the app ' +
+      'is using http://localhost:8000. Set it to the Render backend URL ' +
+      '(e.g. https://<your-app>.onrender.com) under Netlify → Site ' +
+      'configuration → Environment variables, then redeploy.'
+  )
+}
+
+const BASE = (configuredBaseUrl || 'http://localhost:8000').replace(/\/+$/, '')
 
 export class ApiError extends Error {
   constructor(status, data) {
