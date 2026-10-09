@@ -1,9 +1,9 @@
-name: Deploy to Netlify
+name: Deploy Frontend to Netlify
 
 on:
   push:
     branches:
-      - main # Change to 'master' if your main branch uses that name
+      - main
 
 jobs:
   build-and-deploy:
@@ -17,21 +17,23 @@ jobs:
         uses: actions/setup-node@v4
         with:
           node-version: 20
-          cache: 'npm' # Automatically caches npm packages
+          cache: 'npm'
 
+      # NOTE: If your package.json is inside a subfolder, change 'jsd-group-frontend' to match your folder name
       - name: Install dependencies
+        working-directory: ./jsd-group/frontend
         run: npm ci
 
       - name: Build project
-        run: npm run build # Ensures your build script runs locally inside GitHub Actions
+        working-directory: ./jsd-group/frontend
+        run: npm run build
 
       - name: Deploy to Netlify
         uses: nwtgck/actions-netlify@v3.0
         with:
-          publish-dir: './dist' # Replace 'dist' with your project's output folder (e.g., 'build' or 'out')
+          publish-dir: './jsd-group/frontend/dist' # Points to the build output inside your frontend folder
           production-deploy: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
-          enable-commit-comment: false
         env:
           NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
           NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
