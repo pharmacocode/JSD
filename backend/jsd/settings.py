@@ -19,6 +19,11 @@ SECRET_KEY = os.environ.get(
     "django-insecure-jsd-group-dev-only-key-change-in-production",
 )
 
+# Front-door password (user request). There is deliberately NO way to change
+# this from the UI — rotate it here (or in Render's env vars) only.
+# NOTE: this guards the BROWSER UI, not the API (see core.views.PasswordView).
+LOGIN_PASSWORD = os.environ.get("LOGIN_PASSWORD", "asdfghjkl")
+
 DEBUG = os.environ.get("DJANGO_DEBUG", "True").lower() in ("1", "true", "yes")
 
 ALLOWED_HOSTS = [

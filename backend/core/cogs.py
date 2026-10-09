@@ -36,8 +36,10 @@ from . import perfcache
 from .models import (
     Client,
     ClientLedgerEntry,
+    ClientOrder,
     Material,
     MaterialBatch,
+    SKU,
     SKUPrintCost,
     StockDelivery,
     money,
@@ -62,6 +64,32 @@ def month_range(year: int, mon: int) -> dict:
     start = date(year, mon, 1)
     end = date(year + 1, 1, 1) if mon == 12 else date(year, mon + 1, 1)
     return {"date__gte": start, "date__lt": end}
+
+
+def date_range(start, end) -> dict:
+    """
+    Half-open [start, end] -> [start, end + 1 day) for the SAME index reason as
+    month_range above. `end` is INCLUSIVE here (user-facing "to" date), so the
+    caller never has to remember to add a day.
+
+    An empty range (start > end) can never match a row, and Django would reject
+    the same comparison anyway — callers validate before calling.
+    """
+    from datetime import timedelta
+
+    return {"date__gte": start, "date__lt": end + timedelta(days=1)}
+
+
+def months_between(start, end) -> list:
+    """Every YYYY-MM touched by the inclusive [start, end] date range."""
+    out = []
+    year, mon = start.year, start.month
+    while (year, mon) <= (end.year, end.month):
+        out.append(f"{year:04d}-{mon:02d}")
+        mon += 1
+        if mon == 13:
+            year, mon = year + 1, 1
+    return out
 
 
 def client_label_material(client: Client, category: str = "Label"):
@@ -99,6 +127,97 @@ def stock_map() -> dict:
         return {r["material_id"]: (r["total"] or ZERO) for r in rows}
 
     return dict(perfcache.cached(("stock_map",), compute))
+
+
+def committed_map(exclude_item_ids=None):
+    """
+    Material committed to orders that have been moved to Ready to Deliver —
+    {material_id: Decimal}, computed over EVERY committed line in ONE pass.
+
+    A line is committed iff its order is COMPLETED/DELIVERED *and* the line
+    has no delivery behind it yet. Deriving it (rather than storing a
+    "reserved" figure) is what makes the pipeline exact: editing an order,
+    reopening it, deleting a delivery or moving a Masters requirement all
+    change the number immediately, and no write path can forget to adjust a
+    stored balance.
+
+    `exclude_item_ids` lets a caller ignore specific lines — used by the
+    completion check so an order is not judged short by its own requirement.
+
+    Requirements resolve per (sku, client) via resolve_requirements, so a
+    client's own label material is the one committed. Memoized like
+    stock_map; OrderItem writes drop it through InvalidateQuerySet/signals.
+    Returns a fresh dict — callers may mutate it.
+    """
+    from .models import OrderItem
+
+    def compute():
+        # One query for every committed line: id, qty, and the pair the
+        # requirements resolve against. select_related keeps it to a single
+        # round trip regardless of how many orders are open.
+        rows = list(
+            OrderItem.objects.filter(
+                delivery__isnull=True,
+                order__status__in=[ClientOrder.COMPLETED, ClientOrder.DELIVERED],
+                order__is_deleted=False,
+            )
+            .select_related("sku", "order__client")
+            .values_list(
+                "id", "qty_cases", "sku_id", "order__client_id"
+            )
+        )
+
+        # Resolve requirements ONCE per distinct (sku, client) pair — every
+        # line of every open order for the same pair would otherwise re-run
+        # the same resolution (and re-query the label substitution).
+        resolved = {}
+        for item_id, _qty, sku_id, client_id in rows:
+            if (sku_id, client_id) in resolved:
+                continue
+            sku = SKU.objects.filter(pk=sku_id).first()
+            client = Client.objects.filter(pk=client_id).first()
+            if sku is None or client is None:
+                resolved[(sku_id, client_id)] = []
+            else:
+                resolved[(sku_id, client_id)] = list(
+                    resolve_requirements(sku, client)
+                )
+
+        exclude = set(exclude_item_ids or ())
+        totals = {}
+        for item_id, qty, sku_id, client_id in rows:
+            if item_id in exclude:
+                continue
+            for material, per_case in resolved[(sku_id, client_id)]:
+                totals[material.id] = totals.get(material.id, ZERO) + round_qty(
+                    Decimal(qty) * per_case
+                )
+        return totals
+
+    key = ("committed_map", tuple(sorted(exclude_item_ids or ())))
+    return dict(perfcache.cached(key, compute))
+
+
+def available_map(exclude_item_ids=None):
+    """
+    Stock in hand that is genuinely free to promise: {material_id: live FIFO
+    balance − committed}. This is the figure the Stock in Hand tiles show and
+    the figure an order's completion is judged against.
+
+    Distinct from `stock_available` below, which is the PHYSICAL batch balance
+    and is what the FIFO engine consumes — mixing the two would make a
+    delivery look short by its own commitment.
+    """
+    free = stock_map()
+    committed = committed_map(exclude_item_ids)
+    for material_id, amount in committed.items():
+        free[material_id] = free.get(material_id, ZERO) - amount
+    return free
+
+
+def free_stock(material, exclude_item_ids=None) -> Decimal:
+    """Physical stock in hand minus what orders have already committed."""
+    return available_map(exclude_item_ids).get(material.id, ZERO)
 
 
 def booked_map() -> dict:
@@ -378,7 +497,9 @@ def legacy_shortfall_gaps(demand_by_material=None):
     return gaps
 
 
-def check_shortfall_many(client, lines):
+def check_shortfall_many(
+    client, lines, available_basis=False, exclude_item_ids=None
+):
     """
     Multi-SKU sufficiency check (spec 4.2 step 4) without mutating the DB.
 
@@ -389,6 +510,13 @@ def check_shortfall_many(client, lines):
     SKUs can resolve to the same client-owned label, so a delivery that only
     fits when its lines are considered together must not be reported short.
     Each line is rounded on its own — exactly what FIFO consumption will take.
+
+    `available_basis=False` (the default, used by every delivery path) compares
+    against the PHYSICAL batch balance — what FIFO will actually consume.
+    `available_basis=True` compares against stock that is not already
+    committed to another order, which is the right question when DECIDING
+    whether an order may be moved to Ready to Deliver. `exclude_item_ids`
+    keeps an order from being judged short by its own lines.
 
     Returns the same list shape as the single-line check.
     """
@@ -404,10 +532,15 @@ def check_shortfall_many(client, lines):
                 required_by_material[material.id] = required
                 order.append(material)
 
+    if available_basis:
+        available_by_material = available_map(exclude_item_ids)
+    else:
+        available_by_material = stock_map()
+
     shortages = []
     for material in order:
         required = required_by_material[material.id]
-        available = stock_available(material)
+        available = available_by_material.get(material.id, ZERO)
         if available < required:
             shortages.append(
                 {
@@ -568,6 +701,35 @@ def overhead_for_month(month: str) -> Decimal:
         )
 
     return perfcache.cached(("overhead_for_month", month), compute)
+
+
+def overhead_for_range(start, end) -> Decimal:
+    """
+    Sum of the monthly overhead buckets touched by the inclusive [start, end]
+    range. Overhead is keyed by month (spec 6.3), so a range is the sum of the
+    months it spans rather than a new kind of bucket.
+    """
+    return sum((overhead_for_month(m) for m in months_between(start, end)), ZERO)
+
+
+def overhead_per_case_range(start, end) -> Decimal:
+    """
+    Range overhead per case = total overhead across the spanned months divided
+    by the cases sold in the range. Used for the dashboard's headline
+    "per case" tile only — per-DELIVERY allocation always uses that delivery's
+    own month (see DashboardView), so the breakdown rows still add up exactly.
+    """
+    from .models import StockDelivery
+
+    total_overhead = overhead_for_range(start, end)
+    sold = (
+        StockDelivery.objects.filter(is_deleted=False, **date_range(start, end))
+        .aggregate(s=Sum("qty_cases"))["s"]
+        or ZERO
+    )
+    if sold <= 0:
+        return ZERO
+    return total_overhead / sold
 
 
 def cases_sold_in_month(month: str, include_cases: Decimal = ZERO) -> Decimal:
@@ -1350,6 +1512,18 @@ def void_delivery(delivery, reason: str = "") -> dict:
     delivery.edit_history = history
     delivery.is_deleted = True
     delivery.save(skip_audit=True)
+
+    # Orders pipeline: a delivery made for an order line is unlinked here, so
+    # that line's material goes straight back to Ready to Deliver instead of
+    # staying committed against stock that has physically returned (user
+    # request: deleting a delivery must return the stock to Ready to Deliver,
+    # not to Stock in Hand). This runs on BOTH delete paths — the deliveries
+    # list and deleting the delivery from the client ledger — because they
+    # both funnel through void_delivery.
+    for item in delivery.order_items.select_related("order"):
+        item.delivery = None
+        item.save()
+        item.order.recompute_status()
 
     return {
         "delivery_id": delivery.id,

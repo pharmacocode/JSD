@@ -1,0 +1,40 @@
+name: Deploy Frontend to Netlify
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      # NOTE: package.json and package-lock.json live in ./frontend, so run
+      # npm ci there instead of at the repo root.
+      - name: Install dependencies
+        working-directory: ./frontend
+        run: npm ci
+
+      - name: Build project
+        working-directory: ./frontend
+        run: npm run build
+
+      - name: Deploy to Netlify
+        uses: nwtgck/actions-netlify@v3.0
+        with:
+          publish-dir: './frontend/dist' # matches [build] publish in frontend/netlify.toml
+          production-deploy: true
+          github-token: ${{ secrets.GITHUB_TOKEN }}
+        env:
+          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
+          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}

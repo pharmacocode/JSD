@@ -1,7 +1,12 @@
-"""DRF views for the JSD Group API."""
+﻿"""DRF views for the JSD Group API."""
 
+import json
+import urllib.request
+from datetime import timedelta
 from decimal import Decimal, InvalidOperation
 
+from django.conf import settings
+from django.db import transaction
 from django.db.models import F, Q, Sum
 from django.utils import timezone
 from django.utils.dateparse import parse_date
@@ -11,6 +16,7 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from . import cogs
+from . import perfcache
 from .cogs import (
     DeliveryShortfall,
     apply_stock_adjustment,
@@ -20,9 +26,11 @@ from .cogs import (
 from .models import (
     Client,
     ClientLedgerEntry,
+    ClientOrder,
     ClientSKUPrice,
     Employee,
     EmployeePayment,
+    LoginAttempt,
     Material,
     MaterialBatch,
     MonthlyOverhead,
@@ -39,6 +47,8 @@ from .models import (
 )
 from .serializers import (
     ClientLedgerEntrySerializer,
+    ClientOrderSerializer,
+    ClientOrderWriteSerializer,
     ClientSerializer,
     ClientSKUPriceSerializer,
     EmployeePaymentSerializer,
@@ -103,7 +113,7 @@ def delivery_payment_request(request):
     Optional payment sent with a delivery (user request: the payment can be
     noted while entering the delivery).
 
-    Preferred shape: {"payment": {"amount", "date"?, "note"?}} — the flat
+    Preferred shape: {"payment": {"amount", "date"?, "note"?}} â€” the flat
     `payment_amount` / `payment_date` / `payment_note` keys work too. An absent
     or blank amount returns (None, None): no payment, the delivery is saved on
     credit exactly as before. Amount/date validation lives in
@@ -133,7 +143,7 @@ def _pending_amount_map(clients):
     over the grouped rows in Python, because each marked client has its own
     cutoff date.
 
-    Returns {client_id: "DDDD.DD"} strings — identical to the DecimalField
+    Returns {client_id: "DDDD.DD"} strings â€” identical to the DecimalField
     the serializer used before.
     """
     from collections import defaultdict
@@ -211,7 +221,7 @@ class ClientViewSet(viewsets.ModelViewSet):
         as_of = client.pending_as_of_date
         # Deleted rows are shown greyed out and marked deleted (user request:
         # the audit trail stays visible), but they must not affect the running
-        # balance or the pending amount — both are live sums that exclude them.
+        # balance or the pending amount â€” both are live sums that exclude them.
         deleted_rows = list(
             client.ledger_entries.filter(is_deleted=True).order_by("-date", "-id")
         )
@@ -359,7 +369,7 @@ class ClientViewSet(viewsets.ModelViewSet):
         request). Computed over every non-deleted delivery at READ time so
         it always reflects current prices:
           revenue  = qty_cases x selling price
-          direct   = cogs.dynamic_costs_for() — current FIFO material + print
+          direct   = cogs.dynamic_costs_for() â€” current FIFO material + print
           overhead = this client's share: per delivery, qty_cases x that
                      month's overhead-per-case (spec 6.3), i.e. the client
                      carries overhead only for the months it bought in.
@@ -376,7 +386,7 @@ class ClientViewSet(viewsets.ModelViewSet):
             (row["direct"] for row in cogs.dynamic_costs_for(deliveries).values()),
             Decimal("0"),
         )
-        # Overhead rate per delivery month, memoized — many deliveries share
+        # Overhead rate per delivery month, memoized â€” many deliveries share
         # a month and each rate is a small aggregate of its own.
         rates = {}
         overhead = Decimal("0")
@@ -618,7 +628,7 @@ class VendorViewSet(viewsets.ModelViewSet):
 
         GET    -> breakdown; ?as_of=YYYY-MM-DD&amount=X previews without saving.
         POST   -> {"amount": "12000", "date": "2026-09-25"} saves the marker.
-        DELETE -> clears the marker (payable = purchases − payments again).
+        DELETE -> clears the marker (payable = purchases âˆ’ payments again).
         """
         vendor = self.get_object()
         if request.method == "POST":
@@ -695,9 +705,9 @@ class SKUViewSet(viewsets.ModelViewSet):
     @action(detail=True, methods=["get"])
     def cost_breakup(self, request, pk=None):
         """
-        Cost breakup (spec 4.6 SKU detail) — PER CASE ONLY (bottles are never
+        Cost breakup (spec 4.6 SKU detail) â€” PER CASE ONLY (bottles are never
         considered anywhere). Uses current FIFO batch prices + the live
-        overhead allocation — like every other cost figure in the app it is
+        overhead allocation â€” like every other cost figure in the app it is
         recomputed from current data (no frozen values; snapshot fields on
         historical deliveries are audit-only).
         """
@@ -710,7 +720,7 @@ class SKUViewSet(viewsets.ModelViewSet):
             client = Client.objects.order_by("id").first()
         if client is None:
             return Response(
-                {"detail": "Create a client first — label stock resolves per client."},
+                {"detail": "Create a client first â€” label stock resolves per client."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
         result = cogs.estimate_cogs(
@@ -765,7 +775,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
     first attempt returns 409 with shortfall details when stock is short;
     resending with force=true proceeds and sets stock_shortfall_flag.
     cogs_per_case_snapshot is set server-side only (creation-time audit
-    record, spec 5 — displayed costs stay dynamic).
+    record, spec 5 â€” displayed costs stay dynamic).
     """
 
     queryset = StockDelivery.objects.select_related(
@@ -796,7 +806,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         stock it consumed is returned to the batches it came from, and the
         ledger entries it created are soft-deleted so the client's pending
         amount follows. DRF's default here is a HARD delete, which would
-        destroy the audit trail and silently keep the stock consumed — this
+        destroy the audit trail and silently keep the stock consumed â€” this
         is the only correct behaviour for this app.
         """
         return cogs.void_delivery(instance, reason="Delivery deleted")
@@ -860,7 +870,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
             return Response(
                 {
                     "detail": (
-                        "Insufficient stock — proceeding records the delivery "
+                        "Insufficient stock â€” proceeding records the delivery "
                         "and stock in hand will show negative. Reconcile later "
                         "with a Stock Adjustment or a backdated stock arrival, "
                         "or cancel."
@@ -891,7 +901,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                 "payment": result["payment"],
                 "stock_shortfall_flag": delivery.stock_shortfall_flag,
                 # No material requirements on this SKU => this delivery
-                # consumed no stock (it can never go negative) — surfaced so
+                # consumed no stock (it can never go negative) â€” surfaced so
                 # the screen can warn rather than stay silent.
                 "no_material_requirements": result["no_material_requirements"],
                 "skus_without_requirements": (
@@ -904,13 +914,13 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
     @action(detail=False, methods=["post"])
     def bulk(self, request):
         """
-        Multi-SKU delivery (spec 4.2) — one client, one date, one note:
+        Multi-SKU delivery (spec 4.2) â€” one client, one date, one note:
         POST {client, date, note, force,
               lines: [{sku, qty_cases, selling_price_per_case}],
               payment?: {amount, date?, note?}}
 
         Creates one StockDelivery per line (each with its own creation-time
-        COGS snapshot — audit only — and generated client-ledger entry)
+        COGS snapshot â€” audit only â€” and generated client-ledger entry)
         inside a single transaction, so the delivery is never half-saved. The
         stock check is aggregated across the lines: a 409 carries the summed
         shortfall list
@@ -988,7 +998,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
             return Response(
                 {
                     "detail": (
-                        "Insufficient stock — proceeding records the delivery "
+                        "Insufficient stock â€” proceeding records the delivery "
                         "and stock in hand will show negative. Reconcile later "
                         "with a Stock Adjustment or a backdated stock arrival, "
                         "or cancel."
@@ -1012,7 +1022,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
                 "client_pending_amount": result["client_pending_amount"],
                 "payment": result["payment"],
                 "stock_shortfall_flag": result["stock_shortfall_flag"],
-                # SKUs in this run that have no material requirements — they
+                # SKUs in this run that have no material requirements â€” they
                 # consumed no stock at all (see create_deliveries).
                 "no_material_requirements": result["no_material_requirements"],
                 "skus_without_requirements": result["skus_without_requirements"],
@@ -1036,7 +1046,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
             date_cls.fromisoformat(date_value) if date_value else timezone.now().date()
         )
 
-        # Multi-SKU preview — POST {client, date, lines: [{sku, qty_cases}]}:
+        # Multi-SKU preview â€” POST {client, date, lines: [{sku, qty_cases}]}:
         # one card for the whole delivery (per-line breakdown + aggregate
         # totals + the shortfall summed per material across the lines).
         raw_lines = request.data.get("lines")
@@ -1091,7 +1101,7 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
 
     # NOTE: the rolling-back perform_destroy/destroy pair lives at the top of
     # this class. A second perform_destroy used to sit here and shadow it, which
-    # soft-deleted the delivery while leaving its FIFO consumption booked —
+    # soft-deleted the delivery while leaving its FIFO consumption booked â€”
     # exactly the "deleted but still everywhere" bug.
 
 
@@ -1163,7 +1173,7 @@ class MonthlyOverheadViewSet(viewsets.ModelViewSet):
 
     def _enforce_labour_rollup(self, instance):
         """
-        Labour is never entered manually — it is always the sum of that
+        Labour is never entered manually â€” it is always the sum of that
         month's labour payments (user request). Any attempt to set the Labour
         row directly is ignored and the rolled-up figure is returned.
         """
@@ -1216,7 +1226,7 @@ class EmployeePaymentViewSet(viewsets.ModelViewSet):
 class PingView(APIView):
     """
     Keep-alive target (user request): pinged every few minutes so a free-tier
-    host never sleeps. Touches NO database on purpose — its whole job is to
+    host never sleeps. Touches NO database on purpose â€” its whole job is to
     prove the process is awake and answering, instantly, even while the
     database is still warming up.
     """
@@ -1226,6 +1236,65 @@ class PingView(APIView):
 
     def get(self, request):
         return Response({"ok": True, "time": timezone.now().isoformat()})
+
+
+def _orders_payload():
+    """
+    Pending + Ready-to-Deliver orders and the per-material commitment behind
+    them, in one dict. Shared by the dashboard (so Home needs a single request
+    per period) and by /api/orders/summary/ (so StatusUpdate and Add Delivery
+    can fetch it directly).
+
+    `ready` deliberately includes DELIVERED orders that still have an
+    undelivered line â€” a partially delivered multi-line order stays in the
+    Ready bucket for the lines that are still to go out.
+    """
+    orders = (
+        ClientOrder.objects.filter(
+            is_deleted=False,
+            status__in=[ClientOrder.PENDING, ClientOrder.COMPLETED, ClientOrder.DELIVERED],
+        )
+        .select_related("client")
+        .prefetch_related("items__sku", "items__delivery")
+    )
+    pending = [
+        ClientOrderSerializer(o).data
+        for o in orders
+        if o.status == ClientOrder.PENDING
+    ]
+    ready = [
+        ClientOrderSerializer(o).data
+        for o in orders
+        if o.status in (ClientOrder.COMPLETED, ClientOrder.DELIVERED)
+        and o.undelivered_items
+    ]
+
+    committed = cogs.committed_map()
+    available = cogs.available_map()
+    commitment = []
+    for m in Material.objects.filter(id__in=list(committed.keys()) or [0]):
+        amount = committed.get(m.id, cogs.ZERO)
+        if amount <= 0:
+            continue
+        commitment.append(
+            {
+                "material_id": m.id,
+                "material": m.name,
+                "unit": m.unit_of_measure,
+                "committed": dstr(amount),
+                "available": dstr(available.get(m.id, cogs.ZERO)),
+                "short": available.get(m.id, cogs.ZERO) < 0,
+            }
+        )
+    commitment.sort(key=lambda r: r["material"])
+
+    return {
+        "pending": pending,
+        "ready": ready,
+        "pending_count": len(pending),
+        "ready_count": len(ready),
+        "commitment": commitment,
+    }
 
 
 class DashboardView(APIView):
@@ -1239,16 +1308,59 @@ class DashboardView(APIView):
       and the month's overhead categories for the chart drill-down breakups.
     """
 
-    def get(self, request):
+    @staticmethod
+    def _period(request):
+        """
+        Resolve the reporting period from the query string.
+
+        - `from` AND `to` both present, parseable and from <= to -> RANGE mode,
+          and the month is ignored entirely (user request: "if from and to
+          dates are given, then this month selection is not applicable").
+        - otherwise -> MONTH mode via ?month=YYYY-MM (the existing behaviour,
+          so every current caller keeps working unchanged).
+
+        The month is always returned: it is what the inward reconciliation and
+        the overhead bucket need in month mode, and in range mode it is derived
+        from `to` purely for labelling.
+        """
+        raw_from = request.query_params.get("from")
+        raw_to = request.query_params.get("to")
+        if raw_from and raw_to:
+            start, end = parse_date(raw_from), parse_date(raw_to)
+            if start and end and start <= end:
+                return {
+                    "mode": "range",
+                    "month": cogs.month_key(end),
+                    "from": start,
+                    "to": end,
+                }
         month = month_param(request)
+        return {"mode": "month", "month": month, "from": None, "to": None}
+
+    def get(self, request):
+        period = self._period(request)
+        month = period["month"]
         m_year, m_mon = (int(p) for p in month.split("-"))
         # A half-open date RANGE (indexed) instead of date__year/date__month
-        # (EXTRACT), which a plain btree index cannot serve.
-        month_filter = cogs.month_range(m_year, m_mon)
+        # (EXTRACT), which a plain btree index cannot serve. Both modes share
+        # the same shape, so every query below is identical either way.
+        period_filter = (
+            cogs.date_range(period["from"], period["to"])
+            if period["mode"] == "range"
+            else cogs.month_range(m_year, m_mon)
+        )
         arrival_filter = {
-            "arrival_date__gte": month_filter["date__gte"],
-            "arrival_date__lt": month_filter["date__lt"],
+            "arrival_date__gte": period_filter["date__gte"],
+            "arrival_date__lt": period_filter["date__lt"],
         }
+        # Every YYYY-MM the period touches â€” one month in month mode, all of
+        # them in range mode. Overhead is keyed by month, so this is how a
+        # range finds its overhead buckets and its consumption.
+        months = (
+            cogs.months_between(period["from"], period["to"])
+            if period["mode"] == "range"
+            else [month]
+        )
 
         # Stock in hand panel. `stock_in_hand` is the LIVE batch-ledger sum;
         # `unrecorded_shortfall` is the demand-vs-booked gap (pre-negative-stock
@@ -1257,10 +1369,17 @@ class DashboardView(APIView):
         # as the backfill command (cogs.legacy_*), read-only here.
         demand_by_material, _last_event = cogs.legacy_demand_by_material()
         gaps = cogs.legacy_shortfall_gaps(demand_by_material)
+        # Stock committed to Ready-to-Deliver orders. `stock_in_hand` stays the
+        # PHYSICAL batch balance (what FIFO consumes); `available` is what is
+        # genuinely free, and is what the Home tiles show â€” an order that has
+        # been moved to Ready to Deliver has already taken its material out of
+        # Stock in Hand (user request).
+        committed = cogs.committed_map()
         materials = []
         for m in Material.objects.all().order_by("name"):
             row = gaps.get(m.id, {})
             gap = row.get("gap", cogs.ZERO)
+            committed_amt = committed.get(m.id, cogs.ZERO)
             materials.append(
                 {
                     "id": m.id,
@@ -1269,7 +1388,13 @@ class DashboardView(APIView):
                     "unit": m.unit_of_measure,
                     "stock_in_hand": dstr(m.stock_in_hand),
                     "stock_alert_qty": dstr(m.stock_alert_qty),
-                    "below_alert": m.is_below_alert,
+                    # The alert state is judged on what is FREE to promise, not
+                    # on the raw balance â€” stock already committed to a Ready to
+                    # Deliver order is no longer sitting on the shelf.
+                    "below_alert": (m.stock_in_hand - committed_amt)
+                    < m.stock_alert_qty,
+                    "committed": dstr(committed_amt),
+                    "available": dstr(m.stock_in_hand - committed_amt),
                     "demand": dstr(row.get("demand", cogs.ZERO)),
                     "booked": dstr(row.get("booked", cogs.ZERO)),
                     "unrecorded_shortfall": dstr(gap),
@@ -1280,11 +1405,11 @@ class DashboardView(APIView):
                 }
             )
 
-        # Cases sold per SKU this month — one grouped query for cases AND
+        # Cases sold per SKU this month â€” one grouped query for cases AND
         # revenue (the old code re-queried the month's deliveries once per SKU).
         sold = []
         for row in (
-            StockDelivery.objects.filter(is_deleted=False, **month_filter)
+            StockDelivery.objects.filter(is_deleted=False, **period_filter)
             .values("sku_id", "sku__description")
             .annotate(
                 cases=Sum("qty_cases"),
@@ -1303,16 +1428,23 @@ class DashboardView(APIView):
 
         # Inward material arrivals this month: one row per material for the Home
         # summary, each carrying its underlying batch line items. Those line
-        # items are editable from the Home screen (user request) — correcting
+        # items are editable from the Home screen (user request) â€” correcting
         # one recalculates stock in hand, FIFO and the vendor payable.
         #
         # Two extra maps back the "month reconciliation" below: how much of
         # each material this month's LIVE deliveries actually drew out of the
         # FIFO queue, and each material's current live balance. Both are
         # computed once here and reused by every row.
-        month_consumption, _ = cogs.legacy_demand_by_material(
-            year=m_year, month=m_mon
-        )
+        # Consumption for the inward reconciliation: one month in month mode,
+        # the sum of every month the range touches in range mode.
+        month_consumption = {}
+        for key in months:
+            y, mo = (int(p) for p in key.split("-"))
+            partial, _ = cogs.legacy_demand_by_material(year=y, month=mo)
+            for mat_id, value in partial.items():
+                month_consumption[mat_id] = (
+                    month_consumption.get(mat_id, Decimal("0")) + value
+                )
         material_stock = {
             m.id: m.stock_in_hand
             for m in Material.objects.filter(
@@ -1332,7 +1464,7 @@ class DashboardView(APIView):
             .order_by("material__name", "arrival_date", "id")
         ):
             if batch.quantity_received <= 0 and batch.quantity_remaining < 0:
-                # Deficit carrier batch (the negative-stock booking) — not an
+                # Deficit carrier batch (the negative-stock booking) â€” not an
                 # arrival, so it must not show up as an inward line item.
                 continue
             row = arrivals.setdefault(
@@ -1365,7 +1497,7 @@ class DashboardView(APIView):
         for row in arrivals.values():
             row["quantity"] = dstr(row.pop("received"))
             # Month reconciliation (user report: "we had 1000 ml stock in
-            # September but not in October — mismatch"). The inward list is
+            # September but not in October â€” mismatch"). The inward list is
             # scoped to ARRIVAL DATE, while the stock panel is a live balance,
             # so a material whose cases arrived in an earlier month shows zero
             # inward in October even though it is very much in stock. Each row
@@ -1382,18 +1514,41 @@ class DashboardView(APIView):
         # Per-client breakdown this month: revenue, the CURRENT direct cost
         # and profit with/without the month's overhead. Powers the Home metric
         # chart (revenue / profit per client, highest first). Costs are
-        # DYNAMIC (user request — no frozen snapshots): raw materials are
+        # DYNAMIC (user request â€” no frozen snapshots): raw materials are
         # recomputed from today's FIFO queue and print from the SKU's current
         # print config in ONE pass (cogs.dynamic_costs_for), so a price /
         # print-config edit moves every chart immediately. The same pass also
         # accumulates a client x SKU matrix (chart drill-down breakups) so
         # every figure below derives from one identical walk over the
-        # deliveries — bars and drill rows always add up exactly.
-        overhead_total = cogs.overhead_for_month(month)
-        overhead_per_case_month = cogs.overhead_per_case(month)
+        # deliveries â€” bars and drill rows always add up exactly.
+        # Overhead for the period. In month mode this is the month's bucket
+        # and its per-case rate, exactly as before. In range mode it is the
+        # sum of the buckets of every month the range touches. A DELIVERY is
+        # always allocated its OWN month's per-case rate (overhead_rate_for
+        # below) rather than the range's headline rate, so a multi-month
+        # breakdown still adds up to the paise â€” and for a single month the
+        # per-month rate IS the headline rate, so nothing changes there.
+        overhead_total = (
+            cogs.overhead_for_range(period["from"], period["to"])
+            if period["mode"] == "range"
+            else cogs.overhead_for_month(month)
+        )
+        overhead_per_case_month = (
+            cogs.overhead_per_case_range(period["from"], period["to"])
+            if period["mode"] == "range"
+            else cogs.overhead_per_case(month)
+        )
+        _rate_cache = {}
+
+        def overhead_rate_for(delivery):
+            key = cogs.month_key(delivery.date)
+            if key not in _rate_cache:
+                _rate_cache[key] = cogs.overhead_per_case(key)
+            return _rate_cache[key]
+
         month_deliveries = list(
             StockDelivery.objects.filter(
-                is_deleted=False, **month_filter
+                is_deleted=False, **period_filter
             ).select_related("client", "sku", "sku__print_cost")
         )
         dynamic = cogs.dynamic_costs_for(month_deliveries)
@@ -1421,6 +1576,14 @@ class DashboardView(APIView):
             row["cases"] += d.qty_cases
             row["revenue"] += revenue
             row["direct_cost"] += direct_cost
+            # Allocated with THIS delivery's own month rate (identical to the
+            # period rate in month mode, per-delivery in range mode). Kept
+            # unrounded here and rounded once per row below, so a single month
+            # still matches the old `cases x rate` figure exactly.
+            rate = overhead_rate_for(d)
+            row["overhead"] = row.get("overhead", Decimal("0")) + (
+                d.qty_cases * rate
+            )
             pair = per_client_sku.setdefault(
                 (d.client_id, d.sku_id),
                 {
@@ -1431,6 +1594,7 @@ class DashboardView(APIView):
                     "direct_cost": Decimal("0"),
                     "materials_cost": Decimal("0"),
                     "print_cost": Decimal("0"),
+                    "overhead": Decimal("0"),
                 },
             )
             pair["cases"] += d.qty_cases
@@ -1438,12 +1602,13 @@ class DashboardView(APIView):
             pair["direct_cost"] += direct_cost
             pair["materials_cost"] += costs["materials"]
             pair["print_cost"] += costs["print"]
+            pair["overhead"] += d.qty_cases * rate
 
         client_breakdown = []
         for client_id, row in per_client.items():
             # Overhead is a monthly bucket allocated per case sold (spec 6.3),
-            # so each client carries its own share of the month's overhead.
-            overhead = money(row["cases"] * overhead_per_case_month)
+            # so each client carries its own share of the period's overhead.
+            overhead = money(row["overhead"])
             client_breakdown.append(
                 {
                     "client_id": client_id,
@@ -1467,7 +1632,7 @@ class DashboardView(APIView):
         # - revenue chart tap -> SKUs delivered to one client (counts + the
         #   revenue that adds back up to that client's bar),
         # - profit chart tap -> profit per SKU, then the cost chain.
-        # Materials and print both come from the dynamic pass above — raw
+        # Materials and print both come from the dynamic pass above â€” raw
         # materials at TODAY's FIFO queue prices, print at the CURRENT print
         # config (no frozen costs), so they always add up to the row's direct
         # cost and move together when a price or config is edited.
@@ -1484,7 +1649,7 @@ class DashboardView(APIView):
                     "direct_cost": row["direct_cost"],
                     "materials_cost": row["materials_cost"],
                     "print_cost": row["print_cost"],
-                    "overhead": row["cases"] * overhead_per_case_month,
+                    "overhead": row["overhead"],
                 }
             )
 
@@ -1531,10 +1696,11 @@ class DashboardView(APIView):
             key=lambda r: (r["client"], r["sku"]),
         )
 
-        # Month overhead per category (feeds the profit drill-down cost chain).
+        # Period overhead per category (feeds the profit drill-down cost
+        # chain) â€” the sum across every month the period touches.
         overhead_categories = [
             {"category": r["category__name"], "amount": str(money(r["total"]))}
-            for r in MonthlyOverhead.objects.filter(month=month)
+            for r in MonthlyOverhead.objects.filter(month__in=months)
             .values("category__name")
             .annotate(total=Sum("amount"))
             .order_by("category__name")
@@ -1569,7 +1735,22 @@ class DashboardView(APIView):
         return Response(
             {
                 "month": month,
+                # Which period these figures cover. The UI uses it to label the
+                # summary card ("Oct, 2026" vs "1 Jan â†’ 31 Mar 2026") and to
+                # know that the month was ignored because dates were given.
+                "period": {
+                    "mode": period["mode"],
+                    "month": month,
+                    "from": (
+                        period["from"].isoformat() if period["from"] else None
+                    ),
+                    "to": period["to"].isoformat() if period["to"] else None,
+                },
                 "stock": materials,
+                # Orders pipeline for the Home screen's Pending / Ready to
+                # Deliver panels. Sent with the dashboard so Home needs one
+                # request per period instead of three.
+                "orders": _orders_payload(),
                 "stats": {
                     "cases_sold_per_sku": sold,
                     "client_breakdown": client_breakdown,
@@ -1596,7 +1777,7 @@ class ReportView(APIView):
     Reports/Stats (spec 4.7): per-SKU sold & inward quantities by
     day/week/month + rolling 30-day average. Query params:
       sku=<id> or sku=all (required), granularity=day|week|month, start, end
-    Only sold/inward stats — no P&L, GST, or exports in v1 (spec 9).
+    Only sold/inward stats â€” no P&L, GST, or exports in v1 (spec 9).
     """
 
     def get(self, request):
@@ -1730,6 +1911,518 @@ def _bucket_key(date_obj, granularity: str) -> str:
         iso = date_obj.isocalendar()
         return f"{iso.year}-W{iso.week:02d}"
     return date_obj.strftime("%Y-%m")
+
+
+# ---------------------------------------------------------------------------
+# App gate: password check + login-attempt audit (user request)
+# ---------------------------------------------------------------------------
+# 3 wrong passwords from one visitor in 300s restricts THAT visitor; 15 from
+# anyone in the same window restricts everybody (brute-force backstop).
+LOCKOUT_SECONDS = 300
+LOCKOUT_THRESHOLD = 3
+GLOBAL_LOCKOUT_THRESHOLD = 15
+GEO_TIMEOUT_SECONDS = 2.0
+
+# Best-effort geo cache, capped so a long-lived worker process cannot grow it
+# without bound. Keyed by IP â€” a repeat visitor resolves instantly and the
+# external service is not hammered by a lockout loop.
+_GEO_CACHE = {}
+_GEO_CACHE_MAX = 500
+
+_PRIVATE_PREFIXES = ("10.", "192.168.", "127.", "169.254.", "::1", "fc", "fd")
+
+
+def client_ip(request) -> str:
+    """
+    Best-effort visitor IP. Render/Netlify sit in front, so the real client
+    address arrives in X-Forwarded-For (left-most hop is the original caller);
+    REMOTE_ADDR is the fallback for direct/local requests.
+    """
+    forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip()[:64]
+    return (request.META.get("REMOTE_ADDR", "") or "")[:64]
+
+
+def geo_lookup(ip: str) -> dict:
+    """
+    Best-effort location for an IP via the free `ipwho.is` HTTPS API.
+
+    Hard rules: NEVER raises and NEVER blocks for long. A timeout, a DNS
+    failure or a malformed reply all degrade to an IP-only row with
+    geo_source="fallback" plus the error text, so the audit log explains WHY
+    the location is blank instead of silently losing it.
+    """
+    empty = {
+        "geo_country": "",
+        "geo_region": "",
+        "geo_city": "",
+        "geo_isp": "",
+        "geo_source": "fallback",
+        "geo_error": "",
+    }
+    if not ip or ip.startswith(_PRIVATE_PREFIXES):
+        return {
+            **empty,
+            "geo_source": "skipped",
+            "geo_error": "private or empty address",
+        }
+    if ip in _GEO_CACHE:
+        return dict(_GEO_CACHE[ip])
+
+    payload = dict(empty)
+    try:
+        url = f"https://ipwho.is/{ip}"
+        with urllib.request.urlopen(url, timeout=GEO_TIMEOUT_SECONDS) as resp:
+            body = json.loads(resp.read().decode("utf-8", "replace"))
+        if body.get("success") is False:
+            payload["geo_error"] = str(body.get("message") or "lookup refused")
+        else:
+            connection = body.get("connection") or {}
+            payload.update(
+                geo_country=str(body.get("country") or "")[:100],
+                geo_region=str(body.get("region") or "")[:150],
+                geo_city=str(body.get("city") or "")[:150],
+                geo_isp=str(connection.get("isp") or "")[:200],
+                geo_source="ok",
+            )
+    except Exception as exc:  # noqa: BLE001 - a geo failure must never break a login
+        payload["geo_error"] = f"{type(exc).__name__}: {exc}"[:500]
+
+    if len(_GEO_CACHE) < _GEO_CACHE_MAX:
+        _GEO_CACHE[ip] = payload
+    return dict(payload)
+
+
+def _failure_count(ip=None, since=None):
+    """
+    Wrong-password attempts inside the sliding window. `locked_out=True` rows
+    are excluded: they were refused before a password was ever compared, so
+    counting them would let one visitor extend their own lockout forever.
+    """
+    qs = LoginAttempt.objects.filter(
+        timestamp__gte=since, success=False, locked_out=False
+    )
+    if ip is not None:
+        qs = qs.filter(ip=ip)
+    return qs.count()
+
+
+def _retry_after(ip, since):
+    """
+    Seconds until this visitor's oldest in-window failure ages out of the
+    sliding window. Bounded by LOCKOUT_SECONDS so the answer is never
+    "forever", and never 0 (they get at least one second).
+    """
+    oldest = (
+        LoginAttempt.objects.filter(timestamp__gte=since, success=False, ip=ip)
+        .order_by("timestamp")
+        .values_list("timestamp", flat=True)
+        .first()
+    )
+    if not oldest:
+        return LOCKOUT_SECONDS
+    elapsed = (timezone.now() - oldest).total_seconds()
+    return max(1, int(LOCKOUT_SECONDS - elapsed))
+
+
+class PasswordView(APIView):
+    """
+    The app's front-door password check (user request: password "asdfghjkl",
+    no way to change it from the UI, 3+ wrong attempts restrict that visitor
+    for 300 seconds).
+
+    Every attempt is stored in `LoginAttempt` with the visitor's IP, user
+    agent and best-effort location â€” successes, failures and refused-while-
+    locked attempts alike â€” readable at /loginattempts.
+
+    Restriction is PER IP (a mistyping employee cannot lock out everybody),
+    with a global backstop at 15 failures so a distributed brute force is
+    still slowed down.
+
+    NOTE: this guards the BROWSER UI only. The rest of the API has no
+    authentication, so this is a soft gate plus an audit trail, not a
+    security boundary.
+    """
+
+    authentication_classes = []
+    permission_classes = []
+
+    def post(self, request):
+        password = str(request.data.get("password") or "")
+        ip = client_ip(request)
+        since = timezone.now() - timedelta(seconds=LOCKOUT_SECONDS)
+        user_agent = request.META.get("HTTP_USER_AGENT", "")[:500]
+        forwarded = request.META.get("HTTP_X_FORWARDED_FOR", "")[:300]
+        path = str(request.data.get("path") or "")[:200]
+
+        ip_fails = _failure_count(ip, since)
+        global_fails = _failure_count(None, since)
+
+        if ip_fails >= LOCKOUT_THRESHOLD or global_fails >= GLOBAL_LOCKOUT_THRESHOLD:
+            retry_after = _retry_after(ip, since)
+            # Record the refused attempt too â€” a blocked visitor trying again
+            # is exactly what the audit log should show.
+            LoginAttempt.objects.create(
+                ip=ip,
+                user_agent=user_agent,
+                x_forwarded_for=forwarded,
+                success=False,
+                locked_out=True,
+                path=path,
+                **geo_lookup(ip),
+            )
+            return Response(
+                {
+                    "ok": False,
+                    "locked_out": True,
+                    "retry_after": retry_after,
+                    "detail": (
+                        f"Access restricted after {LOCKOUT_THRESHOLD}+ wrong "
+                        f"attempts. Try again in {retry_after} seconds."
+                    ),
+                },
+                status=status.HTTP_429_TOO_MANY_REQUESTS,
+            )
+
+        ok = password == settings.LOGIN_PASSWORD
+        LoginAttempt.objects.create(
+            ip=ip,
+            user_agent=user_agent,
+            x_forwarded_for=forwarded,
+            success=ok,
+            locked_out=False,
+            path=path,
+            **geo_lookup(ip),
+        )
+        if not ok:
+            remaining = max(0, LOCKOUT_THRESHOLD - (ip_fails + 1))
+            return Response(
+                {
+                    "ok": False,
+                    "locked_out": False,
+                    "attempts_remaining": remaining,
+                    "detail": "Wrong password.",
+                },
+                status=status.HTTP_401_UNAUTHORIZED,
+            )
+        return Response({"ok": True, "locked_out": False})
+
+
+class ClientOrderViewSet(viewsets.ModelViewSet):
+    """
+    Orders pipeline (user request):
+
+        Enter Order        -> PENDING    (reserves nothing)
+        Mark complete      -> COMPLETED  (stock in hand -> Ready to Deliver)
+        Mark delivered     -> DELIVERED  (a real StockDelivery per line)
+        Delete a delivery  -> the line goes back to Ready to Deliver
+        Move back to Pending -> PENDING  (Ready to Deliver -> stock in hand)
+
+    The stock figures the whole flow depends on are DERIVED, never stored:
+    `cogs.committed_map` sums the requirements of every COMPLETED/DELIVERED
+    line that has no delivery yet, and `cogs.available_map` subtracts that
+    from the live batch balance. So every transition above is correct by
+    construction and cannot desync (see cogs.committed_map's docstring).
+
+    Two different stock questions are asked along the way, and keeping them
+    apart is what makes the numbers add up:
+      - completing an order checks AVAILABLE stock (physical âˆ’ committed),
+        excluding its own lines;
+      - delivering it checks PHYSICAL stock, because FIFO consumes batches and
+        the order's own commitment is exactly what it is about to consume.
+    """
+
+    # The Home and StatusUpdate screens render every order at once, so the
+    # default page wrapper would hide rows behind a `results` key.
+    pagination_class = None
+
+    def get_serializer_class(self):
+        if self.action in ("create", "update", "partial_update"):
+            return ClientOrderWriteSerializer
+        return ClientOrderSerializer
+
+    def get_queryset(self):
+        qs = ClientOrder.objects.select_related("client").prefetch_related(
+            "items__sku", "items__delivery"
+        )
+        status_value = self.request.query_params.get("status")
+        if status_value:
+            qs = qs.filter(status=status_value)
+        client_id = self.request.query_params.get("client")
+        if client_id:
+            qs = qs.filter(client_id=client_id)
+        return qs.filter(is_deleted=False)
+
+    @staticmethod
+    def _order_payload(order):
+        return ClientOrderSerializer(order).data
+
+    def create(self, request, *args, **kwargs):
+        serializer = ClientOrderWriteSerializer(data=request.data)
+        serializer.is_valid(raise_exception=True)
+        order = serializer.save()
+        return Response(
+            self._order_payload(order), status=status.HTTP_201_CREATED
+        )
+
+    def update(self, request, *args, **kwargs):
+        order = self.get_object()
+        if order.status == ClientOrder.DELIVERED:
+            return Response(
+                {
+                    "detail": "This order has been delivered and can no longer "
+                    "be edited."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        serializer = ClientOrderWriteSerializer(order, data=request.data)
+        serializer.is_valid(raise_exception=True)
+        order = serializer.save()
+        return Response(self._order_payload(order))
+
+    def partial_update(self, request, *args, **kwargs):
+        # The write serializer replaces the line set wholesale, so PATCH would
+        # silently drop lines that were not resent. Editing is all-or-nothing.
+        return self.update(request, *args, **kwargs)
+
+    def destroy(self, request, *args, **kwargs):
+        order = self.get_object()
+        if order.status == ClientOrder.DELIVERED:
+            return Response(
+                {
+                    "detail": "This order has deliveries against it â€” delete "
+                    "those from the deliveries list first."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        # Soft delete: the row and its lines stay in the audit trail (spec 3.7).
+        order.is_deleted = True
+        order.save(skip_audit=True)
+        return Response(status=status.HTTP_204_NO_CONTENT)
+
+
+    @action(detail=True, methods=["post"])
+    def deliver(self, request, pk=None):
+        """
+        Deliver the ready lines: one StockDelivery per line, created through
+        the SAME `cogs.create_delivery` the Add Delivery screen uses, so FIFO
+        consumption, the ledger entry, the COGS snapshots and the shortfall
+        check behave identically.
+
+        All-or-nothing: a shortfall on any line rolls the whole batch back, so
+        an order is never left half-delivered.
+        """
+        order = self.get_object()
+        if order.status == ClientOrder.DELIVERED:
+            return Response(
+                {"detail": "This order has already been delivered."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if order.status == ClientOrder.PENDING:
+            return Response(
+                {
+                    "detail": "Move this order to Ready to Deliver before "
+                    "delivering it."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        pending = order.undelivered_items
+        if not pending:
+            return Response(
+                {"detail": "Nothing left to deliver on this order."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        raw_date = request.data.get("date")
+        delivery_date = None
+        if raw_date:
+            delivery_date = parse_date(str(raw_date))
+            if delivery_date is None:
+                return Response(
+                    {"detail": "Delivery date is not a valid date."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+
+        force = bool(request.data.get("force"))
+        note = request.data.get("note") or f"Order #{order.id}"
+
+        try:
+            with transaction.atomic():
+                made = []
+                for item in pending:
+                    delivery, _result = create_delivery(
+                        client=order.client,
+                        sku=item.sku,
+                        qty_cases=item.qty_cases,
+                        selling_price_per_case=item.selling_price_per_case,
+                        delivery_date=delivery_date,
+                        note=note,
+                        force=force,
+                    )
+                    item.delivery = delivery
+                    item.save()
+                    made.append(delivery)
+                order.delivered_at = timezone.now()
+                order.recompute_status()
+        except DeliveryShortfall as exc:
+            # Nothing was committed: the atomic block rolled every delivery and
+            # every ledger entry back, so the order is still COMPLETED. The
+            # memo must be dropped too — its signals fired inside the rolled
+            # back transaction (a stale generation survives it), so without
+            # this the stock read below would still see the undone consumption.
+            perfcache.invalidate()
+            return Response(
+                {
+                    "detail": "Not enough stock to deliver this order.",
+                    "shortages": exc.shortages,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+        except ValueError as exc:
+            return Response(
+                {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
+            )
+
+        return Response(
+            {
+                "order": self._order_payload(order),
+                "deliveries": [
+                    {
+                        "id": d.id,
+                        "sku": d.sku.description,
+                        "qty_cases": dstr(d.qty_cases),
+                        "date": d.date.isoformat(),
+                        "stock_shortfall_flag": d.stock_shortfall_flag,
+                    }
+                    for d in made
+                ],
+            }
+        )
+
+    # -- transitions ------------------------------------------------------
+    @action(detail=True, methods=["post"])
+    def complete(self, request, pk=None):
+        """
+        Move the order to Ready to Deliver: its material leaves Stock in Hand
+        and appears in the Ready bucket.
+
+        Judged against AVAILABLE stock (physical minus what other orders have
+        already committed) and excluding this order's own lines, so an order
+        can never be blocked by itself. `force=true` proceeds anyway â€” the
+        resulting negative available figure is what the UI warns about.
+        """
+        order = self.get_object()
+        if order.status != ClientOrder.PENDING:
+            return Response(
+                {
+                    "detail": "Only a pending order can be moved to Ready to "
+                    "Deliver."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        lines = [(i.sku, i.qty_cases) for i in order.items.all()]
+        if not lines:
+            return Response(
+                {"detail": "This order has no items."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        exclude = list(order.items.values_list("id", flat=True))
+        shortages = cogs.check_shortfall_many(
+            order.client, lines, available_basis=True, exclude_item_ids=exclude
+        )
+        if shortages and not request.data.get("force"):
+            return Response(
+                {
+                    "detail": "Not enough free stock for this order.",
+                    "shortages": shortages,
+                },
+                status=status.HTTP_409_CONFLICT,
+            )
+
+        order.completed_at = timezone.now()
+        order.recompute_status()
+        return Response(self._order_payload(order))
+
+    @action(detail=True, methods=["post"])
+    def reopen(self, request, pk=None):
+        """
+        Move a Ready-to-Deliver order back to Pending: its material returns to
+        Stock in Hand. Refused once anything has been delivered, because that
+        stock has physically left.
+        """
+        order = self.get_object()
+        if order.status == ClientOrder.DELIVERED:
+            return Response(
+                {"detail": "This order has deliveries against it."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if order.status != ClientOrder.COMPLETED:
+            return Response(
+                {"detail": "This order is not in Ready to Deliver."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        order.completed_at = None
+        order.status = ClientOrder.PENDING
+        order.save(skip_audit=True)
+        return Response(self._order_payload(order))
+
+
+    @action(detail=False, methods=["get"])
+    def summary(self, request):
+        """
+        One round trip for the StatusUpdate and Add Delivery screens: the
+        pending orders, the Ready-to-Deliver bucket, and the per-material
+        commitment behind them. Same payload the dashboard sends Home.
+        """
+        return Response(_orders_payload())
+
+
+class LoginAttemptViewSet(viewsets.ReadOnlyModelViewSet):
+    """
+    Read-only audit trail behind the app gate. Attempts are written by
+    PasswordView only â€” no create/edit/delete is exposed here. Newest first,
+    with optional `?result=success|failed` and `?ip=` filters for the
+    /loginattempts screen.
+    """
+
+    queryset = LoginAttempt.objects.all()
+    pagination_class = None
+
+    def get_queryset(self):
+        qs = LoginAttempt.objects.all()
+        result = self.request.query_params.get("result")
+        if result == "success":
+            qs = qs.filter(success=True)
+        elif result == "failed":
+            qs = qs.filter(success=False)
+        ip = self.request.query_params.get("ip")
+        if ip:
+            qs = qs.filter(ip=ip)
+        return qs
+
+    def list(self, request, *args, **kwargs):
+        rows = [
+            {
+                "id": r.id,
+                "timestamp": r.timestamp.isoformat(),
+                "ip": r.ip,
+                "user_agent": r.user_agent,
+                "x_forwarded_for": r.x_forwarded_for,
+                "success": r.success,
+                "locked_out": r.locked_out,
+                "geo_country": r.geo_country,
+                "geo_region": r.geo_region,
+                "geo_city": r.geo_city,
+                "geo_isp": r.geo_isp,
+                "geo_source": r.geo_source,
+                "geo_error": r.geo_error,
+                "path": r.path,
+            }
+            for r in self.get_queryset()[:500]
+        ]
+        return Response(rows)
 
 
 

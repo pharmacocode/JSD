@@ -1,17 +1,22 @@
 """DRF serializers for the JSD Group API."""
 
+from decimal import Decimal, InvalidOperation
+
+from django.utils import timezone
 from rest_framework import serializers
 
 from .cogs import settle_deficit
 from .models import (
     Client,
     ClientLedgerEntry,
+    ClientOrder,
     ClientSKUPrice,
     Employee,
     EmployeePayment,
     Material,
     MaterialBatch,
     MonthlyOverhead,
+    OrderItem,
     OverheadCategory,
     SKU,
     SKUMaterialRequirement,
@@ -20,6 +25,7 @@ from .models import (
     StockDelivery,
     Vendor,
     VendorPayment,
+    money,
 )
 
 
@@ -440,6 +446,238 @@ class MonthlyOverheadSerializer(serializers.ModelSerializer):
             "amount",
         ]
 
+class OrderItemSerializer(serializers.ModelSerializer):
+    sku_description = serializers.CharField(source="sku.description", read_only=True)
+    line_amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, read_only=True
+    )
+    delivery_date = serializers.DateField(
+        source="delivery.date", read_only=True, default=None
+    )
+
+    class Meta:
+        model = OrderItem
+        fields = [
+            "id",
+            "sku",
+            "sku_description",
+            "qty_cases",
+            "selling_price_per_case",
+            "line_amount",
+            "delivery",
+            "delivery_date",
+        ]
+
+    def validate(self, attrs):
+        qty = attrs.get("qty_cases", getattr(self.instance, "qty_cases", None))
+        if qty is not None and qty <= 0:
+            raise serializers.ValidationError(
+                {"qty_cases": "Quantity must be greater than zero."}
+            )
+        price = attrs.get(
+            "selling_price_per_case",
+            getattr(self.instance, "selling_price_per_case", None),
+        )
+        if price is not None and price <= 0:
+            raise serializers.ValidationError(
+                {"selling_price_per_case": "Price must be greater than zero."}
+            )
+        return attrs
+
+
+class ClientOrderSerializer(serializers.ModelSerializer):
+    """
+    Read shape: the order with its lines nested, plus the totals the Home /
+    StatusUpdate screens show.
+
+    `status` is derived from the lines (see ClientOrder.recompute_status), so
+    it is read-only here — an order reaches DELIVERED by its lines getting
+    deliveries, not by someone typing a status.
+    """
+
+    client_name = serializers.CharField(source="client.name", read_only=True)
+    items = OrderItemSerializer(many=True, read_only=True)
+    total_qty = serializers.DecimalField(
+        max_digits=14, decimal_places=4, read_only=True
+    )
+    total_amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, read_only=True
+    )
+    status_display = serializers.CharField(
+        source="get_status_display", read_only=True
+    )
+
+    class Meta:
+        model = ClientOrder
+        fields = [
+            "id",
+            "client",
+            "client_name",
+            "order_date",
+            "status",
+            "status_display",
+            "completed_at",
+            "delivered_at",
+            "notes",
+            "items",
+            "total_qty",
+            "total_amount",
+            "is_deleted",
+            "created_at",
+        ]
+        read_only_fields = ["status", "completed_at", "delivered_at", "is_deleted"]
+
+
+class ClientOrderWriteSerializer(serializers.Serializer):
+    """
+    Write shape for creating and editing an order. The line set is REPLACED
+    wholesale on edit (same contract as the multi-line delivery endpoint), so
+    a partial edit can never leave a stale line behind.
+
+    Prices are optional per line: blank falls back to the client's configured
+    ClientSKUPrice, which is the "pre-filled, editable" behaviour the Enter
+    Order modal needs.
+    """
+
+    client = serializers.PrimaryKeyRelatedField(queryset=Client.objects.all())
+    order_date = serializers.DateField(required=False)
+    notes = serializers.CharField(required=False, allow_blank=True, default="")
+    items = serializers.ListField(allow_empty=False)
+
+    def validate_items(self, lines):
+        cleaned = []
+        seen = set()
+        for line in lines:
+            sku_id = line.get("sku")
+            if sku_id in seen:
+                raise serializers.ValidationError(
+                    f"SKU {sku_id} appears twice on this order — combine the "
+                    "quantities into one line."
+                )
+            seen.add(sku_id)
+            try:
+                qty = Decimal(str(line.get("qty_cases")))
+            except (TypeError, InvalidOperation):
+                raise serializers.ValidationError(
+                    f"Quantity is required for SKU {sku_id}."
+                )
+            if qty <= 0:
+                raise serializers.ValidationError(
+                    f"Quantity must be greater than zero for SKU {sku_id}."
+                )
+            raw_price = line.get("selling_price_per_case")
+            price = None
+            if raw_price not in (None, ""):
+                try:
+                    price = Decimal(str(raw_price))
+                except (TypeError, InvalidOperation):
+                    raise serializers.ValidationError(
+                        f"Price is not a number for SKU {sku_id}."
+                    )
+                if price <= 0:
+                    raise serializers.ValidationError(
+                        f"Price must be greater than zero for SKU {sku_id}."
+                    )
+            cleaned.append({"sku_id": sku_id, "qty_cases": qty, "price": price})
+        return cleaned
+
+    def _price_for(self, client, sku_id):
+        """
+        The order-time price: the client's configured ClientSKUPrice — the same
+        source the Enter Order modal pre-fills from. There is deliberately no
+        SKU-level fallback: an order is a promise of money, so a pair with no
+        agreed price must be filled in rather than guessed at.
+        """
+        csp = ClientSKUPrice.objects.filter(client=client, sku_id=sku_id).first()
+        if csp is not None:
+            return money(csp.selling_price_per_case)
+        return None
+
+    def _resolve_prices(self, client, lines):
+        """
+        Blank prices fall back to the configured one. Raises if neither is
+        available, so an order is never saved with a zero/None price that
+        would silently zero the client's ledger when delivered.
+        """
+        resolved = []
+        for line in lines:
+            price = line["price"] or self._price_for(client, line["sku_id"])
+            if price is None:
+                raise serializers.ValidationError(
+                    {
+                        "items": "No selling price configured for one of these "
+                        "SKUs — enter a price."
+                    }
+                )
+            resolved.append({**line, "price": price})
+        return resolved
+
+    def create(self, validated_data):
+        from django.db import transaction
+
+        lines = self._resolve_prices(
+            validated_data["client"], validated_data["items"]
+        )
+        with transaction.atomic():
+            order = ClientOrder.objects.create(
+                client=validated_data["client"],
+                order_date=validated_data.get("order_date")
+                or timezone.now().date(),
+                notes=validated_data.get("notes", ""),
+            )
+            for line in lines:
+                OrderItem.objects.create(
+                    order=order,
+                    sku_id=line["sku_id"],
+                    qty_cases=line["qty_cases"],
+                    selling_price_per_case=line["price"],
+                )
+            order.recompute_status()
+        return order
+
+    def update(self, instance, validated_data):
+        from django.db import transaction
+
+        lines = self._resolve_prices(
+            validated_data.get("client", instance.client),
+            validated_data["items"],
+        )
+        with transaction.atomic():
+            instance.client = validated_data.get("client", instance.client)
+            if "order_date" in validated_data:
+                instance.order_date = validated_data["order_date"]
+            instance.notes = validated_data.get("notes", instance.notes)
+            instance.save()
+
+            # Replace the undelivered line set. A line that already produced a
+            # delivery keeps its link — that stock really left the warehouse,
+            # so an edit must not orphan its delivery.
+            delivered = {
+                i.sku_id: i
+                for i in instance.items.filter(delivery__isnull=False)
+            }
+            instance.items.filter(delivery__isnull=True).delete()
+            for line in lines:
+                existing = delivered.get(line["sku_id"])
+                if existing is not None:
+                    existing.qty_cases = line["qty_cases"]
+                    existing.selling_price_per_case = line["price"]
+                    existing.save()
+                    continue
+                OrderItem.objects.create(
+                    order=instance,
+                    sku_id=line["sku_id"],
+                    qty_cases=line["qty_cases"],
+                    selling_price_per_case=line["price"],
+                )
+            instance.recompute_status()
+        return instance
+
+
+class EmployeeSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = Employee
+        fields = ["id", "name", "role", "monthly_pay", "active", "created_at"]
 
 class EmployeeSerializer(serializers.ModelSerializer):
     class Meta:
