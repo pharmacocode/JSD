@@ -21,17 +21,17 @@ jobs:
 
       # NOTE: If your package.json is inside a subfolder, change 'jsd-group-frontend' to match your folder name
       - name: Install dependencies
-        working-directory: ./jsd/frontend
+        working-directory: ./frontend
         run: npm ci
 
       - name: Build project
-        working-directory: ./jsd/frontend
+        working-directory: ./frontend
         run: npm run build
 
       - name: Deploy to Netlify
         uses: nwtgck/actions-netlify@v3.0
         with:
-          publish-dir: './jsd/frontend/dist' # Points to the build output inside your frontend folder
+          publish-dir: './frontend/dist' # Points to the build output inside your frontend folder
           production-deploy: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
         env:
