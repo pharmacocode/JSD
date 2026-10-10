@@ -19,19 +19,20 @@ jobs:
           node-version: 20
           cache: 'npm'
 
-      # NOTE: If your package.json is inside a subfolder, change 'jsd-group-frontend' to match your folder name
+      # NOTE: package.json and package-lock.json live in ./frontend, so run
+      # npm ci there instead of at the repo root.
       - name: Install dependencies
-        working-directory: ./JSD/frontend
+        working-directory: ./frontend
         run: npm ci
 
       - name: Build project
-        working-directory: ./JSD/frontend
+        working-directory: ./frontend
         run: npm run build
 
       - name: Deploy to Netlify
         uses: nwtgck/actions-netlify@v3.0
         with:
-          publish-dir: './JSD/frontend/dist' # Points to the build output inside your frontend folder
+          publish-dir: './frontend/dist' # matches [build] publish in frontend/netlify.toml
           production-deploy: true
           github-token: ${{ secrets.GITHUB_TOKEN }}
         env:
