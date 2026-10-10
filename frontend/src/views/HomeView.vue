@@ -11,10 +11,11 @@ import { ref, watch, onMounted, onActivated, computed } from 'vue'
 import { useRouter } from 'vue-router'
 import { api } from '@/api'
 import { useUiStore } from '@/stores/ui'
-import { money, num, monthLong } from '@/utils/format'
+import { money, num, monthLong, rangeLong } from '@/utils/format'
 import MonthPicker from '@/components/MonthPicker.vue'
 import ChartCanvas from '@/components/ChartCanvas.vue'
 import EmptyState from '@/components/EmptyState.vue'
+import OrderDialog from '@/components/OrderDialog.vue'
 
 const router = useRouter()
 const ui = useUiStore()
@@ -33,9 +34,10 @@ const inwardPanelOpen = ref(false)
 const inwardDraft = ref({}) // batch id -> editable working copy
 const inwardSaving = ref(null)
 
-// Delivery register: chronological rows straight from the API, plus the totals
-// shown in the panel header.
-const deliveryRows = computed(() => stats.value.deliveries || [])
+// Delivery register: recent on top (user request). The API returns the rows
+// oldest-first with entry order as the tie-break, so the client just reverses
+// them — the totals above do not depend on order.
+const deliveryRows = computed(() => [...(stats.value.deliveries || [])].reverse())
 
 const deliveryTotals = computed(() => {
   const rows = deliveryRows.value
@@ -46,10 +48,23 @@ const deliveryTotals = computed(() => {
   }
 })
 
+// Query params for the selected period (user request): a complete from/to
+// range drives the dashboard and the month is ignored entirely; anything else
+// falls back to ?month=, so the month picker keeps working exactly as before.
+function periodParams() {
+  if (ui.rangeActive) return { from: ui.rangeFrom, to: ui.rangeTo }
+  return { month: ui.month }
+}
+
+// Heading for whatever period is selected — 'Oct, 2026' or '1 Jan 2026 → …'.
+const periodLabel = computed(() =>
+  ui.rangeActive ? rangeLong(ui.rangeFrom, ui.rangeTo) : monthLong(ui.month)
+)
+
 async function load() {
-  // Perf plan 2.9: the dashboard is cached per month, so coming back to Home
+  // Perf plan 2.9: the dashboard is cached per period, so coming back to Home
   // from another screen paints instantly and only refreshes in the background.
-  const cached = ui.getDashboard(ui.month)
+  const cached = ui.getDashboard()
   if (cached) {
     data.value = cached
     loading.value = false
@@ -62,45 +77,50 @@ async function load() {
   await refresh()
 }
 
-// One in-flight dashboard request per month: a <keep-alive>d view fires
+// One in-flight dashboard request per period: a <keep-alive>d view fires
 // onMounted *and* onActivated on its first mount (perf plan 2.10), so without
-// this the dashboard would be fetched twice for the same month.
+// this the dashboard would be fetched twice for the same period.
 const inflight = {}
 async function refresh() {
-  const month = ui.month
-  if (inflight[month]) return inflight[month]
+  const key = ui.periodKey
+  const params = periodParams()
+  if (inflight[key]) return inflight[key]
   const req = (async () => {
     try {
-      const payload = await api.get('/dashboard/', { month })
-      // Ignore a response that lands after the month changed again.
-      if (month !== ui.month) return
+      const payload = await api.get('/dashboard/', params)
+      // Ignore a response that lands after the period changed again.
+      if (key !== ui.periodKey) return
       data.value = payload
-      ui.setDashboard(month, payload)
+      ui.setDashboard(key, payload)
     } catch (e) {
       error.value = e.message
     } finally {
       loading.value = false
-      delete inflight[month]
+      delete inflight[key]
     }
   })()
-  inflight[month] = req
+  inflight[key] = req
   return req
 }
 
-onMounted(load)
+onMounted(loadAll)
 // Revived from the <keep-alive> cache: repaint from the cached dashboard and
 // revalidate in the background so Home is never stale after a delivery.
-onActivated(load)
-watch(() => ui.month, load)
+onActivated(loadAll)
+// periodKey covers the month, the mode and both dates in one key, so this
+// single watcher fires for every way the period can change.
+watch(() => ui.periodKey, loadAll)
 
 const stats = computed(() => data.value.stats || {})
 const stock = computed(() => data.value.stock || [])
 const belowAlert = computed(() => stock.value.filter((s) => s.below_alert))
 const aboveAlert = computed(() => stock.value.filter((s) => !s.below_alert))
-// Negative stock = delivered beyond what was in hand (user request): counted
+// Negative stock = promised beyond what was in hand (user request): counted
 // separately so the user Stock-Adjusts or backdates an arrival to clear it.
+// Measured on AVAILABLE, matching the tiles and the backend's alert flag, so
+// the badge and the red tiles always count the same materials.
 const negativeStock = computed(() =>
-  stock.value.filter((s) => Number(s.stock_in_hand) < 0)
+  stock.value.filter((s) => Number(s.available) < 0)
 )
 
 // The profit tile follows the chart toggle, so tile and bars always agree.
@@ -220,7 +240,7 @@ function onProfitDrillSelect(index) {
 
 // Drill-downs belong to one metric and one month — clear them when either
 // changes so a stale selection can never point at the wrong rows.
-watch([metric, () => ui.month], () => {
+watch([metric, () => ui.periodKey], () => {
   drillSku.value = null
   drillClient.value = null
   drillProfitSku.value = null
@@ -236,7 +256,7 @@ const casesDrill = computed(() => {
   const totalCases = rows.reduce((s, r) => s + Number(r.cases), 0)
   return {
     title: `Clients served — ${rows[0].sku}`,
-    subtitle: `${monthLong(ui.month)} · ${num(totalCases, 0)} cases sold`,
+    subtitle: `${periodLabel.value} · ${num(totalCases, 0)} cases sold`,
     labels: rows.map((r) => r.client),
     data: rows.map((r) => Number(r.cases)),
     label: 'Cases',
@@ -262,7 +282,7 @@ const revenueDrill = computed(() => {
   if (!rows.length) return null
   return {
     title: `SKUs delivered — ${bar.client}`,
-    subtitle: `${monthLong(ui.month)} · case counts, revenue adds up to the bar`,
+    subtitle: `${periodLabel.value} · case counts, revenue adds up to the bar`,
     labels: rows.map((r) => r.sku),
     data: rows.map((r) => Number(r.cases)),
     label: 'Cases',
@@ -281,7 +301,7 @@ const profitDrill = computed(() => {
   if (!rows.length) return null
   return {
     title: `Profit per SKU — ${bar.client}`,
-    subtitle: `${monthLong(ui.month)} · ${
+    subtitle: `${periodLabel.value} · ${
       includeOverhead.value ? 'after' : 'before'
     } overhead · tap a bar for the cost breakup`,
     labels: rows.map((r) => r.sku),
@@ -459,6 +479,74 @@ async function deleteItem(item) {
     inwardSaving.value = null
   }
 }
+
+// ---------------------------------------------------------------------------
+// Orders pipeline (user request)
+// ---------------------------------------------------------------------------
+// One endpoint feeds both panels: /orders/summary/ returns the pending orders,
+// the Ready to Deliver bucket and the per-material commitment behind it, so the
+// two collapsible panels never disagree about the same stock.
+const pendingOrders = ref([])
+const readyOrders = ref([])
+const commitment = ref([])
+const pendingExpanded = ref(false)
+const readyExpanded = ref(false)
+const orderDialog = ref(false)
+const editingOrder = ref(null) // null = new order, otherwise the order to edit
+
+const pendingCount = computed(() => pendingOrders.value.length)
+const readyCount = computed(() => readyOrders.value.length)
+
+async function loadOrders() {
+  try {
+    const data = await api.get('/orders/summary/')
+    pendingOrders.value = data.pending || []
+    readyOrders.value = data.ready || []
+    commitment.value = data.commitment || []
+  } catch (e) {
+    error.value = e.message
+  }
+}
+
+// The order panels refresh with the dashboard: commitment, the stock tiles and
+// the two panels then always describe the same state of the warehouse.
+const _load = load
+async function loadAll() {
+  await _load()
+  await loadOrders()
+}
+
+function openOrder(order) {
+  editingOrder.value = order
+  orderDialog.value = true
+}
+
+function onOrderSaved() {
+  // Commitment changed, so the dashboard's stock tiles (which show available)
+  // and both order panels have to be re-read.
+  loadAll()
+}
+
+function dateShort(iso) {
+  if (!iso) return ''
+  const d = new Date(`${iso}T00:00:00`)
+  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
+}
+
+onMounted(loadAll)
+onActivated(loadAll)
+
+// Enter Order / edit order modal. One dialog for both, as the lines are
+// captured identically — editing simply starts from the saved order.
+const closeOrderDialog = () => {
+  orderDialog.value = false
+  editingOrder.value = null
+}
+
+const onOrderClosed = () => {
+  closeOrderDialog()
+  onOrderSaved()
+}
 </script>
 
 <template>
@@ -489,13 +577,26 @@ async function deleteItem(item) {
       >
         Enter Arrived Stock
       </v-btn>
+      <v-btn
+        color="info"
+        size="large"
+        variant="tonal"
+        prepend-icon="mdi-clipboard-text-outline"
+        class="flex-grow-1"
+        style="min-width: 190px"
+        @click="orderDialog = true"
+      >
+        Enter Order
+      </v-btn>
     </div>
 
     <v-alert v-if="error" type="error" class="mb-4" density="compact">
       {{ error }} — check the API connection.
     </v-alert>
 
-    <MonthPicker />
+    <!-- allow-range: the Home dashboard can also be driven by an explicit
+         from/to range instead of the month (user request). -->
+    <MonthPicker allow-range />
 
     <!-- Stock in Hand: the low / healthy summary always shows; clicking the
          header expands the per-material detail (user request). -->
@@ -548,49 +649,179 @@ async function deleteItem(item) {
             action="Open MVP Master"
             @action="router.push('/masters/materials')"
           />
-          <v-list v-else density="compact">
-            <v-list-item
+          <div v-else class="stock-tiles">
+            <div
               v-for="s in stock"
               :key="s.id"
-              :to="`/masters/materials/${s.id}`"
-              :title="s.name"
-              :subtitle="s.client_name || undefined"
+              class="stock-tile"
+              :class="s.below_alert || Number(s.available) < 0 ? 'is-low' : 'is-ok'"
+              role="link"
+              tabindex="0"
+              @click="router.push(`/masters/materials/${s.id}`)"
+              @keyup.enter="router.push(`/masters/materials/${s.id}`)"
             >
-              <template #append>
-                <!-- Number only, coloured by state (user request): green at or
-                     above the alert quantity, red below it or negative. No unit
-                     word, no LOW/SHORT chip, no alert-qty metadata — the colour
-                     carries the meaning and the row stays readable on a phone. -->
-                <v-chip
-                  :color="s.below_alert || Number(s.stock_in_hand) < 0 ? 'error' : 'success'"
-                  size="small"
-                  variant="flat"
-                  class="font-weight-bold"
-                >
-                  {{ num(s.stock_in_hand) }}
-                </v-chip>
-                <v-chip
-                  v-if="s.has_unrecorded_shortfall"
-                  color="warning"
-                  size="x-small"
-                  variant="flat"
-                  class="ml-1"
-                  :title="`Delivered ${num(s.demand)} but only ${num(s.booked)} booked`"
-                >
-                  −{{ num(s.unrecorded_shortfall) }}
-                </v-chip>
-              </template>
-            </v-list-item>
-          </v-list>
+              <div class="stock-tile__name" :title="s.name">{{ s.name }}</div>
+              <div class="stock-tile__qty">
+                {{ num(s.available) }}
+                <span v-if="s.unit" class="stock-tile__unit">{{ s.unit }}</span>
+              </div>
+              <div v-if="s.client_name" class="stock-tile__meta">
+                {{ s.client_name }}
+              </div>
+              <div v-if="Number(s.committed) > 0" class="stock-tile__committed">
+                {{ num(s.committed) }} on orders
+              </div>
+              <div
+                v-if="s.has_unrecorded_shortfall"
+                class="stock-tile__committed"
+                :title="`Delivered ${num(s.demand)} but only ${num(s.booked)} booked`"
+              >
+                {{ num(s.unrecorded_shortfall) }} unbooked
+              </div>
+            </div>
+          </div>
         </div>
       </v-expand-transition>
     </v-card>
+
+    <!-- Pending orders: orders logged at Enter Order that have not yet been
+         moved to Ready to Deliver. Collapsible like Stock in Hand, with a
+         yellow count badge in the header (user request). Tapping a row opens
+         the order for editing. -->
+    <v-card v-if="pendingCount" class="mb-4">
+      <v-card-item class="py-3" @click="pendingExpanded = !pendingExpanded">
+        <div class="d-flex align-center ga-3">
+          <v-chip color="warning" variant="flat" size="small" class="font-weight-bold">
+            {{ pendingCount }}
+          </v-chip>
+          <span class="text-uppercase font-weight-bold text-medium-emphasis">
+            Pending Orders
+          </span>
+          <v-spacer />
+          <v-btn
+            variant="text"
+            size="small"
+            color="primary"
+            @click.stop="router.push('/statusupdate')"
+          >
+            Open status update
+          </v-btn>
+          <v-icon>{{ pendingExpanded ? "mdi-chevron-up" : "mdi-chevron-down" }}</v-icon>
+        </div>
+      </v-card-item>
+      <v-expand-transition>
+        <div v-show="pendingExpanded">
+          <v-card-text class="pt-0">
+            <v-list density="compact">
+              <v-list-item
+                v-for="o in pendingOrders"
+                :key="o.id"
+                :title="`#${o.id} — ${o.client_name}`"
+                :subtitle="`${num(o.total_qty)} cases · ${dateShort(o.order_date)}`"
+                @click="openOrder(o)"
+              >
+                <template #append>
+                  <v-icon size="small">mdi-pencil-outline</v-icon>
+                </template>
+              </v-list-item>
+            </v-list>
+          </v-card-text>
+        </div>
+      </v-expand-transition>
+    </v-card>
+
+    <!-- Ready to Deliver: orders whose material has left Stock in Hand. Same
+         collapsible pattern as the two panels above. The commitment breakdown
+         under it says which materials are spoken for and whether the promise
+         can still be met from what is free. -->
+    <v-card v-if="readyCount" class="mb-4">
+      <v-card-item class="py-3" @click="readyExpanded = !readyExpanded">
+        <div class="d-flex align-center ga-3">
+          <v-chip color="success" variant="flat" size="small" class="font-weight-bold">
+            {{ readyCount }}
+          </v-chip>
+          <span class="text-uppercase font-weight-bold text-medium-emphasis">
+            Ready to Deliver
+          </span>
+          <v-spacer />
+          <v-btn
+            variant="text"
+            size="small"
+            color="primary"
+            @click.stop="router.push('/delivery/new?from=ready')"
+          >
+            Deliver these
+          </v-btn>
+          <v-icon>{{ readyExpanded ? "mdi-chevron-up" : "mdi-chevron-down" }}</v-icon>
+        </div>
+      </v-card-item>
+      <v-expand-transition>
+        <div v-show="readyExpanded">
+          <v-card-text class="pt-0">
+            <v-alert
+              v-if="commitment.some((c) => c.short)"
+              type="warning"
+              variant="tonal"
+              density="compact"
+              class="mb-3"
+            >
+              Some committed material is no longer free — see the breakdown below.
+            </v-alert>
+            <v-list density="compact">
+              <v-list-item
+                v-for="o in readyOrders"
+                :key="o.id"
+                :title="`#${o.id} — ${o.client_name}`"
+                :subtitle="`${num(o.total_qty)} cases · ${dateShort(o.order_date)}`"
+                @click="openOrder(o)"
+              >
+                <template #append>
+                  <v-icon size="small">mdi-pencil-outline</v-icon>
+                </template>
+              </v-list-item>
+            </v-list>
+            <div v-if="commitment.length" class="text-uppercase text-medium-emphasis mt-3 mb-1">
+              Material committed
+            </div>
+            <v-table v-if="commitment.length" density="compact">
+              <thead>
+                <tr>
+                  <th>Material</th>
+                  <th class="text-right">Committed</th>
+                  <th class="text-right">Available</th>
+                </tr>
+              </thead>
+              <tbody>
+                <tr v-for="c in commitment" :key="c.material_id">
+                  <td>{{ c.material }}</td>
+                  <td class="text-right">{{ num(c.committed) }} {{ c.unit }}</td>
+                  <td
+                    class="text-right font-weight-bold"
+                    :class="c.short ? 'text-error' : 'text-success'"
+                  >
+                    {{ num(c.available) }}
+                  </td>
+                </tr>
+              </tbody>
+            </v-table>
+          </v-card-text>
+        </div>
+      </v-expand-transition>
+    </v-card>
+
+    <!-- Enter Order / edit order. Both use the same dialog — editing simply
+         starts from the saved order's lines. -->
+    <OrderDialog
+      v-model="orderDialog"
+      :order="editingOrder"
+      @closed="onOrderClosed"
+    />
 
     <!-- Summary — MMM, YYYY: the tiles drive the chart area below (user request). -->
     <v-card>
       <v-card-title class="d-flex align-center text-subtitle-1 font-weight-bold">
         <v-icon start color="primary">mdi-chart-box</v-icon>
-        Summary — {{ monthLong(ui.month) }}
+        Summary — {{ periodLabel }}
       </v-card-title>
       <v-divider />
       <v-card-text>
@@ -803,7 +1034,7 @@ async function deleteItem(item) {
             <div class="text-caption text-medium-emphasis mt-1">
               Overhead = {{ num(profitSkuDetail.row.cases, 0) }} cases ×
               {{ money(stats.overhead_per_case) }} / case in
-              {{ monthLong(ui.month) }} — the chain adds up to the profit bar
+              {{ periodLabel }} — the chain adds up to the profit bar
               above.
             </div>
           </div>
@@ -1036,6 +1267,75 @@ async function deleteItem(item) {
   background: rgba(var(--v-theme-primary), 0.06);
 }
 
+/* Stock in Hand tiles (user request): small cards, one per material, tinted by
+   state. The colour is the only signal — red when the material is below its
+   alert level or has gone negative, green otherwise — so a glance at the grid
+   replaces reading the rows it replaced. */
+.stock-tiles {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+
+.stock-tile {
+  flex: 1 1 130px;
+  max-width: 200px;
+  min-width: 120px;
+  padding: 10px 12px;
+  border-radius: 10px;
+  cursor: pointer;
+  /* Colour, not just text: the tile itself carries the state. */
+  border: 1px solid transparent;
+  transition: transform 120ms ease, box-shadow 120ms ease;
+}
+
+.stock-tile:hover {
+  transform: translateY(-1px);
+  box-shadow: 0 2px 8px rgba(0, 0, 0, 0.15);
+}
+
+.stock-tile.is-ok {
+  background: rgba(var(--v-theme-success), 0.16);
+  border-color: rgba(var(--v-theme-success), 0.45);
+}
+
+.stock-tile.is-low {
+  background: rgba(var(--v-theme-error), 0.16);
+  border-color: rgba(var(--v-theme-error), 0.5);
+}
+
+.stock-tile__name {
+  font-size: 0.8125rem;
+  font-weight: 600;
+  line-height: 1.25;
+  /* Two lines max, then ellipsis — long material names must not blow up the
+     grid's row height. */
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+
+.stock-tile__qty {
+  font-size: 1.375rem;
+  font-weight: 700;
+  line-height: 1.2;
+  margin-top: 2px;
+}
+
+.stock-tile__unit {
+  font-size: 0.75rem;
+  font-weight: 500;
+  opacity: 0.7;
+}
+
+.stock-tile__meta,
+.stock-tile__committed {
+  font-size: 0.6875rem;
+  opacity: 0.75;
+  line-height: 1.3;
+}
+
 /* Mobile: the register tables must scroll sideways rather than squash the
    columns into each other (user request — no overlapping text). */
 @media (max-width: 600px) {
@@ -1050,4 +1350,3 @@ async function deleteItem(item) {
   }
 }
 </style>
-

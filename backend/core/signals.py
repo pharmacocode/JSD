@@ -18,9 +18,11 @@ from . import perfcache
 from .models import (
     Client,
     ClientLedgerEntry,
+    ClientOrder,
     Material,
     MaterialBatch,
     MonthlyOverhead,
+    OrderItem,
     SKU,
     SKUMaterialRequirement,
     SKUPrintCost,
@@ -36,13 +38,16 @@ from .models import (
 #   cases_sold_in_month         -> StockDelivery
 #   legacy_demand_by_material   -> StockDelivery, StockAdjustment
 #   legacy_booked_consumption   -> MaterialBatch
+#   committed_map / available   -> OrderItem (status, qty, delivery link)
 #   Client.pending_amount       -> Client, ClientLedgerEntry
 MONITORED = (
     Client,
     ClientLedgerEntry,
+    ClientOrder,
     Material,
     MaterialBatch,
     MonthlyOverhead,
+    OrderItem,
     SKU,
     SKUMaterialRequirement,
     SKUPrintCost,

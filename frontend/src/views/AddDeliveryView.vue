@@ -11,11 +11,12 @@
  * confirmation card.
  */
 import { ref, computed, watch, onMounted } from 'vue'
-import { useRouter } from 'vue-router'
+import { useRoute, useRouter } from 'vue-router'
 import { api } from '@/api'
 import { useRefDataStore } from '@/stores/refdata'
 import { money, num, today } from '@/utils/format'
 
+const route = useRoute()
 const router = useRouter()
 const refdata = useRefDataStore()
 

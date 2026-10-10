@@ -27,12 +27,14 @@ from . import perfcache
 from .models import (
     Client,
     ClientLedgerEntry,
+    ClientOrder,
     ClientSKUPrice,
     Employee,
     EmployeePayment,
     Material,
     MaterialBatch,
     MonthlyOverhead,
+    OrderItem,
     OverheadCategory,
     SKU,
     SKUMaterialRequirement,
@@ -2675,4 +2677,545 @@ class PerfCacheInvalidationTests(TestCase):
             selling_price_per_case=D("300"),
         )
         self.assertEqual(cogs_mod.cases_sold_in_month("2026-09"), D("4"))
+
+
+class OrdersPipelineBase:
+    """
+    Shared world for the orders tests: one client, one SKU needing one bottle
+    (generic) and one client-owned label, priced at 300/case.
+
+    The label is deliberately client-specific so `resolve_requirements`
+    substitutes it for the client's orders — commitment must follow the same
+    substitution the delivery path uses, or a client's own label would never
+    be reserved.
+    """
+
+    def make_order_world(self):
+        self.client_obj = Client.objects.create(name="Beta Corp")
+        self.sku = SKU.objects.create(
+            description="500ml", qty_per_case=D("24"), volume_ml=500
+        )
+        self.bottle = make_material("Bottle", "240")
+        self.label = make_material(
+            "Label", "12", category="Label", client=self.client_obj
+        )
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.label, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+
+    def arrive(self, material, qty, price="10", arrival=date(2026, 8, 1)):
+        """Arrive stock and settle any deficit, so the balance is exactly qty."""
+        batch = make_batch(material, qty, price, arrival=arrival)
+        from .cogs import settle_deficit
+
+        settle_deficit(material, batch)
+        return batch
+
+    def make_order(self, qty=D("10"), price=None, items=None):
+        """
+        POST an order. `items=[{sku, qty_cases, selling_price_per_case}, ...]`
+        for the multi-line cases; otherwise a single line of `qty` cases.
+        """
+        if items is None:
+            items = [{"sku": self.sku.id, "qty_cases": str(qty)}]
+            if price is not None:
+                items[0]["selling_price_per_case"] = str(price)
+        return APIClient().post(
+            "/api/orders/",
+            {"client": self.client_obj.id, "items": items},
+            format="json",
+        )
+
+    def make_sku(self, description, requirements, price="100.00"):
+        """
+        A SKU plus its requirements in one go — `requirements` is
+        [(material, qty_per_case), ...]. `price` is only the SKU's own base
+        price; the per-client price is set with `set_client_price`, which is
+        what Enter Order pre-fills.
+        """
+        sku = SKU.objects.create(description=description)
+        for material, per_case in requirements:
+            SKUMaterialRequirement.objects.create(
+                sku=sku, material=material, qty_per_case=D(per_case)
+            )
+        return sku
+
+    def set_client_price(self, sku, price):
+        """Configure this client's price for a SKU."""
+        csp, _created = ClientSKUPrice.objects.update_or_create(
+            client=self.client_obj,
+            sku=sku,
+            defaults={"selling_price_per_case": D(price)},
+        )
+        return csp
+
+    def available(self, material):
+        """Available (physical - committed) straight from the engine."""
+        return cogs_mod.available_map().get(material.id, D("0"))
+
+
+class OrderCommitmentTests(OrdersPipelineBase, TestCase):
+    """
+    The core invariant the user asked for: stock moves out of Stock in Hand
+    when an order reaches Ready to Deliver, and back again when it is reopened
+    or its delivery is deleted.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.make_order_world()
+        self.arrive(self.bottle, "100")
+        self.arrive(self.label, "100")
+
+    def test_pending_order_reserves_nothing(self):
+        created = self.make_order()
+        self.assertEqual(created.status_code, 201)
+        self.assertEqual(created.data["status"], "PENDING")
+        # Price is pre-filled from ClientSKUPrice and stays editable.
+        self.assertEqual(
+            D(created.data["items"][0]["selling_price_per_case"]), D("300")
+        )
+        self.assertEqual(self.available(self.bottle), D("100"))
+        self.assertEqual(cogs_mod.committed_map(), {})
+
+    def test_complete_moves_stock_out_of_stock_in_hand(self):
+        order = self.make_order().data
+        resp = self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "COMPLETED")
+        # 10 cases x 1 bottle = 10 bottles committed out of 100 in hand.
+        self.assertEqual(self.available(self.bottle), D("90"))
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("10"))
+        self.bottle.refresh_from_db()
+        # The physical ledger is untouched by a commitment.
+        self.assertEqual(self.bottle.stock_in_hand, D("100"))
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("100"))
+
+    def test_complete_is_not_blocked_by_its_own_commitment(self):
+        """
+        An order for exactly the whole stock must still complete: the check
+        excludes its own lines, otherwise every order would look short by
+        precisely what it is asking for.
+        """
+        order = self.make_order(qty=D("100")).data
+        resp = self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.available(self.bottle), D("0"))
+
+    def test_complete_blocked_by_another_orders_commitment(self):
+        first = self.make_order(qty=D("100")).data
+        self.api.post(f"/api/orders/{first['id']}/complete/")
+        second = self.make_order(qty=D("10")).data
+        resp = self.api.post(f"/api/orders/{second['id']}/complete/")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(D(resp.data["shortages"][0]["short_by"]), D("10"))
+        # It stayed PENDING — the refusal must not half-commit anything.
+        self.assertEqual(
+            ClientOrder.objects.get(id=second["id"]).status, ClientOrder.PENDING
+        )
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("100"))
+
+    def test_force_complete_proceeds_when_short(self):
+        order = self.make_order(qty=D("150")).data
+        resp = self.api.post(f"/api/orders/{order['id']}/complete/", {"force": True})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.available(self.bottle), D("-50"))
+
+    def test_reopen_returns_stock_to_stock_in_hand(self):
+        order = self.make_order().data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(self.available(self.bottle), D("90"))
+        resp = self.api.post(f"/api/orders/{order['id']}/reopen/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["status"], "PENDING")
+        self.assertEqual(self.available(self.bottle), D("100"))
+        self.assertEqual(cogs_mod.committed_map(), {})
+
+    def test_reopen_refused_once_delivered(self):
+        order = self.make_order().data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.api.post(f"/api/orders/{order['id']}/deliver/")
+        resp = self.api.post(f"/api/orders/{order['id']}/reopen/")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_complete_requires_pending(self):
+        order = self.make_order().data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        resp = self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(resp.status_code, 400)
+
+
+class OrderDeliveryTests(OrdersPipelineBase, TestCase):
+    """
+    Delivering an order must produce exactly the same StockDelivery the Add
+    Delivery screen would, and deleting that delivery must hand the stock
+    back to Ready to Deliver (not to Stock in Hand).
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.make_order_world()
+        self.arrive(self.bottle, "100")
+        self.arrive(self.label, "100")
+        self.arrive(self.label, "100")
+        self.order = self.make_order(qty=D("10")).data
+        resp = self.api.post(f"/api/orders/{self.order['id']}/complete/")
+        self.assertEqual(resp.status_code, 200)
+
+    def test_deliver_creates_a_real_delivery(self):
+        resp = self.api.post(
+            f"/api/orders/{self.order['id']}/deliver/", {"date": "2026-10-05"}
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["order"]["status"], "DELIVERED")
+
+        delivery = StockDelivery.objects.get(id=resp.data["deliveries"][0]["id"])
+        # Exactly what the Add Delivery screen would have produced.
+        self.assertEqual(delivery.client, self.client_obj)
+        self.assertEqual(delivery.sku, self.sku)
+        self.assertEqual(delivery.qty_cases, D("10"))
+        self.assertEqual(delivery.selling_price_per_case, D("300"))
+        self.assertEqual(delivery.date.isoformat(), "2026-10-05")
+        self.assertFalse(delivery.stock_shortfall_flag)
+        # FIFO actually consumed, and the ledger got the receivable.
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("90"))
+        self.bottle.refresh_from_db()
+        self.assertEqual(self.bottle.stock_in_hand, D("90"))
+        self.assertTrue(
+            ClientLedgerEntry.objects.filter(related_delivery=delivery).exists()
+        )
+        # The commitment clears with the stock it was holding.
+        self.assertEqual(cogs_mod.committed_map(), {})
+
+    def test_deleting_the_delivery_returns_it_to_ready_to_deliver(self):
+        resp = self.api.post(f"/api/orders/{self.order['id']}/deliver/")
+        self.assertEqual(resp.status_code, 200)
+        delivery_id = resp.data["deliveries"][0]["id"]
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("90"))
+
+        deleted = self.api.delete(f"/api/deliveries/{delivery_id}/")
+        self.assertEqual(deleted.status_code, 200)
+
+        order = ClientOrder.objects.get(id=self.order["id"])
+        order.refresh_from_db()
+        self.assertEqual(order.status, ClientOrder.COMPLETED)
+        item = order.items.first()
+        self.assertIsNone(item.delivery_id)
+        # FIFO gave the stock back AND the line is committed again: the bucket
+        # is back to where it was, and stock in hand has not moved.
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("100"))
+        self.assertEqual(self.available(self.bottle), D("90"))
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("10"))
+
+    def test_deleting_from_the_client_ledger_also_returns_to_ready(self):
+        """Both delete paths funnel through void_delivery, so both must work."""
+        resp = self.api.post(f"/api/orders/{self.order['id']}/deliver/")
+        delivery_id = resp.data["deliveries"][0]["id"]
+        entry = ClientLedgerEntry.objects.get(related_delivery_id=delivery_id)
+
+        # The ledger's destroy keeps the row but voids the delivery (200), so
+        # the line comes back to Ready to Deliver exactly like a direct delete.
+        deleted = self.api.delete(f"/api/ledger/{entry.id}/")
+        self.assertEqual(deleted.status_code, 200)
+
+        order = ClientOrder.objects.get(id=self.order["id"])
+        order.refresh_from_db()
+        self.assertEqual(order.status, ClientOrder.COMPLETED)
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("10"))
+
+    def test_partial_delivery_commits_only_what_came_back(self):
+        """
+        Order A fully delivered then deleted, while order B is still ready:
+        only A's material returns, so B's commitment is not disturbed.
+        """
+        order_b = self.make_order(qty=D("30")).data
+        self.api.post(f"/api/orders/{order_b['id']}/complete/")
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("40"))
+
+        a = self.api.post(f"/api/orders/{self.order['id']}/deliver/")
+        self.assertEqual(a.status_code, 200)
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("30"))
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("90"))
+
+        self.api.delete(f"/api/deliveries/{a.data['deliveries'][0]['id']}/")
+        # Only A's 10 cases came back — B's 30 are still committed.
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("40"))
+        self.assertEqual(self.available(self.bottle), D("60"))
+
+
+class OrderRollbackTests(OrdersPipelineBase, TestCase):
+    """Delivering a multi-line order is all-or-nothing."""
+
+    def setUp(self):
+        self.api = APIClient()
+        self.make_order_world()
+        self.arrive(self.bottle, "100")
+        self.arrive(self.label, "100")
+
+    def test_rolls_the_whole_order_back_on_shortfall(self):
+        sku_b = self.make_sku("SKU-B", [(self.bottle, "1")], price=D("50"))
+        sku_c = self.make_sku("SKU-C", [(self.label, "1")], price=D("60"))
+        self.set_client_price(sku_b, "50")
+        self.set_client_price(sku_c, "60")
+        created = self.make_order(
+            items=[
+                {"sku": self.sku.id, "qty_cases": "10"},
+                {"sku": sku_b.id, "qty_cases": "10"},
+                {"sku": sku_c.id, "qty_cases": "500"},
+            ]
+        )
+        order_id = created.data["id"]
+        self.api.post(f"/api/orders/{order_id}/complete/", {"force": True})
+
+        resp = self.api.post(f"/api/orders/{order_id}/deliver/")
+        self.assertEqual(resp.status_code, 409)
+        self.assertEqual(len(resp.data["shortages"]), 1)
+        self.assertEqual(resp.data["shortages"][0]["material"], "Label")
+
+        order = ClientOrder.objects.get(id=order_id)
+        self.assertEqual(order.status, ClientOrder.COMPLETED)
+        self.assertEqual(order.items.filter(delivery__isnull=False).count(), 0)
+        self.assertEqual(
+            StockDelivery.objects.filter(order_items__order=order).count(), 0
+        )
+        # Nothing consumed, so the commitment still holds the full amount.
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("100"))
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("20"))
+        self.assertEqual(
+            ClientLedgerEntry.objects.filter(entry_type="SALE").count(), 0
+        )
+
+    def test_deliver_refused_while_still_pending(self):
+        created = self.make_order()
+        resp = self.api.post(f"/api/orders/{created.data['id']}/deliver/")
+        self.assertEqual(resp.status_code, 400)
+
+    def test_force_deliver_proceeds_when_short(self):
+        created = self.make_order(qty=D("500"))
+        self.api.post(f"/api/orders/{created.data['id']}/complete/", {"force": True})
+        resp = self.api.post(
+            f"/api/orders/{created.data['id']}/deliver/", {"force": True}
+        )
+        self.assertEqual(resp.status_code, 200)
+        delivery = StockDelivery.objects.get(id=resp.data["deliveries"][0]["id"])
+        self.assertTrue(delivery.stock_shortfall_flag)
+
+
+class OrderScreenTests(OrdersPipelineBase, TestCase):
+    """The Home / StatusUpdate screen contracts."""
+
+    def setUp(self):
+        self.api = APIClient()
+        self.make_order_world()
+        self.arrive(self.bottle, "100")
+        self.arrive(self.label, "100")
+
+    def test_summary_lists_pending_ready_and_commitment(self):
+        pending = self.make_order(qty=D("5")).data
+        ready = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{ready['id']}/complete/")
+
+        resp = self.api.get("/api/orders/summary/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["pending_count"], 1)
+        self.assertEqual(resp.data["ready_count"], 1)
+        self.assertEqual(resp.data["pending"][0]["id"], pending["id"])
+        self.assertEqual(resp.data["ready"][0]["id"], ready["id"])
+        self.assertEqual(resp.data["commitment"][0]["material"], "Bottle")
+        self.assertEqual(resp.data["commitment"][0]["committed"], "10")
+        self.assertEqual(resp.data["commitment"][0]["available"], "90")
+        self.assertFalse(resp.data["commitment"][0]["short"])
+
+    def test_ready_bucket_excludes_delivered_orders(self):
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(self.api.get("/api/orders/summary/").data["ready_count"], 1)
+        self.api.post(f"/api/orders/{order['id']}/deliver/")
+        summary = self.api.get("/api/orders/summary/").data
+        self.assertEqual(summary["ready_count"], 0)
+        self.assertEqual(summary["commitment"], [])
+
+    def test_delivered_order_cannot_be_edited_or_reopened(self):
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.api.post(f"/api/orders/{order['id']}/deliver/")
+
+        edited = self.api.patch(
+            f"/api/orders/{order['id']}/",
+            {"notes": "changed"},
+            format="json",
+        )
+        self.assertEqual(edited.status_code, 400)
+        reopened = self.api.post(f"/api/orders/{order['id']}/reopen/")
+        self.assertEqual(reopened.status_code, 400)
+        deleted = self.api.delete(f"/api/orders/{order['id']}/")
+        self.assertEqual(deleted.status_code, 400)
+
+    def test_editing_an_order_replaces_its_lines(self):
+        sku_b = self.make_sku("SKU-B", [(self.label, "1")], price=D("50"))
+        self.set_client_price(sku_b, "50")
+        order = self.make_order(qty=D("10")).data
+        resp = self.api.put(
+            f"/api/orders/{order['id']}/",
+            {
+                "client": self.client_obj.id,
+                "items": [{"sku": sku_b.id, "qty_cases": "7"}],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        saved = ClientOrder.objects.get(id=order["id"])
+        self.assertEqual(saved.items.count(), 1)
+        self.assertEqual(saved.items.first().sku_id, sku_b.id)
+        self.assertEqual(saved.items.first().qty_cases, D("7"))
+
+    def test_edit_of_a_completed_order_reconciles_stock(self):
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("10"))
+
+        self.api.put(
+            f"/api/orders/{order['id']}/",
+            {
+                "client": self.client_obj.id,
+                "items": [{"sku": self.sku.id, "qty_cases": "40"}],
+            },
+            format="json",
+        )
+        # Commitment follows the edited quantity immediately — no stored
+        # "reserved" figure could have gotten this wrong.
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("40"))
+        self.assertEqual(self.available(self.bottle), D("60"))
+
+    def test_duplicate_sku_lines_are_rejected(self):
+        resp = self.make_order(
+            items=[
+                {"sku": self.sku.id, "qty_cases": "5"},
+                {"sku": self.sku.id, "qty_cases": "5"},
+            ]
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("twice", str(resp.data))
+
+    def test_empty_order_is_rejected(self):
+        resp = self.api.post(
+            "/api/orders/", {"client": self.client_obj.id, "items": []}, format="json"
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_deleting_a_pending_order_is_allowed(self):
+        order = self.make_order().data
+        resp = self.api.delete(f"/api/orders/{order['id']}/")
+        self.assertEqual(resp.status_code, 204)
+        self.assertTrue(ClientOrder.objects.get(id=order["id"]).is_deleted)
+        self.assertEqual(
+            self.api.get("/api/orders/summary/").data["pending_count"], 0
+        )
+
+    def test_zero_qty_line_is_rejected(self):
+        resp = self.make_order(qty=D("0"))
+        self.assertEqual(resp.status_code, 400)
+
+    def test_delivery_is_linked_to_its_order_item(self):
+        """The line keeps a pointer to the delivery it produced."""
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        resp = self.api.post(f"/api/orders/{order['id']}/deliver/")
+        item = OrderItem.objects.get(order_id=order["id"])
+        self.assertIsNotNone(item.delivery_id)
+        self.assertEqual(item.delivery_id, resp.data["deliveries"][0]["id"])
+
+
+
+class OrderEditTests(OrdersPipelineBase, TestCase):
+    """Editing an order must re-price and re-commit exactly."""
+
+    def setUp(self):
+        self.api = APIClient()
+        self.make_order_world()
+        self.arrive(self.bottle, "100")
+        self.arrive(self.label, "100")
+
+    def test_edit_updates_commitment(self):
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(self.available(self.bottle), D("90"))
+        resp = self.api.put(
+            f"/api/orders/{order['id']}/",
+            {
+                "client": self.client_obj.id,
+                "items": [{"sku": self.sku.id, "qty_cases": "40"}],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(self.available(self.bottle), D("60"))
+        # Price fell back to the configured one, not to zero.
+        self.assertEqual(
+            D(resp.data["items"][0]["selling_price_per_case"]), D("300")
+        )
+
+    def test_duplicate_sku_lines_are_rejected(self):
+        order = self.make_order(qty=D("10")).data
+        resp = self.api.put(
+            f"/api/orders/{order['id']}/",
+            {
+                "client": self.client_obj.id,
+                "items": [
+                    {"sku": self.sku.id, "qty_cases": "10"},
+                    {"sku": self.sku.id, "qty_cases": "5"},
+                ],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(OrderItem.objects.filter(order_id=order["id"]).count(), 1)
+
+    def test_delivered_order_cannot_be_edited_or_deleted(self):
+        order = self.make_order().data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.api.post(f"/api/orders/{order['id']}/deliver/")
+        resp = self.api.put(
+            f"/api/orders/{order['id']}/",
+            {
+                "client": self.client_obj.id,
+                "items": [{"sku": self.sku.id, "qty_cases": "99"}],
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.api.delete(f"/api/orders/{order['id']}/").status_code, 400)
+
+    def test_soft_delete_frees_the_commitment(self):
+        order = self.make_order().data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(self.available(self.bottle), D("90"))
+        self.assertEqual(self.api.delete(f"/api/orders/{order['id']}/").status_code, 204)
+        self.assertEqual(self.available(self.bottle), D("100"))
+        # Gone from the API, still in the table for the audit trail.
+        self.assertEqual(len(self.api.get("/api/orders/").data), 0)
+        self.assertTrue(ClientOrder.objects.filter(pk=order["id"]).exists())
+
+    def test_summary_groups_pending_and_ready(self):
+        pending = self.make_order(qty=D("10")).data
+        ready = self.make_order(qty=D("20")).data
+        self.api.post(f"/api/orders/{ready['id']}/complete/")
+        resp = self.api.get("/api/orders/summary/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["pending_count"], 1)
+        self.assertEqual(resp.data["ready_count"], 1)
+        self.assertEqual(resp.data["pending"][0]["id"], pending["id"])
+        self.assertEqual(resp.data["ready"][0]["id"], ready["id"])
+        # The commitment breakdown names the client-owned label too.
+        names = {c["material"] for c in resp.data["commitment"]}
+        self.assertIn("Bottle", names)
+        self.assertIn("Label", names)
+
+
 

@@ -1069,5 +1069,202 @@ def sync_labour_overhead(month: str):
     return row
 
 
+# ---------------------------------------------------------------------------
+# Orders pipeline (user request)
+# ---------------------------------------------------------------------------
+class ClientOrder(AuditModel):
+    """
+    A client order that moves through three visible stages:
+
+        PENDING    -> logged at Enter Order; reserves NO stock
+        COMPLETED  -> "moved to Ready to Deliver": its material is now
+                      COMMITTED, i.e. it leaves Stock in Hand and appears in
+                      the Ready to Deliver bucket
+        DELIVERED  -> every line has a StockDelivery behind it
+
+    Only COMPLETED and DELIVERED orders hold commitment, and only for the
+    lines that have no delivery yet — see cogs.committed_map. Status is
+    DERIVED from that, never trusted from the stored column, so editing an
+    order, reopening it or deleting a delivery can never leave stock
+    committed against the wrong thing.
+
+    `status` is kept as a stored convenience (newest order first in lists)
+    and recomputed by `recompute_status()` on every write that can change it.
+    """
+
+    PENDING = "PENDING"
+    COMPLETED = "COMPLETED"
+    DELIVERED = "DELIVERED"
+    STATUS_CHOICES = [
+        (PENDING, "Pending"),
+        (COMPLETED, "Ready to deliver"),
+        (DELIVERED, "Delivered"),
+    ]
+
+    objects = InvalidateQuerySet.as_manager()
+    client = models.ForeignKey(
+        Client, on_delete=models.CASCADE, related_name="orders"
+    )
+    order_date = models.DateField(default=timezone.now)
+    # What the order was placed against, if it ever got that far. Distinct
+    # from delivered_at so a cancelled/reopened order keeps its history.
+    completed_at = models.DateTimeField(null=True, blank=True)
+    delivered_at = models.DateTimeField(null=True, blank=True)
+    notes = models.TextField(blank=True, default="")
+    status = models.CharField(
+        max_length=10, choices=STATUS_CHOICES, default=PENDING, db_index=True
+    )
+
+    class Meta:
+        ordering = ["-order_date", "-id"]
+        indexes = [
+            models.Index(
+                fields=["status", "is_deleted"], name="order_status_isdel_idx"
+            ),
+        ]
+
+    def __str__(self):
+        return f"Order #{self.id} — {self.client.name} ({self.order_date})"
+
+    def recompute_status(self, save=True):
+        """
+        Derive status from the lines and persist it.
+
+        An order is DELIVERED when it has at least one line and every one of
+        them is backed by a delivery; COMPLETED when it reached Ready to
+        Deliver but some lines are still un-delivered; PENDING otherwise.
+        """
+        items = list(self.items.all())
+        if items and all(i.delivery_id for i in items):
+            new_status = self.DELIVERED
+        elif self.completed_at is not None:
+            new_status = self.COMPLETED
+        else:
+            new_status = self.PENDING
+        if new_status != self.status:
+            self.status = new_status
+        if save:
+            self.save(skip_audit=True)
+        return new_status
+
+    @property
+    def total_qty(self):
+        return sum((i.qty_cases for i in self.items.all()), Decimal("0"))
+
+    @property
+    def total_amount(self):
+        return money(sum((i.line_amount for i in self.items.all()), Decimal("0")))
+
+    @property
+    def undelivered_items(self):
+        return [i for i in self.items.all() if not i.delivery_id]
+
+
+class OrderItem(models.Model):
+    """
+    One SKU line of a ClientOrder.
+
+    `selling_price_per_case` is PRE-FILLED from the client's ClientSKUPrice
+    (exactly like Add Delivery) and stays editable on the order, so a price
+    agreed at order time is honoured when the delivery is finally made.
+
+    `delivery` is the link that makes the whole pipeline reversible: set when
+    the line is delivered, cleared again when that delivery is deleted — which
+    hands the material straight back to Ready to Deliver.
+    """
+
+    objects = InvalidateQuerySet.as_manager()
+    order = models.ForeignKey(
+        ClientOrder, on_delete=models.CASCADE, related_name="items"
+    )
+    sku = models.ForeignKey(SKU, on_delete=models.PROTECT, related_name="order_items")
+    qty_cases = models.DecimalField(max_digits=12, decimal_places=4)
+    selling_price_per_case = models.DecimalField(max_digits=12, decimal_places=2)
+
+    # Null while the line is still to go out; points at the StockDelivery
+    # created for it once delivered.
+    delivery = models.ForeignKey(
+        StockDelivery,
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="order_items",
+    )
+
+    class Meta:
+        ordering = ["id"]
+
+    def __str__(self):
+        return f"{self.sku.description} x{self.qty_cases} (order {self.order_id})"
+
+    @property
+    def line_amount(self):
+        return money(self.qty_cases * self.selling_price_per_case)
+
+    @property
+    def is_delivered(self):
+        return self.delivery_id is not None
+
+
+# ---------------------------------------------------------------------------
+# App gate audit (user request)
+# ---------------------------------------------------------------------------
+class LoginAttempt(models.Model):
+    """
+    One row per password attempt at the app's front door.
+
+    Captures EVERY attempt — successful logins, wrong passwords, and attempts
+    refused because the visitor was already locked out — together with the
+    visitor's IP address and a best-effort location, viewable at
+    /loginattempts.
+
+    NOTE: this is an AUDIT trail, not a security boundary. The API itself has
+    no authentication (single shared URL, single implicit user role), so the
+    gate stops casual browsing of the UI and records who tried to get in. See
+    core.views.PasswordView for the lockout rules.
+    """
+
+    timestamp = models.DateTimeField(auto_now_add=True, db_index=True)
+    ip = models.CharField(max_length=64, blank=True, default="")
+    user_agent = models.TextField(blank=True, default="")
+    # Raw header as received (may hold several hops behind Render/Netlify).
+    x_forwarded_for = models.CharField(max_length=300, blank=True, default="")
+    success = models.BooleanField(default=False, db_index=True)
+    # True when the attempt never got as far as comparing a password because
+    # the visitor (or everyone) was already locked out.
+    locked_out = models.BooleanField(default=False)
+
+    # Best-effort location from a free geo lookup. Everything here is optional
+    # and must never block a login — a lookup failure is recorded, not raised.
+    geo_country = models.CharField(max_length=100, blank=True, default="")
+    geo_region = models.CharField(max_length=150, blank=True, default="")
+    geo_city = models.CharField(max_length=150, blank=True, default="")
+    geo_isp = models.CharField(max_length=200, blank=True, default="")
+    # "ok"      -> resolved from the lookup service
+    # "fallback"-> lookup failed / timed out; IP only
+    # "skipped" -> private or empty address (local dev), nothing to look up
+    geo_source = models.CharField(max_length=20, blank=True, default="")
+    geo_error = models.TextField(blank=True, default="")
+
+    # Which screen the attempt came from (/statusupdate, /, /loginattempts...).
+    path = models.CharField(max_length=200, blank=True, default="")
+
+    class Meta:
+        ordering = ["-timestamp", "-id"]
+        indexes = [
+            models.Index(fields=["ip", "timestamp"], name="login_ip_ts_idx"),
+        ]
+
+    def __str__(self):
+        if self.success:
+            kind = "ok"
+        elif self.locked_out:
+            kind = "blocked"
+        else:
+            kind = "wrong password"
+        where = f" from {self.geo_city}, {self.geo_country}" if self.geo_city else ""
+        return f"{self.timestamp:%Y-%m-%d %H:%M} {self.ip}{where}: {kind}"
+
+
 
 

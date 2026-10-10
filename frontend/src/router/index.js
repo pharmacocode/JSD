@@ -86,6 +86,21 @@ const routes = [
     name: 'reports',
     component: () => import('@/views/ReportsView.vue'),
   },
+  {
+    path: '/loginattempts',
+    name: 'login-attempts',
+    component: () => import('@/views/LoginAttemptsView.vue'),
+    meta: { title: 'Login Attempts' },
+  },
+  {
+    // Order status board (user request): a deliberately bare screen with no
+    // app bar, drawer or bottom nav, so there is no UI on it that leads back
+    // to Home. `meta.bare` is what App.vue keys off to hide all of that.
+    path: '/statusupdate',
+    name: 'status-update',
+    component: () => import('@/views/StatusUpdateView.vue'),
+    meta: { title: 'Order Status', bare: true },
+  },
 ]
 
 const router = createRouter({

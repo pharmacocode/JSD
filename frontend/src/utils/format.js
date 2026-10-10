@@ -42,6 +42,22 @@ export function monthLong(key) {
   return `${MONTHS[Number(m) - 1]}, ${y}`
 }
 
+/**
+ * '1 Jan 2026' — heading format for a single ISO date (the dashboard's
+ * from/to range picker).
+ */
+export function dateLong(iso) {
+  if (!iso) return ''
+  const [y, m, d] = String(iso).slice(0, 10).split('-').map(Number)
+  if (!y || !m || !d) return ''
+  return `${d} ${MONTHS[m - 1]} ${y}`
+}
+
+/** '1 Jan 2026 → 31 Mar 2026' — the dashboard's range heading (user request). */
+export function rangeLong(from, to) {
+  return `${dateLong(from)} → ${dateLong(to)}`
+}
+
 export function fmtDate(d) {
   if (!d) return ''
   return String(d).slice(0, 10)
