@@ -102,6 +102,8 @@ jobs:
       # The project itself must exist first (one-time, run locally):
       #   npx wrangler@4 login
       #   npx wrangler@4 pages project create <name> --production-branch=main
+      # (Cloudflare may suffix the free subdomain when the name is taken
+      # globally: project "jsd" is served at https://jsd-dt0.pages.dev.)
       #
       # FAILURE MODES:
       #   - "Authentication error" / code 10000 -> the token is wrong, expired,

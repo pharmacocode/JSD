@@ -74,7 +74,7 @@ New **Web Service** → root `backend/`:
   - `DJANGO_DEBUG=False`
   - `DJANGO_ALLOWED_HOSTS=<your-render-domain>.onrender.com`
   - `DJANGO_SECRET_KEY` = long random string
-  - `CORS_ALLOWED_ORIGINS=https://<your-pages-project>.pages.dev`
+  - `CORS_ALLOWED_ORIGINS=https://jsd-dt0.pages.dev` (the Pages origin; comma-separate to allow more than one)
 
 Migrations run on every deploy (safe: all migrations are additive/reversible).
 
@@ -97,6 +97,14 @@ npx wrangler@4 login
 npx wrangler@4 pages project create jsd --production-branch=main
 ```
 
+The project *name* is what CI references (`CLOUDFLARE_PAGES_PROJECT`, default
+`jsd`). Cloudflare appends a suffix to the free subdomain when the name is taken
+globally, so this project is served at **https://jsd-dt0.pages.dev** — use
+whatever URL wrangler prints. Per-deployment preview URLs
+(`https://<hash>.jsd-dt0.pages.dev`) are *different* origins and are not covered
+by `CORS_ALLOWED_ORIGINS`, so the app only talks to the API from the production
+hostname.
+
 Required secrets/variables:
 
 - GitHub → **Settings → Secrets and variables → Actions**
@@ -107,8 +115,10 @@ Required secrets/variables:
     Cloudflare dashboard URL, or `npx wrangler whoami`)
 - Cloudflare → no build/environment variables needed: the host does not build.
   Its UI vars are **not** visible to GitHub Actions.
-- Render → add the Pages origin to `CORS_ALLOWED_ORIGINS`, otherwise the app
-  loads on Pages but every API call is blocked by CORS.
+- Render → add the Pages origin (`https://jsd-dt0.pages.dev`) to
+  `CORS_ALLOWED_ORIGINS`, otherwise the app loads on Pages but every API call is
+  blocked by CORS: django-cors-headers simply omits the
+  `access-control-allow-origin` header and the browser drops the response.
 
 > **Why not Netlify?** The frontend was hosted there until 2026-10-10, when every
 > production publish began failing with a bare `Forbidden`. That was not a token
