@@ -8,11 +8,12 @@
 const configuredBaseUrl = import.meta.env.VITE_API_BASE_URL
 
 /**
- * `frontend/.env` only holds the localhost development default and is
- * git-ignored, so a production build (Netlify) knows the backend address *only*
- * when VITE_API_BASE_URL is set in the site's environment. Without it the
- * bundle would quietly point at localhost and every screen would look broken —
- * so flag it loudly (console + the banner in App.vue) instead.
+ * Vite inlines VITE_* values at build time and `frontend/.env` only holds the
+ * localhost development default (git-ignored), so a production build knows the
+ * backend address *only* when VITE_API_BASE_URL is set in the environment that
+ * runs the build — GitHub Actions, see .github/workflows/deploy.yml. Without it
+ * the bundle would quietly point at localhost and every screen would look
+ * broken — so flag it loudly (console + the banner in App.vue) instead.
  */
 export const apiBaseUrlMissing = import.meta.env.PROD && !configuredBaseUrl
 
@@ -21,8 +22,9 @@ if (apiBaseUrlMissing) {
   console.error(
     '[jsd] VITE_API_BASE_URL is not set for this production build, so the app ' +
       'is using http://localhost:8000. Set it to the Render backend URL ' +
-      '(e.g. https://<your-app>.onrender.com) under Netlify → Site ' +
-      'configuration → Environment variables, then redeploy.'
+      '(e.g. https://<your-app>.onrender.com) in the GitHub repo under ' +
+      'Settings → Secrets and variables → Actions, then re-run the deploy ' +
+      'workflow.'
   )
 }
 

@@ -78,18 +78,31 @@ New **Web Service** → root `backend/`:
 
 Migrations run on every deploy (safe: all migrations are additive/reversible).
 
-### 3. Netlify (frontend)
-Publish directory `frontend/dist` (netlify.toml + `_redirects` included for
-SPA routing). Env var:
+### 3. Frontend (Netlify, built by GitHub Actions)
+Netlify's own build is **bypassed**: `.github/workflows/deploy.yml` runs
+`npm ci && npm run build` in `frontend/` on every push to `main` and publishes
+`frontend/dist` to Netlify via `nwtgck/actions-netlify`. `frontend/netlify.toml`
++ `_redirects` still supply the SPA routing, and `publish-dir` matches the
+`[build] publish` value there.
 
-- `VITE_API_BASE_URL=https://<your-render-domain>.onrender.com`
+Required secrets/variables:
 
-Forgetting this one is the classic slip: `frontend/.env` (which holds the
-localhost default) is git-ignored, so the build would quietly fall back to
-`http://localhost:8000` and every screen would look broken. A production build
-without `VITE_API_BASE_URL` therefore logs a console error **and** shows a red
+- GitHub → **Settings → Secrets and variables → Actions**
+  - *Variables* (a *Secret* works too): `VITE_API_BASE_URL=https://<your-render-domain>.onrender.com`
+  - *Secrets*: `NETLIFY_AUTH_TOKEN`, `NETLIFY_SITE_ID`
+- Netlify → no environment variables needed for the build any more (its UI vars
+  are **not** visible to GitHub Actions).
+
+Forgetting `VITE_API_BASE_URL` is the classic slip: Vite inlines `VITE_*`
+variables **at build time** and `frontend/.env` (the localhost default) is
+git-ignored, so the bundle would quietly fall back to `http://localhost:8000`
+and every screen would look broken. Because the build now happens on the GitHub
+runner, the value must live in the GitHub Actions settings above — setting it on
+Netlify alone does nothing. The workflow guards against this twice: it fails if
+`VITE_API_BASE_URL` is empty, and again if the finished `dist/` does not contain
+it. A bundle that slips through anyway logs a console error **and** shows a red
 "Backend URL not configured" banner at the top of the app (see
-`frontend/src/api/index.js`) instead of failing silently.
+`frontend/src/api/index.js`).
 
 ## Performance notes
 

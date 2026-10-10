@@ -8,6 +8,15 @@ on:
 jobs:
   build-and-deploy:
     runs-on: ubuntu-latest
+    env:
+      # Vite inlines VITE_* variables into the bundle at BUILD time, and this
+      # workflow (not Netlify) now runs that build. Netlify's site environment
+      # variables are therefore NOT visible here, so the backend URL has to be
+      # configured in this GitHub repo:
+      #   Settings -> Secrets and variables -> Actions
+      # A repository *variable* named VITE_API_BASE_URL is enough (a *secret*
+      # with the same name also works as a fallback).
+      VITE_API_BASE_URL: ${{ vars.VITE_API_BASE_URL || secrets.VITE_API_BASE_URL }}
 
     steps:
       - name: Checkout repository
@@ -23,6 +32,18 @@ jobs:
           # "Dependencies lock file is not found in ...").
           cache-dependency-path: './frontend/package-lock.json'
 
+      # Fail fast (and loudly) if the backend URL is not configured: Vite bakes
+      # VITE_* values in at build time, so a missing value would silently ship a
+      # bundle that points at http://localhost:8000 ("Backend URL not
+      # configured" banner in the app).
+      - name: Check VITE_API_BASE_URL is configured
+        run: |
+          if [ -z "${VITE_API_BASE_URL}" ]; then
+            echo "::error title=VITE_API_BASE_URL is not set::This workflow now builds the frontend (Netlify no longer does), so Netlify's environment variables are not visible here. Add VITE_API_BASE_URL under GitHub -> Settings -> Secrets and variables -> Actions (a repository Variable is enough; a Secret also works), set it to the Render backend URL, then re-run this workflow."
+            exit 1
+          fi
+          echo "Using backend URL: ${VITE_API_BASE_URL}"
+
       # NOTE: package.json and package-lock.json live in ./frontend, so run
       # npm ci there instead of at the repo root.
       - name: Install dependencies
@@ -32,6 +53,17 @@ jobs:
       - name: Build project
         working-directory: ./frontend
         run: npm run build
+
+      # Safety net: the URL must literally appear in the emitted bundle,
+      # otherwise Vite did not inline it and the deploy would be broken.
+      - name: Verify the backend URL was baked into the bundle
+        working-directory: ./frontend
+        run: |
+          if ! grep -rqF -- "${VITE_API_BASE_URL}" dist; then
+            echo "::error::VITE_API_BASE_URL (${VITE_API_BASE_URL}) was not found in frontend/dist, so the build fell back to localhost. Refusing to deploy a broken bundle."
+            exit 1
+          fi
+          echo "OK: frontend/dist references ${VITE_API_BASE_URL}"
 
       - name: Deploy to Netlify
         uses: nwtgck/actions-netlify@v3.0

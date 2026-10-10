@@ -129,7 +129,7 @@ function goHome() {
           density="compact"
           class="mb-3"
           title="Backend URL not configured"
-          text="Set VITE_API_BASE_URL to the Render backend URL in Netlify → Site configuration → Environment variables, then redeploy."
+          text="Set VITE_API_BASE_URL to the Render backend URL in GitHub → Settings → Secrets and variables → Actions (repository variable or secret), then re-run the deploy workflow."
         />
 
         <!-- Keep the tab-style views alive so returning to them is instant and
