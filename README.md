@@ -114,8 +114,10 @@ Required secrets/variables:
   - *Variables* (a *Secret* works too): `VITE_API_BASE_URL=https://<your-render-domain>.onrender.com`;
     optionally `CLOUDFLARE_PAGES_PROJECT` (defaults to `jsdbottles`)
   - *Secrets*: `CLOUDFLARE_API_TOKEN` (Cloudflare → My Profile → API Tokens →
-    template *Cloudflare Pages: Edit*) and `CLOUDFLARE_ACCOUNT_ID` (the ID in the
-    Cloudflare dashboard URL, or `npx wrangler whoami`)
+    **Create Custom Token** with *Account → Cloudflare Pages → Edit* — the
+    `Pages Write` scope — and this account listed under *Account Resources*) and
+    `CLOUDFLARE_ACCOUNT_ID` (the ID in the Cloudflare dashboard URL, or
+    `npx wrangler whoami`)
 - Cloudflare → no build/environment variables needed: the host does not build.
   Its UI vars are **not** visible to GitHub Actions.
 - Render → add the Pages origin (`https://jsdbottles.pages.dev`) to
@@ -129,6 +131,33 @@ Required secrets/variables:
 > new deploys are blocked until credits are added"}` for production deploys while
 > still serving the site and still accepting *draft* deploys. The free Cloudflare
 > Pages plan has no bandwidth or deploy credit meter.
+
+*Authentication error, code 10000* on the `upload-token` request means the CI
+token is missing one permission. `wrangler pages deploy` asks Cloudflare for a
+short-lived upload token as its very first API call, and
+`GET /accounts/<id>/pages/projects/<project>/upload-token` accepts exactly one
+scope: account-level **Pages Write** (*Cloudflare Pages: Edit*). A token from the
+*Edit Cloudflare Workers* template, or a custom token granted only *Pages: Read*,
+is refused — and the error names neither the scope nor the account, so
+`wrangler whoami` is no help here: reading the account only needs a user-level
+*membership*, which says nothing about the deploy scope. The workflow now probes
+that endpoint before deploying and prints this remedy; to test a token by hand:
+
+```bash
+curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
+  "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/jsdbottles/upload-token"
+# {"result":{"jwt":"..."},"success":true} -> token is fine
+# {"errors":[{"code":10000,...}]}         -> missing Pages Write, or another account
+```
+
+To publish **now** while the token is being replaced, deploy from your own
+machine — `wrangler login` authenticates the browser session, not the token:
+
+```bash
+cd frontend
+npm run build
+npx wrangler@4 pages deploy dist --project-name=jsdbottles --branch=main
+```
 
 Forgetting `VITE_API_BASE_URL` is the classic slip: Vite inlines `VITE_*`
 variables **at build time** and `frontend/.env` (the localhost default) is
