@@ -81,9 +81,16 @@ Migrations run on every deploy (safe: all migrations are additive/reversible).
 ### 3. Frontend (Netlify, built by GitHub Actions)
 Netlify's own build is **bypassed**: `.github/workflows/deploy.yml` runs
 `npm ci && npm run build` in `frontend/` on every push to `main` and publishes
-`frontend/dist` to Netlify via `nwtgck/actions-netlify`. `frontend/netlify.toml`
-+ `_redirects` still supply the SPA routing, and `publish-dir` matches the
-`[build] publish` value there.
+`frontend/dist` with Netlify's own CLI (`netlify deploy --prod`, pinned to
+`netlify-cli@27`). `frontend/netlify.toml` + `_redirects` still supply the SPA
+routing, and `--dir=dist` matches the `[build] publish` value there.
+
+> **If the deploy step fails with a bare "Forbidden"**, check the team's credit
+> usage before anything else. On an exhausted balance Netlify keeps serving the
+> site and still accepts *draft* deploys, but refuses production publishes with
+> `403 {"error":"Account credit usage exceeded - new deploys are blocked until
+> credits are added"}`. Add credits (Netlify → Team → Billing) or wait for the
+> next usage period, then re-run the workflow — no code change is involved.
 
 Required secrets/variables:
 

@@ -124,7 +124,7 @@ REST_FRAMEWORK = {
 
 # CORS: allow the Netlify-hosted Vue frontend to call this API.
 # Set CORS_ALLOWED_ORIGINS (comma separated) in production, e.g.
-# https://jsd-group.netlify.app
+# https://jsdbottle.netlify.app
 _cors = os.environ.get("CORS_ALLOWED_ORIGINS", "")
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors.split(",") if o.strip()]
 if DEBUG and not CORS_ALLOWED_ORIGINS:

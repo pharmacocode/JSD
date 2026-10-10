@@ -5,12 +5,12 @@ on:
     branches:
       - main
 
-# Least privilege. Note that the previously used deploy action (see the
-# "Deploy to Netlify" step) tried to post GitHub deployments/commit statuses
-# with GITHUB_TOKEN; this repo defaults to a read-only token, so those calls
-# were silently rejected (403 "Resource not accessible by integration") and
-# logged only as noise. The CLI-based deploy below needs nothing but the repo
-# contents, so keep the token read-only.
+# Least privilege. The deploy step below (netlify-cli) needs nothing but the
+# repository contents, so declare the read-only token explicitly instead of
+# relying on the repository default. (Its predecessor, nwtgck/actions-netlify,
+# also tried to post GitHub deployment/commit statuses with GITHUB_TOKEN; this
+# repo's read-only default rejected those with 403 "Resource not accessible by
+# integration" and they showed up only as log noise.)
 permissions:
   contents: read
 
@@ -76,14 +76,23 @@ jobs:
           fi
           echo "OK: frontend/dist references ${VITE_API_BASE_URL}"
 
-      # Deploy with Netlify's own CLI instead of nwtgck/actions-netlify.
+      # Deploy with Netlify's own CLI instead of nwtgck/actions-netlify (v3.0,
+      # unmaintained, bundles an old Netlify client). The CLI is Netlify's
+      # supported deploy path, so pin it deliberately below.
       #
-      # That action (v3.0) started failing every run with a bare "Forbidden"
-      # raised by the old Netlify client bundled inside it, before any deploy
-      # happened. The credentials and the Netlify side were verified healthy
-      # (Sites API reads 200, deploy creation 200, and this same CLI deploys
-      # this same site successfully), so the unmaintained action bundle was the
-      # problem. The CLI is Netlify's supported path, so use it directly.
+      # FAILURE MODE WORTH KNOWING (hit on 2026-10-10): a bare "Forbidden" here
+      # (`JSONHTTPError: Forbidden`) is NOT a token/scope problem. It is the
+      # account-level credit meter being exhausted, which Netlify only reports
+      # in the API response body:
+      #   POST /sites/{id}/deploys   draft=false -> 403
+      #     {"error":"Account credit usage exceeded - new deploys are blocked
+      #               until credits are added"}
+      #   POST /sites/{id}/deploys   draft=true  -> 200 (drafts still allowed)
+      #   GET  /sites/{id}                        -> 200 (site healthy, serving)
+      # So the site keeps serving and draft/preview deploys keep working while
+      # production publishes are refused. Fix by adding credits
+      # (Netlify -> Team -> Billing) or waiting for the next usage period, then
+      # re-run this workflow.
       #
       # working-directory ./frontend means the CLI picks up frontend/netlify.toml
       # (publish = "dist") and its `_redirects` file (shipped via frontend/public)
