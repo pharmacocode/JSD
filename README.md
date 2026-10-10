@@ -147,7 +147,8 @@ that endpoint before deploying and prints this remedy; to test a token by hand:
 curl -s -H "Authorization: Bearer $CLOUDFLARE_API_TOKEN" \
   "https://api.cloudflare.com/client/v4/accounts/$CLOUDFLARE_ACCOUNT_ID/pages/projects/jsdbottles/upload-token"
 # {"result":{"jwt":"..."},"success":true} -> token is fine
-# {"errors":[{"code":10000,...}]}         -> missing Pages Write, or another account
+# {"errors":[{"code":10000,...}]}         -> token valid, lacks Pages Write (or is another account)
+# {"errors":[{"code":9106,...}]}          -> Cloudflare did not accept the token string at all
 ```
 
 To publish **now** while the token is being replaced, deploy from your own
