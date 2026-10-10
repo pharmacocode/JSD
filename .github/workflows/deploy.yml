@@ -18,6 +18,10 @@ jobs:
         with:
           node-version: 20
           cache: 'npm'
+          # package-lock.json lives in ./frontend, not at the repo root, so point
+          # setup-node's cache lookup at it (otherwise the step fails with
+          # "Dependencies lock file is not found in ...").
+          cache-dependency-path: './frontend/package-lock.json'
 
       # NOTE: package.json and package-lock.json live in ./frontend, so run
       # npm ci there instead of at the repo root.
