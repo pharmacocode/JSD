@@ -98,12 +98,15 @@ jobs:
       #                                     Pages: Edit")
       #             CLOUDFLARE_ACCOUNT_ID  (Cloudflare dashboard URL, or
       #                                     `npx wrangler whoami`)
-      #   Variable: CLOUDFLARE_PAGES_PROJECT (optional, defaults to "jsd")
+      #   Variable: CLOUDFLARE_PAGES_PROJECT (optional, defaults to
+      #                                     "jsdbottles")
       # The project itself must exist first (one-time, run locally):
       #   npx wrangler@4 login
-      #   npx wrangler@4 pages project create <name> --production-branch=main
-      # (Cloudflare may suffix the free subdomain when the name is taken
-      # globally: project "jsd" is served at https://jsd-dt0.pages.dev.)
+      #   npx wrangler@4 pages project create jsdbottles --production-branch=main
+      # The <name>.pages.dev hostname is fixed when the project is created: a
+      # later rename does not move it, and a name that is already taken gets a
+      # suffix (the first project here was "jsd" -> jsd-dt0.pages.dev).
+      # Recreating it as "jsdbottles" produced https://jsdbottles.pages.dev.
       #
       # FAILURE MODES:
       #   - "Authentication error" / code 10000 -> the token is wrong, expired,
@@ -117,7 +120,7 @@ jobs:
           # line (and never shows up in the logs).
           CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          CLOUDFLARE_PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT || 'jsd' }}
+          CLOUDFLARE_PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT || 'jsdbottles' }}
           # Keep CI non-interactive: no telemetry or update prompts.
           WRANGLER_SEND_METRICS: 'false'
         run: |

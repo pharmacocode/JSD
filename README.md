@@ -74,7 +74,7 @@ New **Web Service** → root `backend/`:
   - `DJANGO_DEBUG=False`
   - `DJANGO_ALLOWED_HOSTS=<your-render-domain>.onrender.com`
   - `DJANGO_SECRET_KEY` = long random string
-  - `CORS_ALLOWED_ORIGINS=https://jsd-dt0.pages.dev` (the Pages origin; comma-separate to allow more than one)
+  - `CORS_ALLOWED_ORIGINS=https://jsdbottles.pages.dev` (the Pages origin; comma-separate to allow more than one)
 
 Migrations run on every deploy (safe: all migrations are additive/reversible).
 
@@ -94,28 +94,31 @@ The Pages project must exist before the first CI deploy (one-time, locally):
 ```bash
 cd frontend
 npx wrangler@4 login
-npx wrangler@4 pages project create jsd --production-branch=main
+npx wrangler@4 pages project create jsdbottles --production-branch=main
 ```
 
 The project *name* is what CI references (`CLOUDFLARE_PAGES_PROJECT`, default
-`jsd`). Cloudflare appends a suffix to the free subdomain when the name is taken
-globally, so this project is served at **https://jsd-dt0.pages.dev** — use
-whatever URL wrangler prints. Per-deployment preview URLs
-(`https://<hash>.jsd-dt0.pages.dev`) are *different* origins and are not covered
-by `CORS_ALLOWED_ORIGINS`, so the app only talks to the API from the production
-hostname.
+`jsdbottles`) and it is served at **https://jsdbottles.pages.dev** here — check
+whatever hostname wrangler prints. The `<name>.pages.dev` host is assigned when
+the project is created: renaming a project later does **not** move it, and a name
+that is already taken globally gets a suffix (an earlier project called `jsd`
+landed on `jsd-dt0.pages.dev`, which is why the commands above create the project
+under its final name). Per-deployment preview URLs
+(`https://<hash>.jsdbottles.pages.dev`) are *different* origins and are not
+covered by `CORS_ALLOWED_ORIGINS`, so the app only talks to the API from the
+production hostname.
 
 Required secrets/variables:
 
 - GitHub → **Settings → Secrets and variables → Actions**
   - *Variables* (a *Secret* works too): `VITE_API_BASE_URL=https://<your-render-domain>.onrender.com`;
-    optionally `CLOUDFLARE_PAGES_PROJECT` (defaults to `jsd`)
+    optionally `CLOUDFLARE_PAGES_PROJECT` (defaults to `jsdbottles`)
   - *Secrets*: `CLOUDFLARE_API_TOKEN` (Cloudflare → My Profile → API Tokens →
     template *Cloudflare Pages: Edit*) and `CLOUDFLARE_ACCOUNT_ID` (the ID in the
     Cloudflare dashboard URL, or `npx wrangler whoami`)
 - Cloudflare → no build/environment variables needed: the host does not build.
   Its UI vars are **not** visible to GitHub Actions.
-- Render → add the Pages origin (`https://jsd-dt0.pages.dev`) to
+- Render → add the Pages origin (`https://jsdbottles.pages.dev`) to
   `CORS_ALLOWED_ORIGINS`, otherwise the app loads on Pages but every API call is
   blocked by CORS: django-cors-headers simply omits the
   `access-control-allow-origin` header and the browser drops the response.
