@@ -35,6 +35,8 @@ const open = computed({
 })
 
 const busy = ref(false)
+const clientLoading = ref(false)
+const clientLoadError = ref('')
 const error = ref('')
 const shortage = ref(null) // 409 payload from complete/preview, shown as an alert
 
@@ -103,7 +105,19 @@ watch(open, async (v) => {
   if (!v) return
   error.value = ''
   shortage.value = null
-  if (!refdata.clients.length) await refdata.ensureLoaded?.()
+  if (!refdata.clients.length) {
+    // refdata has fetch(), not ensureLoaded() — the old call never threw, so
+    // the list silently stayed empty on a cold Enter Order.
+    clientLoading.value = true
+    clientLoadError.value = ''
+    try {
+      await refdata.fetch('clients')
+    } catch (e) {
+      clientLoadError.value = e.message || 'Could not load clients'
+    } finally {
+      clientLoading.value = false
+    }
+  }
   if (props.order) {
     clientId.value = props.order.client
     orderDate.value = props.order.order_date || today()
@@ -203,12 +217,21 @@ async function save() {
           {{ error }}
         </v-alert>
 
+        <v-alert
+          v-if="clientLoadError"
+          type="error"
+          variant="tonal"
+          density="compact"
+          class="mb-3"
+        >
+          {{ clientLoadError }}
+        </v-alert>
         <v-select
           v-model="clientId"
           :items="refdata.clients"
           item-title="name"
           item-value="id"
-          label="Client"
+          label="Client" :loading="clientLoading"
           variant="outlined"
           density="compact"
           :disabled="editing"

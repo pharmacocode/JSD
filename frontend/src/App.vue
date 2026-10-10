@@ -1,5 +1,5 @@
 <script setup>
-import { ref, computed, watch, onUnmounted } from 'vue'
+import { ref, computed, watch, onUnmounted, onErrorCaptured } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { apiBaseUrlMissing } from '@/api'
 import { useUiStore } from '@/stores/ui'
@@ -40,6 +40,28 @@ const isRoot = computed(() => route.path === '/')
 // /statusupdate in particular offers no way back to Home (user request).
 const isBare = computed(() => !!route.meta.bare)
 const snack = computed(() => ui.toast)
+const renderError = ref(null)
+function reloadApp() {
+  window.location.reload()
+}
+
+// A view that throws during render used to leave a blank page — invisible on
+// meta.bare routes such as /statusupdate, which hide the app bar, drawer and
+// bottom nav. Surface it instead, with a way back.
+onErrorCaptured((err, instance, info) => {
+  renderError.value = { message: err?.message || String(err), info }
+  // eslint-disable-next-line no-console
+  console.error('[jsd] view crashed', err, info)
+  return false
+})
+
+// A later navigation gets a clean slate.
+watch(
+  () => route.fullPath,
+  () => {
+    renderError.value = null
+  }
+)
 
 async function submitPassword() {
   if (auth.lockedOut || auth.checking || !password.value) return
@@ -172,6 +194,29 @@ function goHome() {
           title="Backend URL not configured"
           text="Set VITE_API_BASE_URL to the Render backend URL in GitHub → Settings → Secrets and variables → Actions (repository variable or secret), then re-run the deploy workflow."
         />
+
+        <!-- A view that threw during render (caught above) leaves an error
+             instead of a blank page — invisible on meta.bare routes such as
+             /statusupdate, which hide the app bar, drawer and bottom nav. -->
+        <v-alert
+          v-if="renderError"
+          type="error"
+          variant="tonal"
+          density="compact"
+          class="mb-3"
+          title="This screen failed to render"
+        >
+          {{ renderError.message }}
+          <v-btn
+            size="small"
+            variant="text"
+            color="error"
+            class="ml-2"
+            @click="reloadApp"
+          >
+            Reload
+          </v-btn>
+        </v-alert>
 
         <!-- App gate (user request): ask for the password before anything is
              shown. The check, the 300s restriction and the audit trail are

@@ -57,8 +57,8 @@ function partDelivered(order) {
  * part-delivered order lists what is left rather than what has gone.
  */
 function openLines(order) {
-  const lines = (order.items || []).filter((i) => !i.delivery)
-  return lines.length ? lines : order.items || []
+  const lines = (order?.items || []).filter((i) => !i.delivery)
+  return lines.length ? lines : order?.items || []
 }
 
 /** The lines a partial move can take, with the quantity and price to show. */
@@ -71,6 +71,9 @@ function movableLines(order) {
     price: Number(i.selling_price_per_case),
   }))
 }
+
+/** The picker's lines; safe to evaluate before an order is chosen (`moveOrder` starts null). */
+const moveLines = computed(() => movableLines(moveOrder.value))
 
 function skuSummary(order) {
   return openLines(order)
@@ -350,7 +353,7 @@ onMounted(load)
           :confirm-label="moveConfirmLabel"
           :color="moveColor"
           :icon="moveIcon"
-          :lines="movableLines(moveOrder)"
+          :lines="moveLines"
           :busy="moveBusy"
           :error="moveError"
           @confirm="doMove"
