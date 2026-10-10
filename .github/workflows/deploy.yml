@@ -1,16 +1,17 @@
-name: Deploy Frontend to Netlify
+name: Deploy Frontend to Cloudflare Pages
 
 on:
   push:
     branches:
       - main
 
-# Least privilege. The deploy step below (netlify-cli) needs nothing but the
-# repository contents, so declare the read-only token explicitly instead of
-# relying on the repository default. (Its predecessor, nwtgck/actions-netlify,
-# also tried to post GitHub deployment/commit statuses with GITHUB_TOKEN; this
-# repo's read-only default rejected those with 403 "Resource not accessible by
-# integration" and they showed up only as log noise.)
+# Least privilege. The deploy step below (wrangler -> Cloudflare Pages) needs
+# nothing but the repository contents, so declare the read-only token
+# explicitly instead of relying on the repository default. (An older revision
+# used nwtgck/actions-netlify, which also tried to post GitHub deployment/commit
+# statuses with GITHUB_TOKEN; this repo's read-only default rejected those with
+# 403 "Resource not accessible by integration" and they showed up only as log
+# noise.)
 permissions:
   contents: read
 
@@ -19,7 +20,7 @@ jobs:
     runs-on: ubuntu-latest
     env:
       # Vite inlines VITE_* variables into the bundle at BUILD time, and this
-      # workflow (not Netlify) now runs that build. Netlify's site environment
+      # workflow (not the static host) runs that build. The host's environment
       # variables are therefore NOT visible here, so the backend URL has to be
       # configured in this GitHub repo:
       #   Settings -> Secrets and variables -> Actions
@@ -34,8 +35,8 @@ jobs:
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
-          # node-version 22 because netlify-cli 27 (used by the deploy step
-          # below) requires Node >= 22.13. Vite 5 builds fine on Node 22.
+          # node-version 22 (current LTS): Vite 6 builds fine on it and
+          # wrangler 4 (used by the deploy step below) requires Node >= 18.
           node-version: 22
           cache: 'npm'
           # package-lock.json lives in ./frontend, not at the repo root, so point
@@ -50,7 +51,7 @@ jobs:
       - name: Check VITE_API_BASE_URL is configured
         run: |
           if [ -z "${VITE_API_BASE_URL}" ]; then
-            echo "::error title=VITE_API_BASE_URL is not set::This workflow now builds the frontend (Netlify no longer does), so Netlify's environment variables are not visible here. Add VITE_API_BASE_URL under GitHub -> Settings -> Secrets and variables -> Actions (a repository Variable is enough; a Secret also works), set it to the Render backend URL, then re-run this workflow."
+            echo "::error title=VITE_API_BASE_URL is not set::This workflow builds the frontend itself (the static host only receives the finished dist/), so the host's own environment variables are never visible here. Add VITE_API_BASE_URL under GitHub -> Settings -> Secrets and variables -> Actions (a repository Variable is enough; a Secret also works), set it to the Render backend URL, then re-run this workflow."
             exit 1
           fi
           echo "Using backend URL: ${VITE_API_BASE_URL}"
@@ -76,39 +77,53 @@ jobs:
           fi
           echo "OK: frontend/dist references ${VITE_API_BASE_URL}"
 
-      # Deploy with Netlify's own CLI instead of nwtgck/actions-netlify (v3.0,
-      # unmaintained, bundles an old Netlify client). The CLI is Netlify's
-      # supported deploy path, so pin it deliberately below.
+      # Deploy with Cloudflare's wrangler CLI to Cloudflare Pages (direct
+      # upload). This replaced Netlify on 2026-10-10: Netlify's API started
+      # refusing every *production* publish with a bare "Forbidden" caused by an
+      # exhausted account credit meter (drafts still returned 200 and the site
+      # kept serving), which left the live bundle stale until credits were
+      # bought. Cloudflare Pages has no bandwidth/credit meter on the free plan,
+      # so that failure class is gone.
       #
-      # FAILURE MODE WORTH KNOWING (hit on 2026-10-10): a bare "Forbidden" here
-      # (`JSONHTTPError: Forbidden`) is NOT a token/scope problem. It is the
-      # account-level credit meter being exhausted, which Netlify only reports
-      # in the API response body:
-      #   POST /sites/{id}/deploys   draft=false -> 403
-      #     {"error":"Account credit usage exceeded - new deploys are blocked
-      #               until credits are added"}
-      #   POST /sites/{id}/deploys   draft=true  -> 200 (drafts still allowed)
-      #   GET  /sites/{id}                        -> 200 (site healthy, serving)
-      # So the site keeps serving and draft/preview deploys keep working while
-      # production publishes are refused. Fix by adding credits
-      # (Netlify -> Team -> Billing) or waiting for the next usage period, then
-      # re-run this workflow.
+      # The build still happens HERE, not on the host, so the two
+      # VITE_API_BASE_URL guards above actually run; wrangler only uploads the
+      # finished ./frontend/dist. frontend/public/_redirects
+      # ("/*    /index.html   200") is copied into dist by Vite and Cloudflare
+      # Pages honours that syntax natively, so SPA deep links such as
+      # /statusupdate survive a refresh with HTTP 200.
       #
-      # working-directory ./frontend means the CLI picks up frontend/netlify.toml
-      # (publish = "dist") and its `_redirects` file (shipped via frontend/public)
-      # still provides the SPA history fallback.
-      - name: Deploy to Netlify
+      # Setup (GitHub -> Settings -> Secrets and variables -> Actions):
+      #   Secrets:  CLOUDFLARE_API_TOKEN   (Cloudflare -> My Profile -> API
+      #                                     Tokens -> template "Cloudflare
+      #                                     Pages: Edit")
+      #             CLOUDFLARE_ACCOUNT_ID  (Cloudflare dashboard URL, or
+      #                                     `npx wrangler whoami`)
+      #   Variable: CLOUDFLARE_PAGES_PROJECT (optional, defaults to "jsd")
+      # The project itself must exist first (one-time, run locally):
+      #   npx wrangler@4 login
+      #   npx wrangler@4 pages project create <name> --production-branch=main
+      #
+      # FAILURE MODES:
+      #   - "Authentication error" / code 10000 -> the token is wrong, expired,
+      #     or lacks the Pages:Edit permission.
+      #   - "project not found" -> CLOUDFLARE_PAGES_PROJECT typo, or the token
+      #     belongs to a different account than CLOUDFLARE_ACCOUNT_ID.
+      - name: Deploy to Cloudflare Pages
         working-directory: ./frontend
         env:
-          # The CLI reads the token from the environment, so it is never placed
-          # on a command line (and never printed in the logs).
-          NETLIFY_AUTH_TOKEN: ${{ secrets.NETLIFY_AUTH_TOKEN }}
-          NETLIFY_SITE_ID: ${{ secrets.NETLIFY_SITE_ID }}
+          # Read from the environment so the token never appears on a command
+          # line (and never shows up in the logs).
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          CLOUDFLARE_PAGES_PROJECT: ${{ vars.CLOUDFLARE_PAGES_PROJECT || 'jsd' }}
+          # Keep CI non-interactive: no telemetry or update prompts.
+          WRANGLER_SEND_METRICS: 'false'
         run: |
-          npm install -g netlify-cli@27 --no-fund --no-audit
-          netlify --version
-          netlify deploy \
-            --prod \
-            --dir=dist \
-            --site "${NETLIFY_SITE_ID}" \
-            --message "GitHub Actions ${GITHUB_SHA::7} (${GITHUB_REF_NAME})"
+          if [ -z "${CLOUDFLARE_API_TOKEN}" ] || [ -z "${CLOUDFLARE_ACCOUNT_ID}" ]; then
+            echo "::error title=Cloudflare credentials missing::Add CLOUDFLARE_API_TOKEN and CLOUDFLARE_ACCOUNT_ID as repository Secrets under Settings -> Secrets and variables -> Actions, then re-run this workflow."
+            exit 1
+          fi
+          npx --yes wrangler@4 pages deploy dist \
+            --project-name="${CLOUDFLARE_PAGES_PROJECT}" \
+            --branch=main \
+            --commit-dirty=true

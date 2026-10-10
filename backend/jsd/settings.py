@@ -122,9 +122,11 @@ REST_FRAMEWORK = {
     "DEFAULT_RENDERER_CLASSES": ["rest_framework.renderers.JSONRenderer"],
 }
 
-# CORS: allow the Netlify-hosted Vue frontend to call this API.
+# CORS: allow the static-hosted Vue frontend to call this API.
 # Set CORS_ALLOWED_ORIGINS (comma separated) in production, e.g.
-# https://jsdbottle.netlify.app
+# https://<project>.pages.dev (Cloudflare Pages). The old Netlify origin
+# (https://jsdbottle.netlify.app) was retired on 2026-10-10 — add both while
+# cutting over, then drop the old one.
 _cors = os.environ.get("CORS_ALLOWED_ORIGINS", "")
 CORS_ALLOWED_ORIGINS = [o.strip() for o in _cors.split(",") if o.strip()]
 if DEBUG and not CORS_ALLOWED_ORIGINS:
