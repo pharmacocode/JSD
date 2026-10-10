@@ -80,23 +80,50 @@ export const useOrdersStore = defineStore('orders', {
       return saved
     },
 
-    async complete(id, { force = false } = {}) {
-      const order = await api.post(`/orders/${id}/complete/`, { force })
+    /**
+     * Pending -> Ready to Deliver. `items` = [{item, qty_cases}] moves only
+     * those cases (user request: move part of a pending order); omitting it
+     * moves the whole order. The backend splits the order when only part of it
+     * moves, and answers with `{ order, split, partial }`.
+     */
+    async complete(id, { force = false, items = null } = {}) {
+      const order = await api.post(`/orders/${id}/complete/`, {
+        force,
+        items: items || undefined,
+      })
       await this.refresh(true)
       return order
     },
 
-    async reopen(id) {
-      const order = await api.post(`/orders/${id}/reopen/`)
+    /** Ready to Deliver -> Pending, with the same optional partial selection. */
+    async reopen(id, { items = null } = {}) {
+      const order = await api.post(`/orders/${id}/reopen/`, {
+        items: items || undefined,
+      })
       await this.refresh(true)
       return order
     },
 
-    async deliver(id, { date = null, force = false, note = '' } = {}) {
+    /**
+     * Deliver a ready order. `payment` ({amount, date?, note?}) is optional and
+     * rides in the same request, so the delivery and the money are saved
+     * together or not at all (user request). Both totals and the client's
+     * pending balance come back from the server.
+     *
+     * `items` = [{item, qty_cases}] sends only those cases (partial delivery):
+     * the rest stays on the order in Ready to Deliver and `partial` comes back
+     * true. Omitted = the whole order goes out at once, as before.
+     */
+    async deliver(
+      id,
+      { date = null, force = false, note = '', payment = null, items = null } = {}
+    ) {
       const result = await api.post(`/orders/${id}/deliver/`, {
         date: date || undefined,
         force,
         note: note || undefined,
+        payment: payment || undefined,
+        items: items || undefined,
       })
       await this.refresh(true)
       return result

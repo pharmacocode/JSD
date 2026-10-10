@@ -382,7 +382,7 @@ async function deleteEntry(entry) {
           <EmptyState
             v-if="!deliveries.length"
             icon="mdi-truck"
-            text="No deliveries yet — tap + on Home to add one."
+            text="No deliveries yet — deliveries are made from Ready to Deliver orders."
             action="Add delivery"
             @action="router.push('/delivery/new')"
           />

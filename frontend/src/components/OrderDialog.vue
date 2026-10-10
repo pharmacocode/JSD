@@ -177,8 +177,10 @@ async function save() {
     open.value = false
     emit('saved')
   } catch (e) {
-    if (e.shortages) {
-      shortage.value = e.shortages
+    // 409 from the pipeline carries the per-material gaps in the body; the
+    // banner below lists them so the user can decide to proceed anyway.
+    if (e.data?.shortages) {
+      shortage.value = e.data.shortages
     } else {
       error.value = e.message
     }

@@ -73,6 +73,19 @@ admin.site.register(SKUPrintCost)
 
 @admin.register(StockDelivery)
 class StockDeliveryAdmin(admin.ModelAdmin):
+    """
+    Deliveries are READ-ONLY in the admin (user request: a delivery can only
+    happen through the order pipeline).
+
+    The only sanctioned way to create one is Enter Order -> Ready to Deliver ->
+    Add Delivery (`POST /api/orders/<id>/deliver/`), which links the row to the
+    order line it fulfils and books FIFO consumption, the client's DELIVERY
+    ledger entry and the COGS snapshots in a single transaction. A row typed in
+    here would consume stock no order ever committed -- exactly the state that
+    pipeline exists to prevent -- so adding is switched off. Existing rows stay
+    visible and editable for audit/repair work.
+    """
+
     list_display = (
         "date",
         "client",
@@ -84,6 +97,9 @@ class StockDeliveryAdmin(admin.ModelAdmin):
         "stock_shortfall_flag",
     )
     list_filter = ("stock_shortfall_flag",)
+
+    def has_add_permission(self, request):
+        return False
 
 
 @admin.register(Vendor)

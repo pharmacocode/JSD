@@ -1203,6 +1203,13 @@ def timezone_now_date():
     return timezone.now().date()
 
 
+def timezone_now():
+    """Aware 'now', the timestamp twin of timezone_now_date (order splits)."""
+    from django.utils import timezone
+
+    return timezone.now()
+
+
 def _now_iso():
     """ISO timestamp for audit-trail entries."""
     from django.utils import timezone
@@ -1283,6 +1290,69 @@ def create_delivery_payment(
         date=payment_date,
         related_delivery=related_delivery,
     )
+
+
+@transaction.atomic
+def split_order_lines(order, moves, to_ready=False, note=""):
+    """
+    Move PART of an order out into its own order (user request: "partially move
+    the order from pending to ready to deliver ... the order should split to
+    two, in the backend. So the tracking will happen accordingly").
+
+    `moves` = [(OrderItem, qty_cases), ...] — the portions to take out of
+    `order`, already validated by the caller (undelivered, 0 < qty <= the line's
+    quantity, no duplicates).
+
+    A line taken WHOLE is reassigned to the new order, so its id, its audit
+    history and any delivery link travel with the material it stands for. A line
+    taken IN PART is split: the source keeps the cases left behind and the new
+    order gets the moved ones. Nothing is copied and nothing is duplicated, so
+    the case counts on both sides always add back up to the original order.
+
+    `to_ready=True` completes the new order (its cases move to Ready to
+    Deliver); without it the new order is PENDING (the "move part back to
+    Pending" direction). The caller owns the stock check, because only it knows
+    whether those cases were already committed.
+
+    Returns the new order; both orders are re-judged by recompute_status, so a
+    split can never leave a status that disagrees with its lines.
+    """
+    from .models import ClientOrder, OrderItem
+
+    new_order = ClientOrder.objects.create(
+        client=order.client,
+        order_date=order.order_date,
+        notes=note or f"Split from order #{order.id}",
+        source_order=order,
+    )
+
+    for item, take in moves:
+        take = Decimal(take)
+        if take >= item.qty_cases:
+            item.order = new_order
+            item.save()
+            continue
+        OrderItem.objects.create(
+            order=new_order,
+            sku=item.sku,
+            qty_cases=take,
+            selling_price_per_case=item.selling_price_per_case,
+        )
+        item.qty_cases = item.qty_cases - take
+        item.save()
+
+    if to_ready:
+        new_order.completed_at = timezone_now()
+
+    # Text breadcrumb next to the FK link (the panels show the link; the notes
+    # keep the same story readable in the audit trail). Written before
+    # recompute_status so it costs no extra save.
+    crumb = f"Split to order #{new_order.id}"
+    order.notes = f"{order.notes}\n{crumb}" if order.notes else crumb
+
+    new_order.recompute_status()
+    order.recompute_status()
+    return new_order
 
 
 @transaction.atomic

@@ -1088,6 +1088,14 @@ class ClientOrder(AuditModel):
     order, reopening it or deleting a delivery can never leave stock
     committed against the wrong thing.
 
+    An order is also SPLITTABLE (user request). Moving only part of it to Ready
+    to Deliver — some lines, or some cases of a line — gives the moved part its
+    OWN order, whose `source_order` points back here; the rest stays on this
+    one. A partial delivery works the same way at line level (the delivered
+    cases keep the line, the remainder becomes a new line). That is what keeps
+    the tracking exact: every case lives in exactly one bucket, on exactly one
+    order, and no row ever holds a mixture of sent and unsent quantity.
+
     `status` is kept as a stored convenience (newest order first in lists)
     and recomputed by `recompute_status()` on every write that can change it.
     """
@@ -1113,6 +1121,19 @@ class ClientOrder(AuditModel):
     notes = models.TextField(blank=True, default="")
     status = models.CharField(
         max_length=10, choices=STATUS_CHOICES, default=PENDING, db_index=True
+    )
+    # Set when this order was SPLIT OFF another one by a partial move (user
+    # request: move only some lines/cases to Ready to Deliver). The link makes
+    # the tracking readable both ways — a split order says where its material
+    # came from and the source lists the parts it was broken into
+    # (`order.split_orders`). SET_NULL: deleting the source must never delete
+    # material that is already on its way out.
+    source_order = models.ForeignKey(
+        "self",
+        on_delete=models.SET_NULL,
+        null=True,
+        blank=True,
+        related_name="split_orders",
     )
 
     class Meta:
@@ -1158,6 +1179,19 @@ class ClientOrder(AuditModel):
     @property
     def undelivered_items(self):
         return [i for i in self.items.all() if not i.delivery_id]
+
+    @property
+    def undelivered_qty(self):
+        """Cases still to go out. With partial delivery this is the honest
+        figure for a row's subtitle — total_qty includes what already left."""
+        return sum((i.qty_cases for i in self.undelivered_items), Decimal("0"))
+
+    @property
+    def undelivered_amount(self):
+        """Value still to go out (what the Ready-to-Deliver panel quotes)."""
+        return money(
+            sum((i.line_amount for i in self.undelivered_items), Decimal("0"))
+        )
 
 
 class OrderItem(models.Model):

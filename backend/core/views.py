@@ -22,6 +22,7 @@ from .cogs import (
     apply_stock_adjustment,
     create_deliveries,
     create_delivery,
+    split_order_lines,
 )
 from .models import (
     Client,
@@ -34,6 +35,7 @@ from .models import (
     Material,
     MaterialBatch,
     MonthlyOverhead,
+    OrderItem,
     OverheadCategory,
     SKU,
     SKUMaterialRequirement,
@@ -2158,6 +2160,121 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
     def _order_payload(order):
         return ClientOrderSerializer(order).data
 
+    @staticmethod
+    def _fresh(order_id):
+        """
+        Re-read an order with its lines. The pipeline must JUDGE and SERIALISE
+        what was just written: `get_object()` prefetches the lines, and after a
+        partial delivery or a split that snapshot is stale (a line's quantity
+        changed, a remainder line was just created), which would misreport both
+        the status and the Ready-to-Deliver totals.
+        """
+        return (
+            ClientOrder.objects.select_related("client")
+            .prefetch_related("items__sku", "items__delivery")
+            .get(pk=order_id)
+        )
+
+    @classmethod
+    def _fresh_payload(cls, order_id):
+        return ClientOrderSerializer(cls._fresh(order_id)).data
+
+    def _parse_moves(self, order, allow_delivered=False):
+        """
+        Read the optional `items: [{item, qty_cases}]` selection from the body
+        (user request: partial moves and partial deliveries).
+
+        Returns `(moves, error)`:
+          - moves is None when the request selected nothing at all — every
+            caller then treats the WHOLE order as the unit, so the one-tap flow
+            is unchanged;
+          - moves is [(OrderItem, qty_cases), ...], each validated to be a line
+            of THIS order with 0 < qty <= that line's quantity.
+        Anything a line cannot give away is refused here, before a single row
+        is written: an amount larger than the line, an unknown/foreign line id,
+        the same line twice, or a line whose stock has already gone out.
+        """
+        raw = self.request.data.get("items")
+        if raw in (None, "", []):
+            return None, None
+        if not isinstance(raw, list):
+            return None, Response(
+                {"detail": "items must be a list of {item, qty_cases}."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        lines = {i.id: i for i in order.items.all()}
+        seen = set()
+        moves = []
+        for line in raw:
+            if not isinstance(line, dict):
+                return None, Response(
+                    {"detail": "Each item must be {item, qty_cases}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                item_id = int(line.get("item"))
+            except (TypeError, ValueError):
+                return None, Response(
+                    {"detail": "Each item must name the order line it moves."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            item = lines.get(item_id)
+            if item is None:
+                return None, Response(
+                    {"detail": f"Line {item_id} is not on order #{order.id}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if item_id in seen:
+                return None, Response(
+                    {"detail": f"Line {item_id} appears twice — combine the "
+                    "quantities into one entry."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            seen.add(item_id)
+            if item.delivery_id and not allow_delivered:
+                return None, Response(
+                    {"detail": f"{item.sku.description} has already been "
+                    "delivered — that stock has left the warehouse."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            try:
+                take = Decimal(str(line.get("qty_cases")))
+            except (TypeError, InvalidOperation):
+                return None, Response(
+                    {"detail": f"Quantity is required for line {item_id}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if take <= 0:
+                return None, Response(
+                    {"detail": f"Quantity must be greater than zero for line "
+                    f"{item_id}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            if take > item.qty_cases:
+                return None, Response(
+                    {"detail": f"Only {dstr(item.qty_cases)} cases of "
+                    f"{item.sku.description} are on line {item_id}."},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            moves.append((item, take))
+        return moves, None
+
+    def _split_response(self, order, moves, to_ready):
+        """
+        Split `moves` off `order` and answer with BOTH sides (a partial move is
+        a backend split, user request): the source order that stays behind and
+        the new order holding exactly what moved.
+        """
+        new_order = split_order_lines(order, moves, to_ready=to_ready)
+        return Response(
+            {
+                "order": self._fresh_payload(order.id),
+                "split": self._fresh_payload(new_order.id),
+                "partial": True,
+            }
+        )
+
     def create(self, request, *args, **kwargs):
         serializer = ClientOrderWriteSerializer(data=request.data)
         serializer.is_valid(raise_exception=True)
@@ -2187,8 +2304,18 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         return self.update(request, *args, **kwargs)
 
     def destroy(self, request, *args, **kwargs):
+        """
+        Soft-delete an order (user request: "delete the pending order if
+        required"). A Pending order, and a Ready-to-Deliver order that has sent
+        nothing, can both go: commitment is DERIVED from the lines, so deleting
+        an order hands its reserved material straight back to Stock in Hand.
+
+        Judged on the LINES rather than the stored status: as soon as any line
+        has a delivery behind it that stock has physically left, so the order
+        stays put until the delivery itself is voided.
+        """
         order = self.get_object()
-        if order.status == ClientOrder.DELIVERED:
+        if order.items.filter(delivery__isnull=False).exists():
             return Response(
                 {
                     "detail": "This order has deliveries against it â€” delete "
@@ -2212,13 +2339,17 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
 
         All-or-nothing: a shortfall on any line rolls the whole batch back, so
         an order is never left half-delivered.
+
+        With `items: [{item, qty_cases}]` only those cases go out (user request:
+        partial delivery). A line sent in part keeps the cases that left and
+        gets a new line for the rest, so the order stays in Ready to Deliver for
+        exactly what is still owed and its tracking always adds up.
         """
         order = self.get_object()
-        if order.status == ClientOrder.DELIVERED:
-            return Response(
-                {"detail": "This order has already been delivered."},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        # Pipeline rule (user request): a delivery can only happen for an
+        # order that has been moved through Ready to Deliver, so the Add
+        # Delivery screen can never send out something that was never ordered.
+        # Refused here means nothing was written and no stock moved.
         if order.status == ClientOrder.PENDING:
             return Response(
                 {
@@ -2227,12 +2358,28 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        # Judged on the LINES, not the stored status: an order stays
+        # deliverable while any line has no delivery behind it, and only a
+        # fully delivered one is refused. That is what keeps the Ready to
+        # Deliver bucket honest -- every order the summary lists in it can
+        # always be delivered, including one whose delivery was deleted again.
         pending = order.undelivered_items
         if not pending:
             return Response(
-                {"detail": "Nothing left to deliver on this order."},
+                {"detail": "This order has already been delivered."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        # Which cases go out now (user request: partial delivery). No `items` in
+        # the body means the whole of what is left, exactly as before.
+        moves, error = self._parse_moves(order)
+        if error:
+            return error
+        going = (
+            moves
+            if moves is not None
+            else [(item, item.qty_cases) for item in pending]
+        )
 
         raw_date = request.data.get("date")
         delivery_date = None
@@ -2247,23 +2394,55 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         force = bool(request.data.get("force"))
         note = request.data.get("note") or f"Order #{order.id}"
 
+        # Optional payment handed over as the order goes out (user request):
+        # it rides in the FIRST line's transaction, so the delivery and the
+        # money are saved together or not at all. A bad amount raises ValueError
+        # inside create_delivery -> the 400 below, with every line rolled back.
+        payment, payment_error = delivery_payment_request(request)
+        if payment_error:
+            return Response(
+                {"detail": payment_error}, status=status.HTTP_400_BAD_REQUEST
+            )
+
         try:
             with transaction.atomic():
                 made = []
-                for item in pending:
-                    delivery, _result = create_delivery(
+                last_result = None
+                for index, (item, qty_cases) in enumerate(going):
+                    if qty_cases < item.qty_cases:
+                        # Part of a line (user request: partial delivery): the
+                        # cases going out stay on this line — id, history and
+                        # delivery link included — and the cases left behind
+                        # become a NEW undelivered line, so the order stays in
+                        # the Ready bucket for exactly what is still owed.
+                        OrderItem.objects.create(
+                            order=order,
+                            sku=item.sku,
+                            qty_cases=item.qty_cases - qty_cases,
+                            selling_price_per_case=item.selling_price_per_case,
+                        )
+                        item.qty_cases = qty_cases
+                        item.save()
+                    delivery, last_result = create_delivery(
                         client=order.client,
                         sku=item.sku,
-                        qty_cases=item.qty_cases,
+                        qty_cases=qty_cases,
                         selling_price_per_case=item.selling_price_per_case,
                         delivery_date=delivery_date,
                         note=note,
                         force=force,
+                        payment=payment if index == 0 else None,
                     )
                     item.delivery = delivery
                     item.save()
                     made.append(delivery)
-                order.delivered_at = timezone.now()
+                # Re-read before judging this order: the splits above changed
+                # its lines, and the prefetched copy still holds the pre-write
+                # quantities — without the remainder lines recompute_status
+                # would call a part-delivered order DELIVERED.
+                order = self._fresh(order.id)
+                if not order.undelivered_items:
+                    order.delivered_at = timezone.now()
                 order.recompute_status()
         except DeliveryShortfall as exc:
             # Nothing was committed: the atomic block rolled every delivery and
@@ -2280,6 +2459,11 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                 status=status.HTTP_409_CONFLICT,
             )
         except ValueError as exc:
+            # Same stale-memo caveat as the shortfall path: the payment guard
+            # fires AFTER this line's FIFO consumption was computed inside the
+            # rolled-back transaction, so the memo has to be dropped before
+            # anything reads stock again.
+            perfcache.invalidate()
             return Response(
                 {"detail": str(exc)}, status=status.HTTP_400_BAD_REQUEST
             )
@@ -2287,16 +2471,38 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         return Response(
             {
                 "order": self._order_payload(order),
+                # True while cases are still owed: the UI says "part delivered"
+                # and the order stays in the Ready-to-Deliver queue.
+                "partial": bool(order.undelivered_items),
                 "deliveries": [
                     {
                         "id": d.id,
                         "sku": d.sku.description,
                         "qty_cases": dstr(d.qty_cases),
+                        "selling_price_per_case": dstr(d.selling_price_per_case),
+                        "amount": dstr(money(d.qty_cases * d.selling_price_per_case)),
                         "date": d.date.isoformat(),
                         "stock_shortfall_flag": d.stock_shortfall_flag,
                     }
                     for d in made
                 ],
+                "total_cases": dstr(sum((d.qty_cases for d in made), Decimal("0"))),
+                "total_amount": dstr(
+                    money(
+                        sum(
+                            (d.qty_cases * d.selling_price_per_case for d in made),
+                            Decimal("0"),
+                        )
+                    )
+                ),
+                # What the delivery screen shows after the fact: the client's
+                # live pending balance (read once the optional payment was
+                # booked) and the payment itself (null when none was handed
+                # over) -- the same two keys the Add-Delivery responses carry.
+                "client_pending_amount": (last_result or {}).get(
+                    "client_pending_amount"
+                ),
+                "payment": (last_result or {}).get("payment"),
             }
         )
 
@@ -2311,6 +2517,12 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         already committed) and excluding this order's own lines, so an order
         can never be blocked by itself. `force=true` proceeds anyway â€” the
         resulting negative available figure is what the UI warns about.
+
+        With `items: [{item, qty_cases}]` only part of the order moves and the
+        backend SPLITS it (user request): the moved lines/cases become their own
+        Ready-to-Deliver order (`source_order` pointing back at this one) and
+        everything left behind stays here, still Pending. Sufficiency is judged
+        on exactly the cases that are moving.
         """
         order = self.get_object()
         if order.status != ClientOrder.PENDING:
@@ -2321,16 +2533,22 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        moves, error = self._parse_moves(order)
+        if error:
+            return error
         lines = [(i.sku, i.qty_cases) for i in order.items.all()]
         if not lines:
             return Response(
                 {"detail": "This order has no items."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        # Whatever moves is what gets promised; the cases left behind keep
+        # committing nothing (the order stays Pending).
+        moving = lines if moves is None else [(item.sku, take) for item, take in moves]
 
         exclude = list(order.items.values_list("id", flat=True))
         shortages = cogs.check_shortfall_many(
-            order.client, lines, available_basis=True, exclude_item_ids=exclude
+            order.client, moving, available_basis=True, exclude_item_ids=exclude
         )
         if shortages and not request.data.get("force"):
             return Response(
@@ -2340,6 +2558,9 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                 },
                 status=status.HTTP_409_CONFLICT,
             )
+
+        if moves is not None:
+            return self._split_response(order, moves, to_ready=True)
 
         order.completed_at = timezone.now()
         order.recompute_status()
@@ -2351,6 +2572,11 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         Move a Ready-to-Deliver order back to Pending: its material returns to
         Stock in Hand. Refused once anything has been delivered, because that
         stock has physically left.
+
+        With `items: [{item, qty_cases}]` only part of the order goes back and
+        the backend SPLITS it (user request): the cases named come out into a
+        NEW Pending order, while the cases still promised to the client keep
+        their Ready-to-Deliver order exactly as it was.
         """
         order = self.get_object()
         if order.status == ClientOrder.DELIVERED:
@@ -2363,6 +2589,12 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
                 {"detail": "This order is not in Ready to Deliver."},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+        moves, error = self._parse_moves(order)
+        if error:
+            return error
+        if moves is not None:
+            return self._split_response(order, moves, to_ready=False)
+
         order.completed_at = None
         order.status = ClientOrder.PENDING
         order.save(skip_audit=True)

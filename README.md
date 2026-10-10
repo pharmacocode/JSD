@@ -201,6 +201,66 @@ screens instant and the API quiet. Nothing here changes the business rules.
   live sum of `ClientLedgerEntry.amount` (positive = delivery, negative =
   payment), plus the optional *balance marker* described next. No running total
   is ever stored.
+- **A delivery can only come from the order pipeline (user request):** Enter
+  Order -> Ready to Deliver -> Add Delivery is the single sanctioned path. The
+  Add Delivery screen lists only the Ready-to-Deliver bucket (one tap opens a
+  confirmation showing the remaining lines, with an editable delivery date, a
+  note and the optional payment), and `POST /api/orders/<id>/deliver/` refuses
+  an order that is still PENDING or already fully delivered, so nothing can be
+  sent out that was never ordered. Deliverability is judged on the LINES, not
+  the stored status: a multi-line order whose delivery was deleted stays in the
+  bucket for the lines still to go out. `StockDelivery` admin add is disabled
+  for the same reason. The whole order goes out in ONE atomic request — one
+  `StockDelivery` per undelivered line, or only the cases named in the
+  request's `items` — and the response returns `deliveries[]`
+  (each with `selling_price_per_case` / `amount`), `total_cases`,
+  `total_amount`, `client_pending_amount` and `payment`.
+
+- **Orders can be edited or deleted until their stock leaves (user request):**
+  the pipeline screens carry **Edit** and **Delete** on every row that is still
+  changeable, so a mistake can be taken back: a PENDING order — and a Ready-to-
+  Deliver one that has sent nothing — can be deleted. Deleting soft-deletes it
+  (`is_deleted`, spec 3.7) via `DELETE /api/orders/<id>/`, so the row and its
+  lines survive in the audit trail while the material it was reserving
+  returns to Stock in Hand (commitment is derived from the lines, never
+  stored). The judgement is on the LINES again, not the stored status: as soon
+  as one line has a delivery behind it, both are refused with a `400` (delete
+  those deliveries from the deliveries list first) — that stock has
+  physically left. Editing reuses the Enter-Order dialog. The update replaces
+  the whole line set (`PUT /api/orders/<id>/`), and PATCH is refused for that
+  same reason: a partial payload could otherwise silently drop lines.
+- **Part of an order can move through the pipeline (user request — backend
+  split):** Pending -> Ready to Deliver and Ready -> Pending both accept
+  `items: [{item, qty_cases}]`, where `item` is an ORDER LINE id and the
+  quantity may be anything from 1 up to what that line holds. Only those cases
+  change bucket and the caller gets **both sides** back — the source order
+  that stayed (`order`), a new order holding exactly what moved (`split`) and a
+  `partial: true` flag — the UI shows the new one as *split from #N*. A line that
+  moves whole is **reassigned** to the split order and keeps its identity (its
+  id, edit history and, where it applied, its delivery link); only a line sent
+  in part is split into a new line — so nothing is duplicated and no case is
+  ever counted twice. With no `items` the whole order moves as one, which is the
+  original one-tap flow, byte for byte. Free stock is judged against today's
+  Stock in Hand BEFORE anything is written (`force: true` overrides), and an
+  unknown/foreign line, a line already delivered, the same line twice or a
+  quantity larger than the line is rejected with a `400` before a single row is
+  written.
+- **Part of an order can be delivered (user request):** the Add-Delivery
+  confirmation lists the remaining lines ticked at full quantity, and both the
+  tick and the cases can be trimmed — send 8 of 10 cases now and keep the
+  client's order standing for the other two. `POST /api/orders/<id>/deliver/`
+  takes the same `items: [{item, qty_cases}]`: a whole line goes through the
+  normal delivery path and keeps its identity, a part line is split so the
+  remainder stays on the order, and every case still passes through
+  `cogs.create_delivery` (FIFO consumption, ledger entry, COGS snapshots,
+  shortfall check) — one `StockDelivery` per line, all or nothing, a shortfall
+  still rolls the request back with a `409` and `shortages[]`. The response
+  adds `partial` (true while cases are still owed) and every order carries
+  `undelivered_qty` / `undelivered_amount`, so a part-delivered order **stays**
+  in the Ready-to-Deliver bucket with the leftover cases and value on it (chipped
+  *part delivered*), and the client's pending amount only moves by what actually
+  went out. Sending a whole order still sends no `items` at all.
+
 - **Payment noted at delivery entry (user request):** the Add-Delivery screen
   carries an optional **Payment** section — a switch (off by default), the amount
   (pre-filled with the full delivery value, still editable), a payment date
@@ -212,10 +272,11 @@ screens instant and the API quiet. Nothing here changes the business rules.
   immediately — the delivery and the payment are saved together or not at all.
   A blank/zero amount simply means "no payment"; a negative or unreadable amount
   (or unreadable date) rejects the whole delivery with a `400`. API:
-  `payment: {amount, date?, note?}` on `POST /api/deliveries/` and
-  `POST /api/deliveries/bulk/` (flat `payment_amount` / `payment_date` /
-  `payment_note` keys also accepted); both responses return `payment` (`null`
-  when none was entered) and `client_pending_amount` **after** it.
+  `payment: {amount, date?, note?}` on `POST /api/deliveries/`,
+  `POST /api/deliveries/bulk/` and `POST /api/orders/<id>/deliver/` (flat
+  `payment_amount` / `payment_date` / `payment_note` keys also accepted); every
+  response returns `payment` (`null` when none was entered) and
+  `client_pending_amount` **after** it.
 - **Balance markers ("pending amount as of a date", user request):** the client's
   pending amount and the vendor's payable can be **edited at any time together
   with the date they refer to** (`Client.pending_as_of_amount` /

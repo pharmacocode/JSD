@@ -2929,6 +2929,82 @@ class OrderDeliveryTests(OrdersPipelineBase, TestCase):
         self.assertEqual(order.status, ClientOrder.COMPLETED)
         self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("10"))
 
+    def test_delivery_needs_the_order_to_be_ready_first(self):
+        """
+        The pipeline rule the Add Delivery screen stands on (user request): a
+        pending order cannot be delivered, and a refused call moves nothing.
+        """
+        created = self.make_order(qty=D("10"))
+        resp = self.api.post(f"/api/orders/{created.data['id']}/deliver/")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("Ready to Deliver", resp.data["detail"])
+        self.assertEqual(StockDelivery.objects.count(), 0)
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("100"))
+        # The order still committed in setUp is untouched by the refusal.
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("10"))
+
+    def test_delivering_the_same_order_twice_is_refused(self):
+        """No second delivery for the same order: stock and ledger stay put."""
+        first = self.api.post(f"/api/orders/{self.order['id']}/deliver/")
+        self.assertEqual(first.status_code, 200)
+        again = self.api.post(f"/api/orders/{self.order['id']}/deliver/")
+        self.assertEqual(again.status_code, 400)
+        self.assertIn("already been delivered", again.data["detail"])
+        self.assertEqual(StockDelivery.objects.count(), 1)
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("90"))
+        self.assertEqual(
+            ClientLedgerEntry.objects.filter(
+                entry_type="DELIVERY", is_deleted=False
+            ).count(),
+            1,
+        )
+
+    def test_payment_can_be_noted_while_delivering_the_order(self):
+        """
+        The optional Payment section of the confirm dialog (user request): the
+        money is captured as a normal client transaction in the same request.
+        """
+        resp = self.api.post(
+            f"/api/orders/{self.order['id']}/deliver/",
+            {
+                "date": "2026-10-05",
+                "payment": {"amount": "1200", "date": "2026-10-05", "note": "UPI"},
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        entry = ClientLedgerEntry.objects.get(entry_type="PAYMENT")
+        self.assertEqual(entry.amount, D("-1200"))  # payment reduces pending
+        self.assertEqual(entry.note, "UPI")
+        self.assertEqual(entry.date, date(2026, 10, 5))
+        # Linked to the delivery this order produced, exactly like the
+        # single-SKU Add-Delivery path.
+        self.assertEqual(entry.related_delivery_id, resp.data["deliveries"][0]["id"])
+        self.assertEqual(resp.data["payment"]["amount"], "1200.00")
+        # 10 cases x 300 = 3000 on credit, 1200 handed over -> 1800 pending.
+        self.assertEqual(resp.data["client_pending_amount"], "1800.00")
+        # dstr() drops trailing zeros, so compare the totals numerically.
+        self.assertEqual(D(resp.data["total_amount"]), D("3000.00"))
+        self.assertEqual(D(resp.data["total_cases"]), D("10"))
+        self.assertEqual(D(resp.data["deliveries"][0]["amount"]), D("3000.00"))
+        self.assertEqual(resp.data["deliveries"][0]["sku"], "500ml")
+
+    def test_a_bad_payment_amount_rolls_the_whole_order_back(self):
+        """A rejected payment must not leave the order half-delivered."""
+        resp = self.api.post(
+            f"/api/orders/{self.order['id']}/deliver/",
+            {"payment": {"amount": "-5"}},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(StockDelivery.objects.count(), 0)
+        order = ClientOrder.objects.get(id=self.order["id"])
+        self.assertEqual(order.status, ClientOrder.COMPLETED)
+        self.assertEqual(cogs_mod.stock_map()[self.bottle.id], D("100"))
+        self.assertEqual(
+            ClientLedgerEntry.objects.filter(entry_type="PAYMENT").count(), 0
+        )
+
     def test_partial_delivery_commits_only_what_came_back(self):
         """
         Order A fully delivered then deleted, while order B is still ready:
@@ -3216,6 +3292,282 @@ class OrderEditTests(OrdersPipelineBase, TestCase):
         names = {c["material"] for c in resp.data["commitment"]}
         self.assertIn("Bottle", names)
         self.assertIn("Label", names)
+
+
+
+class OrderSplitTests(OrdersPipelineBase, TestCase):
+    """
+    Partial moves (user request): moving part of an order to Ready to Deliver —
+    or part of it back to Pending — SPLITS the order in the backend, and a
+    partial delivery splits the line, so every case stays tracked exactly once.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.make_order_world()
+        self.arrive(self.bottle, "100")
+        self.arrive(self.label, "100")
+
+    def lines(self, order_id):
+        return list(OrderItem.objects.filter(order_id=order_id).order_by("id"))
+
+    def test_partial_move_to_ready_splits_the_order_in_two(self):
+        """
+        Moving 3 of 10 cases to Ready to Deliver gives the moved cases their own
+        Ready-to-Deliver order and leaves the other 7 behind, still Pending.
+        Only the cases that actually moved are committed.
+        """
+        order = self.make_order(qty=D("10")).data
+        line_id = order["items"][0]["id"]
+        resp = self.api.post(
+            f"/api/orders/{order['id']}/complete/",
+            {"items": [{"item": line_id, "qty_cases": "3"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["partial"])
+
+        # Parent: what stayed behind, still Pending.
+        parent = ClientOrder.objects.get(id=order["id"])
+        self.assertEqual(parent.status, ClientOrder.PENDING)
+        self.assertEqual(parent.total_qty, D("7"))
+        self.assertIsNone(parent.completed_at)
+        self.assertIsNone(parent.source_order)
+
+        # Split: what moved, ready to go out, linked back to where it came from.
+        split = ClientOrder.objects.get(id=resp.data["split"]["id"])
+        self.assertEqual(split.status, ClientOrder.COMPLETED)
+        self.assertEqual(split.total_qty, D("3"))
+        self.assertEqual(split.source_order_id, parent.id)
+        self.assertEqual(parent.split_orders.count(), 1)
+        # The price travelled with the moved cases.
+        self.assertEqual(split.items.get().selling_price_per_case, D("300"))
+
+        # Commitment follows the cases that moved, and only those.
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("3"))
+        self.assertEqual(self.available(self.bottle), D("97"))
+
+        # Both halves show up on the status board, each on its own side.
+        summary = self.api.get("/api/orders/summary/").data
+        self.assertEqual([o["id"] for o in summary["pending"]], [parent.id])
+        self.assertEqual([o["id"] for o in summary["ready"]], [split.id])
+        self.assertEqual(D(summary["ready"][0]["undelivered_qty"]), D("3"))
+        self.assertEqual(summary["ready"][0]["source_order"], parent.id)
+
+    def test_partial_move_of_one_line_out_of_two_keeps_the_line_id(self):
+        """
+        A line that is taken WHOLE is reassigned, not copied: its id, price and
+        future delivery link stay with the material it stands for.
+        """
+        second = self.make_sku("1L", [(self.bottle, "1")])
+        self.set_client_price(second, "150")
+        order = self.make_order(
+            items=[
+                {"sku": self.sku.id, "qty_cases": "10"},
+                {"sku": second.id, "qty_cases": "5"},
+            ]
+        ).data
+        moved_id = order["items"][1]["id"]
+        resp = self.api.post(
+            f"/api/orders/{order['id']}/complete/",
+            {"items": [{"item": moved_id, "qty_cases": "5"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        split = ClientOrder.objects.get(id=resp.data["split"]["id"])
+        self.assertEqual([i.id for i in self.lines(split.id)], [moved_id])
+        self.assertEqual(
+            [i.sku_id for i in self.lines(order["id"])], [self.sku.id]
+        )
+        self.assertEqual(split.total_amount, D("750.00"))
+
+    def test_partial_move_judges_stock_on_what_moves_only(self):
+        """
+        The cases left behind stay Pending and commit nothing, so a part-move is
+        judged on the cases that move: 60 of the 100 bottles on hand goes
+        through, and the next order then finds only 40 free.
+        """
+        order = self.make_order(qty=D("100")).data
+        ok = self.api.post(
+            f"/api/orders/{order['id']}/complete/",
+            {"items": [{"item": order["items"][0]["id"], "qty_cases": "60"}]},
+            format="json",
+        )
+        self.assertEqual(ok.status_code, 200)
+        self.assertEqual(self.available(self.bottle), D("40"))
+
+        other = self.make_order(qty=D("70")).data
+        over = self.api.post(
+            f"/api/orders/{other['id']}/complete/",
+            {"items": [{"item": other["items"][0]["id"], "qty_cases": "70"}]},
+            format="json",
+        )
+        self.assertEqual(over.status_code, 409)
+        short = {s["material"]: D(s["short_by"]) for s in over.data["shortages"]}
+        self.assertEqual(short["Bottle"], D("30"))
+        # Refused means nothing moved: the order is still whole and Pending.
+        self.assertEqual(
+            ClientOrder.objects.get(id=other["id"]).status, ClientOrder.PENDING
+        )
+        self.assertEqual(len(self.lines(other["id"])), 1)
+
+        forced = self.api.post(
+            f"/api/orders/{other['id']}/complete/",
+            {
+                "items": [
+                    {"item": other["items"][0]["id"], "qty_cases": "70"}
+                ],
+                "force": True,
+            },
+            format="json",
+        )
+        self.assertEqual(forced.status_code, 200)
+        self.assertEqual(self.available(self.bottle), D("-30"))
+
+    def test_partial_move_rejects_selections_that_make_no_sense(self):
+        order = self.make_order(qty=D("10")).data
+        line_id = order["items"][0]["id"]
+        url = f"/api/orders/{order['id']}/complete/"
+        bad = [
+            [{"item": line_id, "qty_cases": "11"}],  # more than the line holds
+            [{"item": line_id, "qty_cases": "0"}],  # nothing at all
+            [{"item": 999999, "qty_cases": "1"}],  # not a line of this order
+            [
+                {"item": line_id, "qty_cases": "1"},
+                {"item": line_id, "qty_cases": "1"},
+            ],  # the same line twice
+            [{"qty_cases": "1"}],  # no line named
+        ]
+        for items in bad:
+            resp = self.api.post(url, {"items": items}, format="json")
+            self.assertEqual(resp.status_code, 400, items)
+        # Every refusal left the order exactly as it was.
+        self.assertEqual(
+            ClientOrder.objects.get(id=order["id"]).status, ClientOrder.PENDING
+        )
+        self.assertEqual([i.qty_cases for i in self.lines(order["id"])], [D("10")])
+
+    def test_a_line_that_already_shipped_cannot_be_moved_back(self):
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.api.post(
+            f"/api/orders/{order['id']}/deliver/",
+            {"items": [{"item": order["items"][0]["id"], "qty_cases": "4"}]},
+            format="json",
+        )
+        shipped = self.lines(order["id"])[0]
+        self.assertIsNotNone(shipped.delivery_id)
+        resp = self.api.post(
+            f"/api/orders/{order['id']}/reopen/",
+            {"items": [{"item": shipped.id, "qty_cases": "1"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_partial_delivery_leaves_the_rest_ready_to_deliver(self):
+        """
+        Sending 4 of 10 cases out keeps the order in the queue for the 6 still
+        owed, and the stock and ledger only move by what actually left.
+        """
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        resp = self.api.post(
+            f"/api/orders/{order['id']}/deliver/",
+            {"items": [{"item": order["items"][0]["id"], "qty_cases": "4"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["partial"])
+        self.assertEqual(D(resp.data["total_cases"]), D("4"))
+        self.assertEqual(D(resp.data["total_amount"]), D("1200"))
+        self.assertEqual(D(resp.data["order"]["undelivered_qty"]), D("6"))
+
+        row = ClientOrder.objects.get(id=order["id"])
+        self.assertEqual(row.status, ClientOrder.COMPLETED)
+        self.assertIsNone(row.delivered_at)  # not finished yet
+        self.assertEqual(row.undelivered_qty, D("6"))
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("6"))
+        # One delivery, for the 4 cases that left, and one ledger entry.
+        self.assertEqual(StockDelivery.objects.filter(sku=self.sku).count(), 1)
+        self.assertEqual(
+            ClientLedgerEntry.objects.filter(
+                client=self.client_obj, entry_type="DELIVERY"
+            ).count(),
+            1,
+        )
+        # The queue still offers it, with only the cases still owed.
+        summary = self.api.get("/api/orders/summary/").data
+        self.assertEqual([o["id"] for o in summary["ready"]], [row.id])
+
+        # The rest goes out later; only then is the order DELIVERED.
+        owed = [i for i in self.lines(order["id"]) if not i.delivery_id][0]
+        second = self.api.post(
+            f"/api/orders/{order['id']}/deliver/",
+            {"items": [{"item": owed.id, "qty_cases": "6"}]},
+            format="json",
+        )
+        self.assertEqual(second.status_code, 200)
+        self.assertFalse(second.data["partial"])
+        row.refresh_from_db()
+        self.assertEqual(row.status, ClientOrder.DELIVERED)
+        self.assertIsNotNone(row.delivered_at)
+        self.assertEqual(StockDelivery.objects.filter(sku=self.sku).count(), 2)
+        self.assertEqual(cogs_mod.committed_map(), {})
+
+    def test_partial_move_back_to_pending_splits_off_a_pending_order(self):
+        """
+        Handing 4 of the 10 promised cases back to Pending leaves the promise
+        that still stands untouched in Ready to Deliver and gives the 4 returned
+        cases a Pending order of their own.
+        """
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        self.assertEqual(self.available(self.bottle), D("90"))
+        resp = self.api.post(
+            f"/api/orders/{order['id']}/reopen/",
+            {"items": [{"item": order["items"][0]["id"], "qty_cases": "4"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["partial"])
+        self.assertEqual(resp.data["order"]["status"], "COMPLETED")
+        self.assertEqual(D(resp.data["order"]["undelivered_qty"]), D("6"))
+        self.assertEqual(resp.data["split"]["status"], "PENDING")
+        self.assertEqual(D(resp.data["split"]["total_qty"]), D("4"))
+        self.assertEqual(resp.data["split"]["source_order"], order["id"])
+        # The promise shrank to 6 and the returned 4 are free again.
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("6"))
+        self.assertEqual(self.available(self.bottle), D("94"))
+
+    def test_pending_and_unsent_orders_can_be_deleted_but_shipped_ones_cannot(self):
+        """
+        "Delete the pending order if required" — and a Ready-to-Deliver order
+        that has sent nothing, which hands its stock straight back.
+        """
+        pending = self.make_order(qty=D("10")).data
+        self.assertEqual(
+            self.api.delete(f"/api/orders/{pending['id']}/").status_code, 204
+        )
+
+        ready = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{ready['id']}/complete/")
+        self.assertEqual(self.available(self.bottle), D("90"))
+        self.assertEqual(
+            self.api.delete(f"/api/orders/{ready['id']}/").status_code, 204
+        )
+        self.assertEqual(self.available(self.bottle), D("100"))
+
+        shipped = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{shipped['id']}/complete/")
+        self.api.post(
+            f"/api/orders/{shipped['id']}/deliver/",
+            {"items": [{"item": shipped["items"][0]["id"], "qty_cases": "4"}]},
+            format="json",
+        )
+        resp = self.api.delete(f"/api/orders/{shipped['id']}/")
+        self.assertEqual(resp.status_code, 400)
+        # Half delivered: still live, still tracking the 6 cases owed.
+        self.assertFalse(ClientOrder.objects.get(id=shipped["id"]).is_deleted)
 
 
 

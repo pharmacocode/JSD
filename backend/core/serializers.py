@@ -503,6 +503,15 @@ class ClientOrderSerializer(serializers.ModelSerializer):
     total_amount = serializers.DecimalField(
         max_digits=14, decimal_places=2, read_only=True
     )
+    # What is still to go out. For an order that was split (partial move) or
+    # part-delivered these are the honest figures: total_* counts the whole
+    # order, including cases that have already left the warehouse.
+    undelivered_qty = serializers.DecimalField(
+        max_digits=14, decimal_places=4, read_only=True
+    )
+    undelivered_amount = serializers.DecimalField(
+        max_digits=14, decimal_places=2, read_only=True
+    )
     status_display = serializers.CharField(
         source="get_status_display", read_only=True
     )
@@ -522,10 +531,20 @@ class ClientOrderSerializer(serializers.ModelSerializer):
             "items",
             "total_qty",
             "total_amount",
+            "undelivered_qty",
+            "undelivered_amount",
+            # Lineage of a split order (null unless it was split off another).
+            "source_order",
             "is_deleted",
             "created_at",
         ]
-        read_only_fields = ["status", "completed_at", "delivered_at", "is_deleted"]
+        read_only_fields = [
+            "status",
+            "completed_at",
+            "delivered_at",
+            "source_order",
+            "is_deleted",
+        ]
 
 
 class ClientOrderWriteSerializer(serializers.Serializer):
