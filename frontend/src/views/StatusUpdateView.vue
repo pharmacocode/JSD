@@ -75,24 +75,16 @@ function movableLines(order) {
 /** The picker's lines; safe to evaluate before an order is chosen (`moveOrder` starts null). */
 const moveLines = computed(() => movableLines(moveOrder.value))
 
-function skuSummary(order) {
-  return openLines(order)
-    .map((i) => `${i.sku_description} × ${num(i.qty_cases)}`)
-    .join(' · ')
-}
-
 /**
  * Cases still owed lead the row, because that — not the original total — is
- * what this board can still move or deliver.
+ * what this board can still move or deliver. The SKU lines and the
+ * "split from #12" lineage render as their own wrapping elements (see the
+ * style block) so the quantities stay readable on a phone.
  */
-function subtitle(order) {
+function qtyFigure(order) {
   const owed = Number(order.undelivered_qty ?? order.total_qty)
   const total = Number(order.total_qty)
-  const figure =
-    owed < total ? `${num(owed)} of ${num(total)} cases left` : `${num(total)} cases`
-  // "split from #12": this order was carved out of another one (partial move).
-  const lineage = order.source_order ? ` · split from #${order.source_order}` : ''
-  return `${figure} · ${skuSummary(order)}${lineage}`
+  return owed < total ? `${num(owed)} of ${num(total)} cases left` : `${num(total)} cases`
 }
 
 // ---------------------------------------------------------------------------
@@ -220,7 +212,7 @@ onMounted(load)
   <v-app>
     <v-main>
       <v-container class="py-6" style="max-width: 900px">
-        <div class="text-h6 font-weight-bold mb-1">Order status</div>
+        <div class="text-subtitle-1 text-sm-h6 font-weight-bold mb-1">Order status</div>
         <div class="text-body-2 text-medium-emphasis mb-4">
           Move an order's stock to Ready to Deliver, send it back to Pending, or
           take part of it across — both buttons open a picker where every line
@@ -243,7 +235,7 @@ onMounted(load)
             <v-chip color="warning" variant="flat" size="small" class="font-weight-bold">
               {{ pending.length }}
             </v-chip>
-            <span class="text-uppercase font-weight-bold text-medium-emphasis">
+            <span class="text-body-2 text-sm-subtitle-1 text-uppercase font-weight-bold text-medium-emphasis">
               Pending Orders
             </span>
           </v-card-title>
@@ -252,9 +244,21 @@ onMounted(load)
               <v-list-item
                 v-for="o in pending"
                 :key="o.id"
-                :title="`#${o.id} — ${o.client_name}`"
-                :subtitle="subtitle(o)"
+                class="order-row"
               >
+                <div class="order-row__head">
+                  <span class="order-row__id">#{{ o.id }}</span>
+                  <span class="order-row__client">{{ o.client_name }}</span>
+                  <v-chip v-if="o.source_order" size="x-small" variant="tonal" class="order-row__lineage">
+                    split from #{{ o.source_order }}
+                  </v-chip>
+                </div>
+                <div class="order-row__figure">{{ qtyFigure(o) }}</div>
+                <div class="order-row__skus">
+                  <span v-for="i in openLines(o)" :key="i.id" class="order-row__sku">
+                    {{ i.sku_description }} <b>× {{ num(i.qty_cases) }}</b>
+                  </span>
+                </div>
                 <template #append>
                   <v-btn
                     size="small"
@@ -289,7 +293,7 @@ onMounted(load)
             <v-chip color="success" variant="flat" size="small" class="font-weight-bold">
               {{ completed.length }}
             </v-chip>
-            <span class="text-uppercase font-weight-bold text-medium-emphasis">
+            <span class="text-body-2 text-sm-subtitle-1 text-uppercase font-weight-bold text-medium-emphasis">
               Completed Orders
             </span>
           </v-card-title>
@@ -298,9 +302,21 @@ onMounted(load)
               <v-list-item
                 v-for="o in completed"
                 :key="o.id"
-                :title="`#${o.id} — ${o.client_name}`"
-                :subtitle="subtitle(o)"
+                class="order-row"
               >
+                <div class="order-row__head">
+                  <span class="order-row__id">#{{ o.id }}</span>
+                  <span class="order-row__client">{{ o.client_name }}</span>
+                  <v-chip v-if="o.source_order" size="x-small" variant="tonal" class="order-row__lineage">
+                    split from #{{ o.source_order }}
+                  </v-chip>
+                </div>
+                <div class="order-row__figure">{{ qtyFigure(o) }}</div>
+                <div class="order-row__skus">
+                  <span v-for="i in openLines(o)" :key="i.id" class="order-row__sku">
+                    {{ i.sku_description }} <b>× {{ num(i.qty_cases) }}</b>
+                  </span>
+                </div>
                 <template #append>
                   <v-chip
                     v-if="partDelivered(o)"
@@ -373,3 +389,96 @@ onMounted(load)
     </v-main>
   </v-app>
 </template>
+
+<style scoped>
+/* Rows: keep every order detail visible at any width (user request). The
+   stock v-list-item truncates its title/subtitle with an ellipsis and parks
+   the append buttons in a fixed `auto` column, which squeezes the text off
+   small screens entirely. Rows instead render their own wrapping elements,
+   and below 600px the buttons drop onto their own line under the details. */
+.order-row {
+  align-items: flex-start;
+}
+
+.order-row :deep(.v-list-item__content) {
+  align-self: start;
+  min-width: 0;
+  overflow: visible;
+  padding-block: 4px;
+}
+
+.order-row :deep(.v-list-item__append) {
+  flex-wrap: wrap;
+}
+
+.order-row__head {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  font-size: 1rem;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.order-row__id {
+  font-weight: 700;
+}
+
+.order-row__client {
+  font-weight: 500;
+}
+
+/* "N cases" / "N of M cases left" — the figure this board acts on. */
+.order-row__figure {
+  margin-top: 2px;
+  font-size: 0.875rem;
+  font-weight: 600;
+  line-height: 1.35;
+  overflow-wrap: anywhere;
+}
+
+.order-row__skus {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+
+.order-row__sku {
+  background: rgba(var(--v-theme-on-surface), 0.06);
+  border-radius: 999px;
+  font-size: 0.8125rem;
+  line-height: 1.45;
+  padding: 1px 10px;
+  overflow-wrap: anywhere;
+}
+
+@media (max-width: 600px) {
+  .order-row {
+    grid-template-areas:
+      "content"
+      "append";
+    grid-template-columns: minmax(0, 1fr);
+    row-gap: 4px;
+  }
+
+  .order-row :deep(.v-list-item__append) {
+    justify-content: flex-start;
+    margin-left: 0;
+    padding-top: 0;
+  }
+
+  .order-row__head {
+    font-size: 0.9375rem;
+  }
+
+  .order-row__figure {
+    font-size: 0.8125rem;
+  }
+
+  .order-row__sku {
+    font-size: 0.75rem;
+  }
+}
+</style>
