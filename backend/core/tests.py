@@ -1356,9 +1356,11 @@ class ClientStatementTests(TestCase):
     """
     The client Deliveries Export (user request): GET
     /api/clients/<id>/statement/?from=&to= drives the delivery-statement PDF —
-    one row per delivery in the range with its line revenue and CURRENT direct
-    cost, plus the payments and balance math (previous due -> total due) the
-    PDF renders underneath.
+    one row per delivery in the range with its line revenue, the payments
+    received in the range and the balance math (previous due -> total due) the
+    PDF renders underneath. The document is CLIENT-FACING, so it deliberately
+    carries no cost or profit figures (user request) — those stay on the
+    owner's screens.
     """
 
     def setUp(self):
@@ -1404,6 +1406,7 @@ class ClientStatementTests(TestCase):
             entry_type="PAYMENT",
             amount=D("-2000"),
             date=date(2026, 9, 25),
+            note="part payment",
         )
         resp = self.api.get(self.url, {"from": "2026-09-01", "to": "2026-09-30"})
         self.assertEqual(resp.status_code, 200)
@@ -1411,20 +1414,25 @@ class ClientStatementTests(TestCase):
         self.assertEqual(resp.data["from"], "2026-09-01")
         self.assertEqual(resp.data["to"], "2026-09-30")
 
-        # Delivery by delivery, oldest first, each line carrying its cost so
-        # the PDF can show the cost of every consignment.
+        # Delivery by delivery, oldest first. Client-facing: the row carries
+        # revenue only — no direct cost or any other internal figure.
         rows = resp.data["deliveries"]
         self.assertEqual(len(rows), 2)
         self.assertEqual(rows[0]["date"], "2026-09-10")
         self.assertEqual(D(rows[0]["qty_cases"]), D("10"))
         self.assertEqual(rows[0]["line_amount"], "3000.00")
-        self.assertEqual(rows[0]["line_direct_cost"], "2400.00")
+        self.assertNotIn("line_direct_cost", rows[0])
         self.assertEqual(rows[1]["line_amount"], "1500.00")
-        self.assertEqual(rows[1]["line_direct_cost"], "1200.00")
+        self.assertNotIn("line_direct_cost", rows[1])
 
         self.assertEqual(resp.data["period_revenue"], "4500.00")
-        self.assertEqual(resp.data["period_direct_cost"], "3600.00")
+        self.assertNotIn("period_direct_cost", resp.data)
         self.assertEqual(resp.data["payments_total"], "2000.00")
+        # The payment is itemised for the PDF (date / note / positive amount).
+        self.assertEqual(
+            resp.data["payments"],
+            [{"date": "2026-09-25", "note": "part payment", "amount": "2000.00"}],
+        )
         # Nothing before the range -> previous due is 0; total = revenue - pay.
         self.assertEqual(resp.data["previous_due"], "0.00")
         self.assertEqual(resp.data["total_due"], "2500.00")
@@ -1882,6 +1890,49 @@ class DashboardSummaryTests(TestCase):
             D(stats["total_direct_cost"]),
         )
 
+    def test_register_rows_carry_dashboard_profit(self):
+        """
+        User bug report: the Home register Export PDF's profit total disagreed
+        with the Home tile. A per-DELIVERY FIFO walk prices every delivery
+        against the FRONT of the queue (cheap stock double-counted once
+        deliveries share a batch), so /deliveries/ now also ships each row's
+        profit computed exactly the way the tile computes it — one blended
+        walk over the whole set, plus the row's own-month overhead share.
+        The rows must add up to the tile to the paise.
+        """
+        # The cheap batch only covers part of the month's demand; the rest
+        # rolls into a dearer batch. One walk over both deliveries prices
+        # 2 @ 10 + 5 @ 25, while a per-delivery walk would hand both the
+        # cheap price — exactly the drift the old export summed up.
+        MaterialBatch.objects.filter(material=self.mat).update(
+            quantity_remaining=D("2")
+        )
+        make_batch(self.mat, "10", "25", arrival=date(2026, 9, 5))
+
+        stats = self.stats()
+        self.assertEqual(D(stats["total_direct_cost"]), D("145"))  # 2×10 + 5×25
+
+        rows = self.api.get(
+            "/api/deliveries/", {"from": "2026-09-01", "to": "2026-09-30"}
+        ).data["results"]
+        self.assertEqual(len(rows), 2)
+        # dynamic_costs_for prices the WHOLE set at one blended unit cost
+        # (145 / 7 per case) and charges each row its proportional share, so
+        # Beta's row is 2000 − 5×(145/7) − 250 = 1646.43 — where a naive
+        # per-row walk (2 @ 10 + 3 @ 25 = 19/case) would say
+        # 2000 − 5×(19+50) = 1655. The blended rows add up to the tile.
+        beta = next(r for r in rows if r["client_name"] == "Beta")
+        self.assertEqual(D(beta["profit_excl_overhead"]), D("1896.43"))
+        self.assertEqual(D(beta["profit_incl_overhead"]), D("1646.43"))
+        self.assertEqual(
+            sum((D(r["profit_excl_overhead"]) for r in rows), D("0")),
+            D(stats["total_profit_excl_overhead"]),
+        )
+        self.assertEqual(
+            sum((D(r["profit_incl_overhead"]) for r in rows), D("0")),
+            D(stats["total_profit_incl_overhead"]),
+        )
+
     def test_delivery_api_costs_are_dynamic(self):
         """
         The deliveries API serves recomputed costs (today's queue + current
@@ -1995,10 +2046,13 @@ class DashboardSummaryTests(TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["date"], "2026-09-10")
         # Cost fields the Home export's profit column is computed from ride
-        # along on every row.
+        # along on every row — plus the tile-matched blended profit figures
+        # the register Export PDF totals from.
         self.assertIn("base_cogs_per_case", rows[0])
         self.assertIn("cogs_per_case_current", rows[0])
         self.assertIn("total_amount", rows[0])
+        self.assertIn("profit_excl_overhead", rows[0])
+        self.assertIn("profit_incl_overhead", rows[0])
 
     def test_inward_row_reconciles_the_month(self):
         """
@@ -3760,6 +3814,90 @@ class OrderSplitTests(OrdersPipelineBase, TestCase):
         self.assertEqual(resp.status_code, 400)
         # Half delivered: still live, still tracking the 6 cases owed.
         self.assertFalse(ClientOrder.objects.get(id=shipped["id"]).is_deleted)
+
+
+class CleanupEmptySplitOrdersCommandTests(OrdersPipelineBase, TestCase):
+    """
+    Approved fix-up tool (user request): before the whole-selection split fix,
+    confirming the line picker with every line ticked at full quantity ran the
+    SPLIT path and left the source order as an EMPTY shell on the board
+    (0 items) while the real cases lived on the child order.
+    `cleanup_empty_split_orders` reports those shells read-only and
+    soft-deletes them only with --apply — the children, their items,
+    deliveries and ledger entries stay untouched.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.make_order_world()
+        self.arrive(self.bottle, "100")
+        self.arrive(self.label, "100")
+
+    def _run(self, *args):
+        out = StringIO()
+        call_command("cleanup_empty_split_orders", *args, stdout=out)
+        return out.getvalue()
+
+    def _bug_shell(self, qty=D("10")):
+        """Reproduce the pre-fix bug: a full-quantity split empties the source."""
+        order = self.make_order(qty=qty).data
+        source = ClientOrder.objects.get(id=order["id"])
+        items = list(source.items.all())
+        cogs_mod.split_order_lines(
+            source, [(item, item.qty_cases) for item in items], to_ready=True
+        )
+        source.refresh_from_db()
+        self.assertEqual(source.items.count(), 0)  # the empty shell
+        return source
+
+    def test_dry_run_reports_the_shell_and_writes_nothing(self):
+        shell = self._bug_shell()
+        report = self._run()
+        self.assertIn("DRY RUN", report)
+        self.assertIn(f"order #{shell.id}", report)
+        self.assertIn("0 items", report)
+        shell.refresh_from_db()
+        self.assertFalse(shell.is_deleted)  # still on the board
+
+    def test_apply_purges_the_shell_and_keeps_the_child(self):
+        shell = self._bug_shell()
+        child = shell.split_orders.get()
+        report = self._run("--apply")
+        self.assertIn("[APPLY]", report)
+        shell.refresh_from_db()
+        self.assertTrue(shell.is_deleted)
+        # The child keeps its cases and its Ready-to-Deliver status; only the
+        # link to the now-hidden shell is cleared.
+        child.refresh_from_db()
+        self.assertFalse(child.is_deleted)
+        self.assertEqual(child.items.count(), 1)
+        self.assertEqual(child.total_qty, D("10"))
+        self.assertEqual(child.status, ClientOrder.COMPLETED)
+        self.assertIsNone(child.source_order)
+        # Purged = soft-deleted, so a re-run finds nothing (idempotent).
+        again = self._run("--apply")
+        self.assertIn("No empty split orders", again)
+
+    def test_orders_with_items_and_empty_orders_without_children_are_untouched(self):
+        whole = self.make_order(qty=D("6")).data  # a normal order
+        # An empty order that was never split is not this bug's shape.
+        empty = ClientOrder.objects.create(client=self.client_obj)
+        report = self._run("--apply")
+        self.assertIn("No empty split orders", report)
+        self.assertFalse(ClientOrder.objects.get(id=whole["id"]).is_deleted)
+        self.assertFalse(ClientOrder.objects.get(id=empty.id).is_deleted)
+
+    def test_a_real_partial_split_is_left_alone(self):
+        """A genuine split leaves ITEMS on the source — it must never be purged."""
+        order = self.make_order(qty=D("10")).data
+        source = ClientOrder.objects.get(id=order["id"])
+        item = source.items.get()
+        cogs_mod.split_order_lines(source, [(item, D("4"))], to_ready=True)
+        source.refresh_from_db()
+        self.assertEqual(source.items.count(), 1)
+        report = self._run("--apply")
+        self.assertIn("No empty split orders", report)
+        self.assertFalse(source.is_deleted)
 
 
 

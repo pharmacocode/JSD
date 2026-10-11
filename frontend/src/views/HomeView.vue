@@ -91,20 +91,30 @@ async function loadExportRows({ from, to }) {
 
 async function runExport({ from, to, rows }) {
   try {
-    // Profit per row, honouring the same with/without-overhead toggle the
-    // tiles use: cogs_per_case_current = direct cost + the delivery month's
-    // live overhead per case, base_cogs_per_case is direct cost only.
-    const withProfit = rows.map((r) => ({
-      ...r,
-      _profit:
+    // Profit per row from the server's blended figures: /deliveries/
+    // computes them the same way the Home tile does — one FIFO walk over the
+    // whole filtered set (cheap stock is never double-counted) plus each
+    // delivery's own-month overhead share — so the PDF total always matches
+    // the tile to the paise (user bug report: they disagreed). The per-case
+    // columns stay as a fallback if an older payload lacks the fields.
+    const withProfit = rows.map((r) => {
+      const server = includeOverhead.value
+        ? r.profit_incl_overhead
+        : r.profit_excl_overhead
+      const fallback =
         Number(r.total_amount) -
         Number(r.qty_cases) *
           Number(
             includeOverhead.value
               ? r.cogs_per_case_current
               : r.base_cogs_per_case,
-          ),
-    }))
+          )
+      return {
+        ...r,
+        _profit:
+          server !== undefined && server !== null ? Number(server) : fallback,
+      }
+    })
     const file = await exportDeliveryRegister({
       from,
       to,

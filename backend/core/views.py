@@ -371,13 +371,15 @@ class ClientViewSet(viewsets.ModelViewSet):
         GET /api/clients/<id>/statement/?from=YYYY-MM-DD&to=YYYY-MM-DD.
 
         One row per non-deleted delivery in the range (delivery-by-delivery,
-        oldest first), each carrying its date, SKU, quantity, selling price,
-        line revenue and line direct cost — so the PDF can show the cost of
-        each consignment line. `payments_total` is what the client paid back
-        inside the range; `previous_due` is the ledger balance dated strictly
-        BEFORE the range (honouring the pending marker exactly like
-        pending_amount, so an old figure the user entered is never counted
-        twice); `total_due` = previous_due + range revenue − range payments.
+        oldest first), each carrying its date, SKU, quantity, selling price
+        and line revenue. This document is CLIENT-FACING (user request): it
+        deliberately carries NO cost or profit figures — those stay on the
+        owner's screens. `payments` itemises the payments received inside the
+        range (date / note / positive amount); `payments_total` is their sum;
+        `previous_due` is the ledger balance dated strictly BEFORE the range
+        (honouring the pending marker exactly like pending_amount, so an old
+        figure the user entered is never counted twice); `total_due` =
+        previous_due + range revenue − range payments.
         """
         client = self.get_object()
         raw_from = (request.query_params.get("from") or "").strip()
@@ -402,18 +404,14 @@ class ClientViewSet(viewsets.ModelViewSet):
             StockDelivery.objects.filter(
                 client=client, is_deleted=False, date__gte=start, date__lte=end
             )
-            .select_related("sku", "sku__print_cost")
+            .select_related("sku")
             .order_by("date", "id")
         )
-        dynamic = cogs.dynamic_costs_for(deliveries)
         rows = []
         revenue = Decimal("0")
-        direct_cost = Decimal("0")
         for d in deliveries:
             line_revenue = d.qty_cases * d.selling_price_per_case
-            line_direct = dynamic[d.id]["direct"]
             revenue += line_revenue
-            direct_cost += line_direct
             rows.append(
                 {
                     "id": d.id,
@@ -422,21 +420,31 @@ class ClientViewSet(viewsets.ModelViewSet):
                     "qty_cases": dstr(d.qty_cases),
                     "selling_price_per_case": str(money(d.selling_price_per_case)),
                     "line_amount": str(money(line_revenue)),
-                    "line_direct_cost": str(money(line_direct)),
                 }
             )
 
-        # Payments handed over inside the range (negative ledger amounts).
-        paid = (
+        # Payments handed over inside the range (negative ledger amounts),
+        # itemised for the PDF — amounts flip to positive "received" figures.
+        payment_entries = list(
             client.ledger_entries.filter(
                 is_deleted=False,
                 entry_type="PAYMENT",
                 date__gte=start,
                 date__lte=end,
-            ).aggregate(s=Sum("amount"))["s"]
-            or Decimal("0")
+            )
+            .order_by("date", "id")
         )
-        payments_total = -paid
+        payments = [
+            {
+                "date": e.date.isoformat(),
+                "note": e.note,
+                "amount": str(-money(e.amount)),
+            }
+            for e in payment_entries
+        ]
+        payments_total = money(
+            sum((-e.amount for e in payment_entries), Decimal("0"))
+        )
 
         # What was owed before this range: the plain ledger sum for entries
         # dated before the range starts, with a stored pending marker replacing
@@ -470,8 +478,8 @@ class ClientViewSet(viewsets.ModelViewSet):
                 "generated_at": timezone.now().isoformat(),
                 "deliveries": rows,
                 "period_revenue": str(money(revenue)),
-                "period_direct_cost": str(money(direct_cost)),
-                "payments_total": str(money(payments_total)),
+                "payments": payments,
+                "payments_total": str(payments_total),
                 "previous_due": str(previous_due),
                 "total_due": str(total_due),
                 "pending_amount": str(client.pending_amount),
@@ -929,6 +937,57 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         if not self.request.query_params.get("include_deleted"):
             qs = qs.filter(is_deleted=False)
         return qs
+
+    def list(self, request, *args, **kwargs):
+        """
+        The deliveries list ALSO carries each row's profit for the whole
+        filtered SET, so the Home register Export PDF adds up to the Home
+        tile exactly (user bug report: the PDF profit total disagreed with
+        the tile).
+
+        The serializer's per-case cost columns walk the FIFO queue per
+        delivery (base_cogs_per_case_current), pricing every delivery against
+        the FRONT of the queue — fine for one row, but summed over a range
+        they double-count cheap stock and drift from the true total. The
+        dashboard tile prices the whole set in ONE blended walk
+        (cogs.dynamic_costs_for) and allocates each delivery its own month's
+        overhead share, so these rows are computed the same way:
+          profit_excl_overhead = money(revenue - blended direct cost)
+          profit_incl_overhead = money(revenue - blended direct cost
+                                       - qty_cases x own-month OH rate)
+        The figures cover the WHOLE filtered range (not just the requested
+        page), so page 1 of a long register still totals like the dashboard.
+        """
+        queryset = self.filter_queryset(self.get_queryset())
+        # Materialised once: the profit pass and the page below share it.
+        deliveries = list(queryset)
+        dynamic = cogs.dynamic_costs_for(deliveries)
+        rate_cache = {}
+        profits = {}
+        for d in deliveries:
+            month = cogs.month_key(d.date)
+            if month not in rate_cache:
+                rate_cache[month] = cogs.overhead_per_case(month)
+            revenue = d.qty_cases * d.selling_price_per_case
+            direct = dynamic[d.id]["direct"]
+            overhead = d.qty_cases * rate_cache[month]
+            profits[d.id] = {
+                "profit_excl_overhead": str(money(revenue - direct)),
+                "profit_incl_overhead": str(money(revenue - direct - overhead)),
+            }
+
+        page = self.paginate_queryset(deliveries)
+        serializer = self.get_serializer(
+            page if page is not None else deliveries, many=True
+        )
+        rows = serializer.data
+        for row in rows:
+            extra = profits.get(row["id"])
+            if extra:
+                row.update(extra)
+        if page is not None:
+            return self.get_paginated_response(rows)
+        return Response(rows)
 
     def perform_destroy(self, instance):
         """

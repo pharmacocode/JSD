@@ -39,7 +39,7 @@ cd backend
 python -m pip install -r requirements.txt
 python manage.py migrate          # seeds Rent/Diesel/Electricity/Labour
 python manage.py runserver        # http://localhost:8000
-python manage.py test core        # 57 tests (FIFO + COGS + ledger + markers + home)
+python manage.py test core        # 173 tests (FIFO + COGS + ledger + orders + fixes)
 ```
 
 Without `DATABASE_URL` the backend uses local SQLite (dev/tests). Set it to
@@ -368,6 +368,34 @@ screens instant and the API quiet. Nothing here changes the business rules.
   (`demand` / `booked` / `UNRECORDED −n` badge) so a silent pre-fix gap can
   never hide — booking the backfill (or recording the missing arrival)
   clears the badge.
+- **Client statement PDF is client-facing (user request):** the delivery
+  statement (Client detail → Deliveries → Export PDF) no longer shows any
+  cost or profit column — the endpoint behind it (`GET
+  /api/clients/<id>/statement/`) now sends revenue-only rows plus the
+  **itemised payments** (date / note / positive amount) received in the range,
+  and the PDF renders a *Billed in this period* → *Payments received* →
+  *Balance carried in* → *Total due* block. Direct-cost figures stay on the
+  owner's screens.
+- **Delivery-register export now totals like the Home tile (user bug report):**
+  the Home *Export PDF* profit column summed per-delivery FIFO walks, which
+  price every delivery against the front of the queue and double-count cheap
+  stock once deliveries share a batch — the PDF total drifted from the Home
+  profit tile. `/api/deliveries/` now also returns `profit_excl_overhead` /
+  `profit_incl_overhead` per row, computed exactly like the dashboard tile
+  (one blended FIFO walk over the whole filtered range + each delivery's
+  own-month overhead share), and the export uses them, so the PDF footer
+  always matches the tile — even for registers longer than one page of
+  deliveries.
+- **Empty split-order shells (user bug report, one-off fix-up):** before the
+  whole-selection split fix, confirming the Ready-to-Deliver line picker with
+  every line ticked at full quantity still ran the split path and left the
+  source order behind with **zero items** — a ghost order on the board while
+  the real cases lived on the split child. `python manage.py
+  cleanup_empty_split_orders` reports every such shell (live order, no items,
+  at least one split child — a shape the app can no longer create) and
+  **writes nothing** by default; add `--apply` to soft-delete the shells. The
+  children keep their items, deliveries and ledger untouched — only the
+  `source_order` link to the hidden shell is cleared. Idempotent.
 - **Deleting a delivery rolls everything back (user request):** deleting a
   `DELIVERY` row in the client ledger — or the delivery itself via
   `DELETE /api/deliveries/<id>/` — now removes it from **everywhere** it was

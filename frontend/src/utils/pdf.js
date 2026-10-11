@@ -3,8 +3,9 @@
  *
  *   exportClientStatement — delivery-by-delivery statement for one client
  *     (Client detail → Deliveries → Export PDF): the period's consignment
- *     lines with their direct cost, payments received in the period, the
- *     balance carried in and the resulting total due.
+ *     lines with their revenue, the payments received in the period (with
+ *     the balance carried in and the resulting total due). Client-facing, so
+ *     it deliberately carries NO cost or profit figures (user request).
  *   exportDeliveryRegister — the Home delivery register for any date range:
  *     date / client / SKU / qty / revenue / profit with totals.
  *
@@ -106,41 +107,55 @@ export async function exportClientStatement(statement) {
   doc.setFont('helvetica', 'normal')
   y = periodLine(doc, statement.from, statement.to, y + 9, statement.generated_at)
 
+  // Client-facing document: revenue only. Cost and profit figures never
+  // leave the owner's screens (user request).
   const rows = statement.deliveries || []
   const totalQty = rows.reduce((s, r) => s + Number(r.qty_cases || 0), 0)
   autoTable(doc, {
     ...TABLE_STYLE,
     startY: y,
-    head: [['Date', 'SKU', 'Qty', 'Rate / case', 'Amount', 'Direct cost']],
+    head: [['Date', 'SKU', 'Qty', 'Rate / case', 'Amount']],
     body: rows.map((r) => [
       r.date,
       r.sku,
       num(r.qty_cases),
       pdfMoney(r.selling_price_per_case),
       pdfMoney(r.line_amount),
-      pdfMoney(r.line_direct_cost),
     ]),
-    foot: [
-      [
-        '',
-        'Total',
-        num(totalQty),
-        '',
-        pdfMoney(statement.period_revenue),
-        pdfMoney(statement.period_direct_cost),
-      ],
-    ],
+    foot: [['', 'Total', num(totalQty), '', pdfMoney(statement.period_revenue)]],
     columnStyles: {
       2: { halign: 'right' },
       3: { halign: 'right' },
       4: { halign: 'right' },
-      5: { halign: 'right' },
     },
   })
   y = (doc.lastAutoTable?.finalY ?? y + 40) + 12
 
+  // Payments received inside the period, itemised (date / note / amount).
+  const payments = statement.payments || []
+  if (payments.length) {
+    doc.setFont('helvetica', 'bold')
+    doc.setFontSize(10)
+    doc.text('Payments received in this period', MARGIN, y)
+    doc.setFont('helvetica', 'normal')
+    autoTable(doc, {
+      ...TABLE_STYLE,
+      startY: y + 4,
+      head: [['Date', 'Note', 'Amount']],
+      body: payments.map((p) => [p.date, p.note || '', pdfMoney(p.amount)]),
+      columnStyles: { 2: { halign: 'right' } },
+    })
+    y = (doc.lastAutoTable?.finalY ?? y + 20) + 12
+  }
+
   doc.setFillColor(245, 247, 250)
-  doc.roundedRect(MARGIN, y - 8, RIGHT - MARGIN, 36, 2, 2, 'F')
+  doc.roundedRect(MARGIN, y - 8, RIGHT - MARGIN, 42, 2, 2, 'F')
+  y = summaryRow(
+    doc,
+    'Billed in this period',
+    pdfMoney(statement.period_revenue),
+    y,
+  )
   y = summaryRow(
     doc,
     'Payments received in this period',
