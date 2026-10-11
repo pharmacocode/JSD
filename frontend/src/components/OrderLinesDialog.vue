@@ -101,12 +101,19 @@ function tickAll(on) {
 
 function confirm() {
   if (!canConfirm.value) return
+  // Everything ticked at full quantity = the WHOLE order moves, so emit null
+  // and the caller sends no `items` at all. The backend then takes its
+  // whole-order path — an explicit full-qty selection would instead run the
+  // split, reassigning every line to the new order and leaving an empty shell
+  // behind (the reported bug: an "empty split order" on fully-moved orders).
   emit(
     'confirm',
-    chosen.value.map((l) => ({
-      item: l.id,
-      qty_cases: String(Number(picks.value[l.id].take)),
-    }))
+    whole.value
+      ? null
+      : chosen.value.map((l) => ({
+          item: l.id,
+          qty_cases: String(Number(picks.value[l.id].take)),
+        }))
   )
 }
 </script>

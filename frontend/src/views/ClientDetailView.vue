@@ -7,10 +7,12 @@ import { ref, onMounted, computed } from 'vue'
 import { useRoute, useRouter } from 'vue-router'
 import { api, listify } from '@/api'
 import { money, today } from '@/utils/format'
+import { exportClientStatement } from '@/utils/pdf'
 import { useUiStore } from '@/stores/ui'
 import AuditBadge from '@/components/AuditBadge.vue'
 import BalanceMarkerDialog from '@/components/BalanceMarkerDialog.vue'
 import EmptyState from '@/components/EmptyState.vue'
+import ExportDialog from '@/components/ExportDialog.vue'
 
 const route = useRoute()
 const router = useRouter()
@@ -35,6 +37,39 @@ const error = ref('')
 const lifetime = ref(null)
 // "with" = profit after direct costs + this client's share of overhead.
 const ohMode = ref('with')
+
+// ---------------------------------------------------------------------------
+// Deliveries Export PDF (user request): date-range statement, generated
+// server-side (/clients/<id>/statement/) and rendered in utils/pdf.js.
+// ---------------------------------------------------------------------------
+const exportOpen = ref(false)
+// Default range = the current month, so the first export already covers
+// something useful; both dates stay editable in the dialog.
+const exportDefaults = (() => {
+  const t = today()
+  return { from: `${t.slice(0, 7)}-01`, to: t }
+})()
+const statementColumns = [
+  { key: 'date', label: 'Date' },
+  { key: 'sku_description', label: 'SKU' },
+  { key: 'qty_cases', label: 'Qty', align: 'right' },
+  {
+    key: 'total_amount',
+    label: 'Amount',
+    align: 'right',
+    format: (v) => money(v),
+  },
+]
+
+async function runExport({ from, to }) {
+  try {
+    const statement = await api.get(`/clients/${id}/statement/`, { from, to })
+    const file = await exportClientStatement(statement)
+    ui.notify(`Statement exported — ${file}`)
+  } catch (e) {
+    ui.notify(e?.message || 'Export failed', 'error')
+  }
+}
 
 async function load() {
   loading.value = true
@@ -379,6 +414,20 @@ async function deleteEntry(entry) {
 
       <v-tabs-window-item value="deliveries">
         <v-card :loading="loading">
+          <!-- Export PDF (user request): date-range statement of this
+               client's deliveries, delivery by delivery. -->
+          <div class="d-flex justify-end pa-2 pb-0">
+            <v-btn
+              size="small"
+              variant="tonal"
+              color="primary"
+              prepend-icon="mdi-file-pdf-box"
+              :disabled="loading || !deliveries.length"
+              @click="exportOpen = true"
+            >
+              Export PDF
+            </v-btn>
+          </div>
           <EmptyState
             v-if="!deliveries.length"
             icon="mdi-truck"
@@ -453,6 +502,22 @@ async function deleteEntry(entry) {
       :date="client.pending_as_of_date"
       :active="markerActive"
       @saved="load"
+    />
+
+    <!-- Delivery statement export: pick the range, preview the deliveries,
+         then download the PDF (client Deliveries tab). -->
+    <ExportDialog
+      v-model="exportOpen"
+      title="Export deliveries statement"
+      range-label="Delivery statement — delivery lines, payments and total due"
+      date-label="Statement range"
+      :rows="deliveries"
+      :default-from="exportDefaults.from"
+      :default-to="exportDefaults.to"
+      :columns="statementColumns"
+      empty-hint="No deliveries in this date range."
+      confirm-label="Export PDF"
+      @confirm="runExport"
     />
   </div>
 

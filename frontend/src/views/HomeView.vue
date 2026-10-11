@@ -9,7 +9,7 @@
  */
 import { ref, watch, onMounted, onActivated, computed } from 'vue'
 import { useRouter } from 'vue-router'
-import { api } from '@/api'
+import { api, listify } from '@/api'
 import { useUiStore } from '@/stores/ui'
 import { money, num, monthLong, rangeLong } from '@/utils/format'
 import MonthPicker from '@/components/MonthPicker.vue'
@@ -18,6 +18,8 @@ import EmptyState from '@/components/EmptyState.vue'
 import OrderDialog from '@/components/OrderDialog.vue'
 import OrderLinesDialog from '@/components/OrderLinesDialog.vue'
 import ConfirmDialog from '@/components/ConfirmDialog.vue'
+import ExportDialog from '@/components/ExportDialog.vue'
+import { exportDeliveryRegister } from '@/utils/pdf'
 
 const router = useRouter()
 const ui = useUiStore()
@@ -49,6 +51,74 @@ const deliveryTotals = computed(() => {
     amount: rows.reduce((s, r) => s + Number(r.total_amount), 0),
   }
 })
+
+// ---------------------------------------------------------------------------
+// Delivery register Export PDF (user request): an arbitrary date range, rows
+// fetched from /deliveries/ (they carry live per-case costs) and rendered in
+// utils/pdf.js. The profit toggle on this screen flows into the PDF.
+// ---------------------------------------------------------------------------
+const exportOpen = ref(false)
+
+// Default range = the period the register on screen is showing.
+const exportDefaults = computed(() => {
+  if (ui.rangeActive) return { from: ui.rangeFrom, to: ui.rangeTo }
+  const [y, m] = ui.month.split('-').map(Number)
+  const last = new Date(y, m, 0).getDate()
+  const pad = (n) => String(n).padStart(2, '0')
+  return { from: `${ui.month}-01`, to: `${ui.month}-${pad(last)}` }
+})
+
+// Preview columns of the export dialog (the PDF renders more: revenue+profit).
+const registerColumns = [
+  { key: 'date', label: 'Date' },
+  { key: 'client_name', label: 'Client' },
+  { key: 'sku_description', label: 'SKU' },
+  { key: 'qty_cases', label: 'Qty', align: 'right' },
+  {
+    key: 'total_amount',
+    label: 'Revenue',
+    align: 'right',
+    format: (v) => money(v),
+  },
+]
+
+/** ExportDialog row source: the server scopes rows to the chosen range. */
+async function loadExportRows({ from, to }) {
+  // /deliveries/ is DRF-paginated, so the { results } payload is unwrapped
+  // the same way every other list in this app is.
+  return listify(await api.get('/deliveries/', { from, to }))
+}
+
+async function runExport({ from, to, rows }) {
+  try {
+    // Profit per row, honouring the same with/without-overhead toggle the
+    // tiles use: cogs_per_case_current = direct cost + the delivery month's
+    // live overhead per case, base_cogs_per_case is direct cost only.
+    const withProfit = rows.map((r) => ({
+      ...r,
+      _profit:
+        Number(r.total_amount) -
+        Number(r.qty_cases) *
+          Number(
+            includeOverhead.value
+              ? r.cogs_per_case_current
+              : r.base_cogs_per_case,
+          ),
+    }))
+    const file = await exportDeliveryRegister({
+      from,
+      to,
+      rows: withProfit,
+      profitLabel: includeOverhead.value ? 'Profit after OH' : 'Profit before OH',
+      profitNote: includeOverhead.value
+        ? "Profit = revenue - direct cost (FIFO materials + print) - this period's overhead per case (live)."
+        : 'Profit = revenue - direct cost (FIFO materials + print), before overhead.',
+    })
+    ui.notify(`Delivery register exported — ${file}`)
+  } catch (e) {
+    ui.notify(e?.message || 'Export failed', 'error')
+  }
+}
 
 // Query params for the selected period (user request): a complete from/to
 // range drives the dashboard and the month is ignored entirely; anything else
@@ -1092,6 +1162,23 @@ const onOrderClosed = () => {
       @confirm="doDelete"
     />
 
+    <!-- Delivery register export (user request): pick a range, preview the
+         rows the server returns for it, then download the PDF with revenue
+         and profit totals. -->
+    <ExportDialog
+      v-model="exportOpen"
+      title="Export delivery register"
+      range-label="Delivery register — date, client, SKU, quantity, revenue and profit"
+      date-label="Register range"
+      :loader="loadExportRows"
+      :default-from="exportDefaults.from"
+      :default-to="exportDefaults.to"
+      :columns="registerColumns"
+      empty-hint="No deliveries in this date range."
+      confirm-label="Export PDF"
+      @confirm="runExport"
+    />
+
     <!-- Summary — MMM, YYYY: the tiles drive the chart area below (user request). -->
     <v-card>
       <v-card-title class="d-flex align-center text-subtitle-1 font-weight-bold">
@@ -1334,6 +1421,17 @@ const onOrderClosed = () => {
         <span class="text-caption text-medium-emphasis mr-1">
           {{ deliveryTotals.count }} · {{ num(deliveryTotals.cases) }}
         </span>
+        <v-btn
+          size="x-small"
+          variant="tonal"
+          color="primary"
+          prepend-icon="mdi-file-pdf-box"
+          class="mr-2"
+          title="Export this register as a PDF for any date range"
+          @click.stop="exportOpen = true"
+        >
+          Export PDF
+        </v-btn>
         <v-icon>{{ deliveriesOpen ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
       </v-card-title>
       <v-divider />

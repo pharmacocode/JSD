@@ -226,12 +226,21 @@ async function save() {
         >
           {{ clientLoadError }}
         </v-alert>
-        <v-select
+        <!-- Client picker: autocomplete with instant search over the cached
+             client list (user request) — type any part of the name to narrow,
+             arrow keys + Enter pick, and the SKUs priced for that client load
+             underneath. -->
+        <v-autocomplete
           v-model="clientId"
           :items="refdata.clients"
           item-title="name"
           item-value="id"
-          label="Client" :loading="clientLoading"
+          label="Client"
+          placeholder="Type to search clients…"
+          prepend-inner-icon="mdi-magnify"
+          no-data-text="No client matches — add them in Masters → Clients."
+          auto-select-first
+          :loading="clientLoading"
           variant="outlined"
           density="compact"
           :disabled="editing"

@@ -1352,6 +1352,117 @@ class ClientPendingMarkerTests(TestCase):
         self.assertEqual(resp.data["pending_amount"], "3000.00")
 
 
+class ClientStatementTests(TestCase):
+    """
+    The client Deliveries Export (user request): GET
+    /api/clients/<id>/statement/?from=&to= drives the delivery-statement PDF —
+    one row per delivery in the range with its line revenue and CURRENT direct
+    cost, plus the payments and balance math (previous due -> total due) the
+    PDF renders underneath.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.client_obj = Client.objects.create(name="Statement Client")
+        self.sku = SKU.objects.create(
+            description="500ml", qty_per_case=D("24"), volume_ml=500
+        )
+        self.bottle = make_material("Bottle", "240")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+        make_batch(self.bottle, "100", "240", arrival=date(2026, 8, 1))
+        self.url = f"/api/clients/{self.client_obj.id}/statement/"
+
+    def deliver(self, day, qty=D("10")):
+        return create_delivery(
+            self.client_obj, self.sku, qty, delivery_date=date.fromisoformat(day)
+        )[0]
+
+    def test_both_dates_are_required_and_ordered(self):
+        self.assertEqual(self.api.get(self.url).status_code, 400)
+        self.assertEqual(
+            self.api.get(self.url, {"from": "2026-09-01"}).status_code, 400
+        )
+        self.assertEqual(
+            self.api.get(self.url, {"to": "2026-09-30"}).status_code, 400
+        )
+        resp = self.api.get(
+            self.url, {"from": "2026-09-30", "to": "2026-09-01"}
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_rows_totals_and_balance_math(self):
+        self.deliver("2026-09-10", D("10"))  # 3,000 revenue, 2,400 direct cost
+        self.deliver("2026-09-20", D("5"))  # 1,500 revenue, 1,200 direct cost
+        self.deliver("2026-10-05", D("3"))  # outside the range — not listed
+        ClientLedgerEntry.objects.create(
+            client=self.client_obj,
+            entry_type="PAYMENT",
+            amount=D("-2000"),
+            date=date(2026, 9, 25),
+        )
+        resp = self.api.get(self.url, {"from": "2026-09-01", "to": "2026-09-30"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["client_name"], "Statement Client")
+        self.assertEqual(resp.data["from"], "2026-09-01")
+        self.assertEqual(resp.data["to"], "2026-09-30")
+
+        # Delivery by delivery, oldest first, each line carrying its cost so
+        # the PDF can show the cost of every consignment.
+        rows = resp.data["deliveries"]
+        self.assertEqual(len(rows), 2)
+        self.assertEqual(rows[0]["date"], "2026-09-10")
+        self.assertEqual(D(rows[0]["qty_cases"]), D("10"))
+        self.assertEqual(rows[0]["line_amount"], "3000.00")
+        self.assertEqual(rows[0]["line_direct_cost"], "2400.00")
+        self.assertEqual(rows[1]["line_amount"], "1500.00")
+        self.assertEqual(rows[1]["line_direct_cost"], "1200.00")
+
+        self.assertEqual(resp.data["period_revenue"], "4500.00")
+        self.assertEqual(resp.data["period_direct_cost"], "3600.00")
+        self.assertEqual(resp.data["payments_total"], "2000.00")
+        # Nothing before the range -> previous due is 0; total = revenue - pay.
+        self.assertEqual(resp.data["previous_due"], "0.00")
+        self.assertEqual(resp.data["total_due"], "2500.00")
+
+    def test_previous_due_honours_the_pending_marker(self):
+        """
+        A pending amount entered "as of" a day BEFORE the range replaces every
+        older ledger entry (the same rule pending_amount uses), so the
+        statement must carry that figure in — never the old entries too.
+        """
+        ClientLedgerEntry.objects.create(
+            client=self.client_obj,
+            entry_type="DELIVERY",
+            amount=D("4000"),
+            date=date(2026, 8, 15),
+        )
+        self.client_obj.pending_as_of_amount = D("1000")
+        self.client_obj.pending_as_of_date = date(2026, 8, 20)
+        self.client_obj.save()
+        self.deliver("2026-09-10", D("10"))  # 3,000 inside the range
+
+        resp = self.api.get(self.url, {"from": "2026-09-01", "to": "2026-09-30"})
+        self.assertEqual(resp.status_code, 200)
+        # The 4,000 delivery is inside the marked figure — counted once.
+        self.assertEqual(resp.data["previous_due"], "1000.00")
+        self.assertEqual(resp.data["period_revenue"], "3000.00")
+        self.assertEqual(resp.data["total_due"], "4000.00")
+
+    def test_deleted_deliveries_are_left_out(self):
+        delivery = self.deliver("2026-09-12", D("10"))
+        cogs_mod.void_delivery(delivery, reason="test")
+        resp = self.api.get(self.url, {"from": "2026-09-01", "to": "2026-09-30"})
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(resp.data["deliveries"], [])
+        self.assertEqual(resp.data["period_revenue"], "0.00")
+        self.assertEqual(resp.data["total_due"], "0.00")
+
+
 class VendorPayableMarkerTests(TestCase):
     """
     User request (vendor side): what we owe a vendor is editable at any time,
@@ -1862,6 +1973,32 @@ class DashboardSummaryTests(TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0]["date"], "2026-09-12")
         self.assertEqual(D(self.stats()["total_cases"]), D("5"))
+
+    def test_deliveries_list_filters_by_from_and_to(self):
+        """
+        The register Export PDF needs any date range, not just a month: the
+        deliveries list accepts half-open from/to filters (both inclusive).
+        """
+        all_rows = self.api.get("/api/deliveries/").data
+        self.assertEqual(all_rows["count"], 2)
+        # Only the 12 Sep delivery falls inside this range.
+        rows = self.api.get(
+            "/api/deliveries/", {"from": "2026-09-11", "to": "2026-09-30"}
+        ).data["results"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["date"], "2026-09-12")
+        self.assertEqual(rows[0]["client_name"], "Beta")
+        # A one-day window catches the other one; endpoints are inclusive.
+        rows = self.api.get(
+            "/api/deliveries/", {"from": "2026-09-01", "to": "2026-09-10"}
+        ).data["results"]
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0]["date"], "2026-09-10")
+        # Cost fields the Home export's profit column is computed from ride
+        # along on every row.
+        self.assertIn("base_cogs_per_case", rows[0])
+        self.assertIn("cogs_per_case_current", rows[0])
+        self.assertIn("total_amount", rows[0])
 
     def test_inward_row_reconciles_the_month(self):
         """
@@ -3310,6 +3447,61 @@ class OrderSplitTests(OrdersPipelineBase, TestCase):
 
     def lines(self, order_id):
         return list(OrderItem.objects.filter(order_id=order_id).order_by("id"))
+
+    def test_full_selection_does_not_split_the_order(self):
+        """
+        Regression (user bug report): the line picker starts fully ticked, so
+        confirming it untouched sends every line at FULL quantity. That must
+        behave exactly like a whole move — the same order flips to Ready to
+        Deliver, no split order, no empty shell left behind.
+        """
+        order = self.make_order(qty=D("10")).data
+        before = ClientOrder.objects.count()
+        resp = self.api.post(
+            f"/api/orders/{order['id']}/complete/",
+            {"items": [{"item": order["items"][0]["id"], "qty_cases": "10"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("split", resp.data)
+        self.assertNotIn("partial", resp.data)
+        self.assertEqual(resp.data["status"], "COMPLETED")
+        self.assertEqual(ClientOrder.objects.count(), before)  # nothing created
+        moved = self.lines(order["id"])
+        self.assertEqual(len(moved), 1)
+        self.assertEqual(moved[0].qty_cases, D("10"))
+        # Same stock effect as the one-tap whole move.
+        self.assertEqual(cogs_mod.committed_map()[self.bottle.id], D("10"))
+        self.assertEqual(self.available(self.bottle), D("90"))
+
+    def test_full_selection_reopen_does_not_split_the_order(self):
+        """The same rule on the way back: every remaining case ticked at full
+        quantity is the whole order returning to Pending — one order, not two."""
+        order = self.make_order(qty=D("10")).data
+        self.api.post(f"/api/orders/{order['id']}/complete/")
+        before = ClientOrder.objects.count()
+        resp = self.api.post(
+            f"/api/orders/{order['id']}/reopen/",
+            {"items": [{"item": order["items"][0]["id"], "qty_cases": "10"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertNotIn("split", resp.data)
+        self.assertEqual(resp.data["status"], "PENDING")
+        self.assertEqual(ClientOrder.objects.count(), before)
+        self.assertEqual(self.available(self.bottle), D("100"))
+
+    def test_partial_selection_still_splits(self):
+        """The whole-selection rule must not swallow a real split."""
+        order = self.make_order(qty=D("10")).data
+        resp = self.api.post(
+            f"/api/orders/{order['id']}/complete/",
+            {"items": [{"item": order["items"][0]["id"], "qty_cases": "4"}]},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 200)
+        self.assertTrue(resp.data["partial"])
+        self.assertEqual(ClientOrder.objects.filter(is_deleted=False).count(), 2)
 
     def test_partial_move_to_ready_splits_the_order_in_two(self):
         """

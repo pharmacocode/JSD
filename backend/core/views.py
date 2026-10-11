@@ -364,6 +364,126 @@ class ClientViewSet(viewsets.ModelViewSet):
         serializer = StockDeliverySerializer(qs, many=True)
         return Response(serializer.data)
 
+    @action(detail=True, methods=["get"], url_path="statement")
+    def statement(self, request, pk=None):
+        """
+        Delivery statement for a date range (the client Deliveries Export):
+        GET /api/clients/<id>/statement/?from=YYYY-MM-DD&to=YYYY-MM-DD.
+
+        One row per non-deleted delivery in the range (delivery-by-delivery,
+        oldest first), each carrying its date, SKU, quantity, selling price,
+        line revenue and line direct cost — so the PDF can show the cost of
+        each consignment line. `payments_total` is what the client paid back
+        inside the range; `previous_due` is the ledger balance dated strictly
+        BEFORE the range (honouring the pending marker exactly like
+        pending_amount, so an old figure the user entered is never counted
+        twice); `total_due` = previous_due + range revenue − range payments.
+        """
+        client = self.get_object()
+        raw_from = (request.query_params.get("from") or "").strip()
+        raw_to = (request.query_params.get("to") or "").strip()
+        start = parse_date(raw_from) if raw_from else None
+        end = parse_date(raw_to) if raw_to else None
+        if start is None or end is None:
+            return Response(
+                {
+                    "detail": "from and to (YYYY-MM-DD) are both required, e.g. "
+                    "?from=2026-09-01&to=2026-09-30."
+                },
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+        if start > end:
+            return Response(
+                {"detail": "from must not be after to."},
+                status=status.HTTP_400_BAD_REQUEST,
+            )
+
+        deliveries = list(
+            StockDelivery.objects.filter(
+                client=client, is_deleted=False, date__gte=start, date__lte=end
+            )
+            .select_related("sku", "sku__print_cost")
+            .order_by("date", "id")
+        )
+        dynamic = cogs.dynamic_costs_for(deliveries)
+        rows = []
+        revenue = Decimal("0")
+        direct_cost = Decimal("0")
+        for d in deliveries:
+            line_revenue = d.qty_cases * d.selling_price_per_case
+            line_direct = dynamic[d.id]["direct"]
+            revenue += line_revenue
+            direct_cost += line_direct
+            rows.append(
+                {
+                    "id": d.id,
+                    "date": d.date.isoformat(),
+                    "sku": d.sku.description,
+                    "qty_cases": dstr(d.qty_cases),
+                    "selling_price_per_case": str(money(d.selling_price_per_case)),
+                    "line_amount": str(money(line_revenue)),
+                    "line_direct_cost": str(money(line_direct)),
+                }
+            )
+
+        # Payments handed over inside the range (negative ledger amounts).
+        paid = (
+            client.ledger_entries.filter(
+                is_deleted=False,
+                entry_type="PAYMENT",
+                date__gte=start,
+                date__lte=end,
+            ).aggregate(s=Sum("amount"))["s"]
+            or Decimal("0")
+        )
+        payments_total = -paid
+
+        # What was owed before this range: the plain ledger sum for entries
+        # dated before the range starts, with a stored pending marker replacing
+        # everything on/before its own date (the same rule pending_amount uses).
+        as_of = client.pending_as_of_date
+        live_before = (
+            client.ledger_entries.filter(is_deleted=False, date__lt=start).aggregate(
+                s=Sum("amount")
+            )["s"]
+            or Decimal("0")
+        )
+        if as_of is not None and as_of < start:
+            superseded_before = (
+                client.ledger_entries.filter(
+                    is_deleted=False, date__lt=start, date__lte=as_of
+                ).aggregate(s=Sum("amount"))["s"]
+                or Decimal("0")
+            )
+            previous_due = money(
+                client.pending_as_of_amount + live_before - superseded_before
+            )
+        else:
+            previous_due = money(live_before)
+        total_due = money(previous_due + revenue - payments_total)
+        return Response(
+            {
+                "client_id": client.id,
+                "client_name": client.name,
+                "from": start.isoformat(),
+                "to": end.isoformat(),
+                "generated_at": timezone.now().isoformat(),
+                "deliveries": rows,
+                "period_revenue": str(money(revenue)),
+                "period_direct_cost": str(money(direct_cost)),
+                "payments_total": str(money(payments_total)),
+                "previous_due": str(previous_due),
+                "total_due": str(total_due),
+                "pending_amount": str(client.pending_amount),
+                "pending_as_of_date": (
+                    client.pending_as_of_date.isoformat()
+                    if client.pending_as_of_date
+                    else None
+                ),
+            }
+        )
+
+
     @action(detail=True, methods=["get"])
     def lifetime(self, request, pk=None):
         """
@@ -798,6 +918,14 @@ class StockDeliveryViewSet(viewsets.ModelViewSet):
         if month:
             year, mon = (int(p) for p in month.split("-"))
             qs = qs.filter(**cogs.month_range(year, mon))
+        # Explicit date range (Home's delivery-register Export PDF): both
+        # dates inclusive, independent of the month filter.
+        from_date = self.request.query_params.get("from")
+        if from_date:
+            qs = qs.filter(date__gte=parse_date(from_date))
+        to_date = self.request.query_params.get("to")
+        if to_date:
+            qs = qs.filter(date__lte=parse_date(to_date))
         if not self.request.query_params.get("include_deleted"):
             qs = qs.filter(is_deleted=False)
         return qs
@@ -2536,6 +2664,16 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         moves, error = self._parse_moves(order)
         if error:
             return error
+        # A selection taking EVERY line in full is the whole order moving (the
+        # line picker starts fully ticked). Treated exactly like no selection
+        # at all: split_order_lines would reassign every line to the new order
+        # and leave an empty shell behind.
+        if moves is not None:
+            all_lines = list(order.items.all())
+            if len(moves) == len(all_lines) and all(
+                take == item.qty_cases for item, take in moves
+            ):
+                moves = None
         lines = [(i.sku, i.qty_cases) for i in order.items.all()]
         if not lines:
             return Response(
@@ -2592,6 +2730,15 @@ class ClientOrderViewSet(viewsets.ModelViewSet):
         moves, error = self._parse_moves(order)
         if error:
             return error
+        # Same whole-selection rule as `complete`: every still-undelivered
+        # line in full = the whole order goes back, so no split (and no empty
+        # shell left behind).
+        if moves is not None:
+            remaining = list(order.undelivered_items)
+            if len(moves) == len(remaining) and all(
+                take == item.qty_cases for item, take in moves
+            ):
+                moves = None
         if moves is not None:
             return self._split_response(order, moves, to_ready=False)
 
