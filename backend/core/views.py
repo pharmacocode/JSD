@@ -1901,6 +1901,75 @@ class DashboardView(APIView):
         profit_excl_overhead = money(total_revenue - total_direct_cost)
         profit_incl_overhead = money(profit_excl_overhead - overhead_total)
 
+        # Assets panel (user request): the money side of the business for the
+        # SAME period the rest of this payload uses — what the period's
+        # deliveries expect to bring in, what was actually received in it, what
+        # clients still owe overall (LIFETIME, honoring each client's "pending
+        # as of" marker) and what we still owe the vendors (lifetime, honoring
+        # the payable marker). Each total carries a per-client / per-vendor
+        # breakdown so the tile's bar chart is backed by rows.
+        received_per_client = []
+        received_total = Decimal("0")
+        for row in (
+            ClientLedgerEntry.objects.filter(
+                is_deleted=False, entry_type="PAYMENT", **period_filter
+            )
+            .values("client_id", "client__name")
+            .annotate(amount=Sum("amount"))
+            .order_by("client__name")
+        ):
+            # PAYMENT rows are stored NEGATIVE (they shrink the pending
+            # balance) — the tile shows what came IN, so flip the sign.
+            amount = money(-(row["amount"] or Decimal("0")))
+            received_per_client.append(
+                {
+                    "client_id": row["client_id"],
+                    "client": row["client__name"],
+                    "amount": str(amount),
+                }
+            )
+            received_total += amount
+
+        pending_per_client = []
+        pending_total = Decimal("0")
+        for c in Client.objects.all().order_by("name"):
+            # The live, marker-aware figure — the same number the Clients
+            # screen shows, so the two can never disagree.
+            amount = c.pending_amount
+            pending_per_client.append(
+                {"client_id": c.id, "client": c.name, "amount": str(amount)}
+            )
+            pending_total += amount
+
+        vendor_payable_per_vendor = []
+        vendor_payable_total = Decimal("0")
+        for v in Vendor.objects.all().order_by("name"):
+            amount = v.amount_owed
+            vendor_payable_per_vendor.append(
+                {"vendor_id": v.id, "vendor": v.name, "amount": str(amount)}
+            )
+            vendor_payable_total += amount
+
+        assets = {
+            # Expected during the period = the period's delivery revenue (what
+            # is to be received against the deliveries made in it).
+            "expected": str(money(total_revenue)),
+            "received": str(money(received_total)),
+            "pending": str(money(pending_total)),
+            "vendor_payable": str(money(vendor_payable_total)),
+            "expected_per_client": [
+                {
+                    "client_id": r["client_id"],
+                    "client": r["client"],
+                    "amount": r["revenue"],
+                }
+                for r in client_breakdown
+            ],
+            "received_per_client": received_per_client,
+            "pending_per_client": pending_per_client,
+            "vendor_payable_per_vendor": vendor_payable_per_vendor,
+        }
+
         # Delivery register for the month (user request: a chronological list of
         # delivery date / client / SKU / qty, separate from the inward register).
         # Oldest first, with the id as the tie-break so two deliveries on the
@@ -1956,6 +2025,9 @@ class DashboardView(APIView):
                     "overhead_per_case": str(money(overhead_per_case_month)),
                     "sku_client_matrix": sku_client_matrix,
                     "overhead_categories": overhead_categories,
+                    # Assets panel figures (expected / received / pending /
+                    # vendor payable + their chart rows).
+                    "assets": assets,
                 },
             }
         )

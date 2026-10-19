@@ -1,7 +1,9 @@
 <script setup>
 /**
  * Home (spec 4.1, reworked per user request): FAB for + Add Delivery, secondary
- * + Enter Arrived Stock, a Stock in Hand panel that always shows the low /
+ * + Enter Arrived Stock, a collapsible Assets panel (Expected / Received /
+ * Pending / Vendor dues) just above Stock in Hand whose tiles drive their own
+ * bar chart, a Stock in Hand panel that always shows the low /
  * healthy summary and expands on click, and a "Summary — MMM, YYYY" card whose
  * tiles (cases sold / revenue / profit / overhead) drive ONE chart area.
  * The month's inward material arrivals sit at the bottom with editable line
@@ -427,6 +429,115 @@ const profitSkuDetail = computed(() => {
     })),
   }
 })
+// ---------------------------------------------------------------------------
+// Assets panel (user request): a collapsible card just above Stock in Hand
+// whose tiles — Expected (the period's revenue) / Received (payments recorded
+// in the period) / Pending (lifetime client balances) / Vendor dues (lifetime
+// payable) — drive their own bar chart, the same way the Summary tiles do.
+// The figures come from `stats.assets`; the period is whatever the picker at
+// the top has selected (month OR explicit from/to range).
+// ---------------------------------------------------------------------------
+const assetsOpen = ref(false)
+const assetMetric = ref('expected') // expected | received | pending | vendor
+
+const assets = computed(() => stats.value.assets || {})
+
+const assetTiles = computed(() => {
+  const a = assets.value
+  const base = [
+    {
+      key: 'expected',
+      label: 'Expected',
+      color: 'success',
+      value: money(a.expected),
+      note: 'revenue for the period',
+    },
+    {
+      key: 'received',
+      label: 'Received',
+      color: 'primary',
+      value: money(a.received),
+      note: `payments in ${periodLabel.value}`,
+    },
+    {
+      key: 'pending',
+      label: 'Pending',
+      color: 'warning',
+      value: money(a.pending),
+      note: 'from clients, lifetime',
+    },
+    {
+      key: 'vendor',
+      label: 'Vendor dues',
+      color: 'error',
+      value: money(a.vendor_payable),
+      note: 'we owe, lifetime',
+    },
+  ]
+  return base.map((t) => ({
+    ...t,
+    caption: assetMetric.value === t.key ? 'chart below' : 'tap for chart',
+  }))
+})
+
+// Highest first so the biggest bar always reads left to right.
+function byAmountDesc(rows) {
+  return [...rows].sort((x, y) => Number(y.amount) - Number(x.amount))
+}
+
+// The Assets chart area: the per-client / per-vendor rows of whichever tile
+// is selected above.
+const assetChart = computed(() => {
+  const a = assets.value
+  if (assetMetric.value === 'received') {
+    const rows = byAmountDesc(a.received_per_client || [])
+    return {
+      title: 'Received per client',
+      subtitle: `${periodLabel.value} · payments recorded in the period`,
+      labels: rows.map((r) => r.client),
+      data: rows.map((r) => Number(r.amount)),
+      label: 'Received (₹)',
+      empty: 'No payments received in this period.',
+    }
+  }
+  if (assetMetric.value === 'pending') {
+    // Zero balances carry no information in a bar chart — drop them.
+    const rows = byAmountDesc(
+      (a.pending_per_client || []).filter((r) => Number(r.amount) !== 0)
+    )
+    return {
+      title: 'Pending per client',
+      subtitle: 'Lifetime balances · tap a client in Clients for the ledger',
+      labels: rows.map((r) => r.client),
+      data: rows.map((r) => Number(r.amount)),
+      label: 'Pending (₹)',
+      empty: 'Nothing pending from any client.',
+    }
+  }
+  if (assetMetric.value === 'vendor') {
+    const rows = byAmountDesc(
+      (a.vendor_payable_per_vendor || []).filter((r) => Number(r.amount) !== 0)
+    )
+    return {
+      title: 'Payable per vendor',
+      subtitle: 'Lifetime · what we still owe each vendor',
+      labels: rows.map((r) => r.vendor),
+      data: rows.map((r) => Number(r.amount)),
+      label: 'We owe (₹)',
+      empty: 'Nothing owed to any vendor.',
+    }
+  }
+  const rows = a.expected_per_client || []
+  return {
+    title: 'Expected per client',
+    subtitle: `${periodLabel.value} · revenue of the period's deliveries`,
+    labels: rows.map((r) => r.client),
+    data: rows.map((r) => Number(r.amount)),
+    label: 'Expected (₹)',
+    empty: 'No deliveries in this period.',
+  }
+})
+
 // --- Inward material line items (editable at any time) ---------------------
 // The inward register is shown as a flat, chronological table (date /
 // material / qty) rather than grouped rows, so it reads like a register book
@@ -836,6 +947,72 @@ const onOrderClosed = () => {
     <!-- allow-range: the Home dashboard can also be driven by an explicit
          from/to range instead of the month (user request). -->
     <MonthPicker allow-range />
+
+    <!-- Assets (user request): click the header to expand / collapse, exactly
+         like Stock in Hand. The four tiles drive the bar chart below the same
+         way the Summary tiles do. -->
+    <v-card class="mb-4" :loading="loading">
+      <v-card-title
+        class="d-flex align-center flex-wrap text-subtitle-1 font-weight-bold"
+        style="cursor: pointer"
+        @click="assetsOpen = !assetsOpen"
+      >
+        <v-icon start color="primary">mdi-cash-multiple</v-icon>
+        <span class="mr-2">Assets</span>
+        <v-spacer />
+        <span class="text-caption text-medium-emphasis mr-2">{{ periodLabel }}</span>
+        <v-icon>{{ assetsOpen ? 'mdi-chevron-up' : 'mdi-chevron-down' }}</v-icon>
+      </v-card-title>
+      <v-divider />
+      <v-expand-transition>
+        <div v-show="assetsOpen">
+          <v-card-text>
+            <v-row>
+              <v-col v-for="t in assetTiles" :key="t.key" cols="6" md="3">
+                <v-card
+                  :color="t.color"
+                  :variant="assetMetric === t.key ? 'flat' : 'tonal'"
+                  height="100%"
+                  style="cursor: pointer"
+                  @click="assetMetric = t.key"
+                >
+                  <v-card-text class="d-flex flex-column text-center h-100">
+                    <div class="text-h5 font-weight-bold">{{ t.value }}</div>
+                    <div class="text-caption font-weight-bold text-uppercase">
+                      {{ t.label }}
+                    </div>
+                    <div v-if="t.note" class="text-caption" style="opacity: 0.85">
+                      {{ t.note }}
+                    </div>
+                    <div class="text-caption mt-auto" style="opacity: 0.8">
+                      {{ t.caption }}
+                    </div>
+                  </v-card-text>
+                </v-card>
+              </v-col>
+            </v-row>
+
+            <!-- Chart area: populated by the tile selected above. -->
+            <div
+              class="text-caption font-weight-bold text-uppercase text-medium-emphasis mt-2"
+            >
+              {{ assetChart.title }}
+            </div>
+            <div class="text-caption text-medium-emphasis">
+              {{ assetChart.subtitle }}
+            </div>
+            <ChartCanvas
+              v-if="assetChart.labels.length"
+              type="bar"
+              :labels="assetChart.labels"
+              :datasets="[{ label: assetChart.label, data: assetChart.data }]"
+              :height="220"
+            />
+            <EmptyState v-else :text="assetChart.empty" icon="mdi-chart-bar" />
+          </v-card-text>
+        </div>
+      </v-expand-transition>
+    </v-card>
 
     <!-- Stock in Hand: the low / healthy summary always shows; clicking the
          header expands the per-material detail (user request). -->

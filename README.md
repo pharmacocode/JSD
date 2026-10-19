@@ -470,6 +470,18 @@ screens instant and the API quiet. Nothing here changes the business rules.
   `stats.client_breakdown` (= revenue − current direct cost − the client's share
   of the month's per-case overhead); the profit tile follows the toggle so card
   and bars always agree. The old "top clients by revenue" doughnut is gone.
+- **Home Assets panel (user request):** a collapsible **Assets** card sits just
+  above *Stock in Hand* (click the header to expand / collapse, like every other
+  Home panel), driven by the same month / from-to picker at the top. Its four
+  tiles — **Expected** (the period's delivery revenue, i.e. what is to be
+  received against the deliveries made in it), **Received** (client payments
+  recorded in the period), **Pending** (every client's LIFETIME pending
+  balance, honoring the "pending as of" marker) and **Vendor dues** (every
+  vendor's lifetime payable, honoring its marker) — each drive a bar chart
+  below the tiles, the same way the Summary tiles do: expected / received /
+  pending per client, and payable per vendor. The figures come from the new
+  `stats.assets` payload; only Expected and Received follow the selected
+  period, the two owed figures are always lifetime.
 - **Chart drill-downs (user request):** tapping a bar opens a break-up below
   the chart — on *Cases sold* the picked SKU shows the **clients served**
   (bar chart); on *Revenue* the picked client shows the **case count per SKU

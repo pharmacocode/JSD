@@ -2072,6 +2072,130 @@ class DashboardSummaryTests(TestCase):
         self.assertEqual(carry_forward + inward - delivered, in_hand)
 
 
+class DashboardAssetsTests(TestCase):
+    """
+    User request: Home gets a collapsible Assets panel above Stock in Hand —
+    Expected (the period's delivery revenue) · Received (client payments
+    recorded in the period) · Pending (lifetime client balances) · Vendor dues
+    (lifetime payable) — each tile backed by per-client / per-vendor rows so
+    its bar chart has data. These tests pin the figures behind those tiles.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.alpha = Client.objects.create(name="Alpha")
+        self.beta = Client.objects.create(name="Beta")
+        self.vendor = Vendor.objects.create(name="Glass Co")
+        self.mat = make_material("Bottle API", "10", vendor=self.vendor)
+        # Purchase: 100 x 10 = 1000 landed from the vendor.
+        make_batch(self.mat, "100", "10", arrival=date(2026, 9, 1))
+        self.sku = SKU.objects.create(description="Serum 500ml", qty_per_case=D("1"))
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.mat, qty_per_case=D("1")
+        )
+        # September deliveries: Alpha 2 x 500, Beta 5 x 400 => 3000 expected.
+        for client, cases, price, day in (
+            (self.alpha, "2", "500", "2026-09-10"),
+            (self.beta, "5", "400", "2026-09-12"),
+        ):
+            self.api.post(
+                "/api/deliveries/",
+                {
+                    "client": client.id,
+                    "sku": self.sku.id,
+                    "qty_cases": cases,
+                    "selling_price_per_case": price,
+                    "date": day,
+                },
+                format="json",
+            )
+        # Received: 400 from Alpha INSIDE September, 1000 from Beta in August
+        # (lifetime only), and 250 paid to the vendor in September.
+        ClientLedgerEntry.objects.create(
+            client=self.alpha,
+            entry_type="PAYMENT",
+            amount=D("-400"),
+            date=date(2026, 9, 15),
+        )
+        ClientLedgerEntry.objects.create(
+            client=self.beta,
+            entry_type="PAYMENT",
+            amount=D("-1000"),
+            date=date(2026, 8, 20),
+        )
+        VendorPayment.objects.create(
+            vendor=self.vendor, amount=D("250"), date=date(2026, 9, 20)
+        )
+
+    def assets(self, query="month=2026-09"):
+        return self.api.get(f"/api/dashboard/?{query}").data["stats"]["assets"]
+
+    def test_four_tiles_add_up_to_their_breakdown_rows(self):
+        a = self.assets()
+        # Expected = the period's delivery revenue (2x500 + 5x400).
+        self.assertEqual(D(a["expected"]), D("3000"))
+        # Received = only the payment DATED in September, not August's.
+        self.assertEqual(D(a["received"]), D("400"))
+        # Pending = lifetime: Alpha 1000-400, Beta 2000-1000.
+        self.assertEqual(D(a["pending"]), D("1600"))
+        # Vendor dues = purchases 1000 - payments 250.
+        self.assertEqual(D(a["vendor_payable"]), D("750"))
+        # Every tile's chart rows add back up to its total.
+        self.assertEqual(
+            sum((D(r["amount"]) for r in a["expected_per_client"]), D("0")),
+            D(a["expected"]),
+        )
+        self.assertEqual(
+            sum((D(r["amount"]) for r in a["received_per_client"]), D("0")),
+            D(a["received"]),
+        )
+        self.assertEqual(
+            sum((D(r["amount"]) for r in a["pending_per_client"]), D("0")),
+            D(a["pending"]),
+        )
+        self.assertEqual(
+            sum((D(r["amount"]) for r in a["vendor_payable_per_vendor"]), D("0")),
+            D(a["vendor_payable"]),
+        )
+
+    def test_breakdown_rows_are_per_client_and_per_vendor(self):
+        a = self.assets()
+        self.assertEqual(
+            {r["client"]: D(r["amount"]) for r in a["expected_per_client"]},
+            {"Alpha": D("1000"), "Beta": D("2000")},
+        )
+        self.assertEqual(
+            {r["client"]: D(r["amount"]) for r in a["received_per_client"]},
+            {"Alpha": D("400")},
+        )
+        self.assertEqual(
+            {r["client"]: D(r["amount"]) for r in a["pending_per_client"]},
+            {"Alpha": D("600"), "Beta": D("1000")},
+        )
+        self.assertEqual(
+            {r["vendor"]: D(r["amount"]) for r in a["vendor_payable_per_vendor"]},
+            {"Glass Co": D("750")},
+        )
+
+    def test_range_mode_scopes_expected_and_received_only(self):
+        # August: no deliveries, but Beta's 1000 payment lands in it.
+        a = self.assets("from=2026-08-01&to=2026-08-31")
+        self.assertEqual(D(a["expected"]), D("0"))
+        self.assertEqual(D(a["received"]), D("1000"))
+        # Pending / vendor dues are LIFETIME figures — the period never moves
+        # them, so both tiles read the same under any date selection.
+        self.assertEqual(D(a["pending"]), D("1600"))
+        self.assertEqual(D(a["vendor_payable"]), D("750"))
+
+    def test_client_pending_marker_flows_into_the_pending_tile(self):
+        self.alpha.pending_as_of_amount = D("50")
+        self.alpha.pending_as_of_date = date(2026, 9, 30)
+        self.alpha.save()
+        a = self.assets()
+        # Alpha's whole September ledger is replaced by the marked 50.
+        self.assertEqual(D(a["pending"]), D("1050"))
+
+
 class MultiSKUDeliveryTests(TestCase):
     """
     User request: ONE delivery can carry several SKUs, each with its own
