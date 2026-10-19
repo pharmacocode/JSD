@@ -482,6 +482,32 @@ screens instant and the API quiet. Nothing here changes the business rules.
   pending per client, and payable per vendor. The figures come from the new
   `stats.assets` payload; only Expected and Received follow the selected
   period, the two owed figures are always lifetime.
+- **Asset & Loan master and the Net Worth page (user request):** Masters gains
+  an **Asset & Loan Master** screen. Adding an asset first asks for its
+  **label — depreciating (auto, printing machine…) or non-depreciating
+  (savings, deposits…)**; only a depreciating asset then collects **initial
+  value, purchase month & year, expected life (years) and end-of-life value**,
+  and its current value is estimated **straight-line** down to the end-of-life
+  figure (`Asset.current_value`, previewed live in the dialog). A loan
+  collects **amount, annual interest rate, first EMI date (the start date),
+  duration in months and the total payment already made** (0 for a fresh
+  loan); the dialog computes the **expected EMI** (reducing-balance annuity)
+  before confirm and the EMI may be **edited** (an "EMI edited" chip marks it
+  later); omitting it server-side stores the computed figure. The
+  **outstanding is schedule-based**: EMI #1 falls due ON the first EMI date,
+  the rest monthly from there, and the liability is the EMIs fallen due so
+  far minus everything paid — the entered already-paid figure plus every
+  recorded payment (an EMI instalment or a **transfer from profits**,
+  `POST /api/loans/<id>/payments/`). A fresh loan therefore starts at exactly
+  one EMI and one that starts in the future owes nothing yet. The **Home
+  screen shows
+  three small tiles above the Add Delivery row — Assets · Liabilities · Net —**
+  from the new `GET /api/networth/`, and tapping them opens the
+  **Assets & Liabilities** page with the full breakup: fixed assets at today's
+  depreciated value, non-depreciating assets, **stock in hand valued at the
+  price we pay the vendor (material master)**, lifetime **profit** (revenue −
+  current direct cost − all overhead booked), and the loans with **Pay EMI** /
+  **From profits** actions.
 - **Chart drill-downs (user request):** tapping a bar opens a break-up below
   the chart — on *Cases sold* the picked SKU shows the **clients served**
   (bar chart); on *Revenue* the picked client shows the **case count per SKU

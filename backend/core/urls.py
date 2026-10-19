@@ -4,6 +4,7 @@ from django.urls import include, path
 from rest_framework.routers import DefaultRouter
 
 from .views import (
+    AssetViewSet,
     ClientLedgerEntryViewSet,
     ClientOrderViewSet,
     ClientSKUPriceViewSet,
@@ -11,10 +12,12 @@ from .views import (
     DashboardView,
     EmployeePaymentViewSet,
     EmployeeViewSet,
+    LoanViewSet,
     LoginAttemptViewSet,
     MaterialBatchViewSet,
     MaterialViewSet,
     MonthlyOverheadViewSet,
+    NetWorthView,
     OverheadCategoryViewSet,
     PasswordView,
     PingView,
@@ -28,6 +31,8 @@ from .views import (
 )
 
 router = DefaultRouter()
+router.register(r"assets", AssetViewSet, basename="asset")
+router.register(r"loans", LoanViewSet, basename="loan")
 router.register(r"clients", ClientViewSet, basename="client")
 router.register(r"client-prices", ClientSKUPriceViewSet, basename="client-price")
 router.register(r"ledger", ClientLedgerEntryViewSet, basename="ledger")
@@ -61,5 +66,7 @@ urlpatterns = [
     # App gate (user request): password check + the audit list it feeds.
     path("auth/password/", PasswordView.as_view(), name="auth-password"),
     path("dashboard/", DashboardView.as_view(), name="dashboard"),
+    # Balance sheet behind the Home tiles (user request).
+    path("networth/", NetWorthView.as_view(), name="networth"),
     path("reports/", ReportView.as_view(), name="reports"),
 ]

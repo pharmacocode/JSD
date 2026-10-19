@@ -7,12 +7,15 @@ from rest_framework import serializers
 
 from .cogs import settle_deficit
 from .models import (
+    Asset,
     Client,
     ClientLedgerEntry,
     ClientOrder,
     ClientSKUPrice,
     Employee,
     EmployeePayment,
+    Loan,
+    LoanPayment,
     Material,
     MaterialBatch,
     MonthlyOverhead,
@@ -720,4 +723,149 @@ class EmployeePaymentSerializer(serializers.ModelSerializer):
             "is_deleted",
             "created_at",
         ]
+
+
+class AssetSerializer(serializers.ModelSerializer):
+    """Asset master (user request) — `current_value` is the live estimate."""
+
+    current_value = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Asset
+        fields = [
+            "id",
+            "name",
+            "kind",
+            "initial_value",
+            "purchase_month",
+            "lifetime_years",
+            "end_of_life_value",
+            "current_value",
+            "created_at",
+        ]
+
+    def validate_purchase_month(self, value):
+        if not value:
+            return value
+        parts = value.split("-")
+        if (
+            len(parts) != 2
+            or not all(p.isdigit() for p in parts)
+            or not (1 <= int(parts[1]) <= 12)
+        ):
+            raise serializers.ValidationError("Use YYYY-MM (e.g. 2025-06).")
+        return value
+
+    def validate(self, attrs):
+        # A DEPRECIATING asset must carry its life details — the value
+        # estimate is built from them (user request). A NON_DEPRECIATING one
+        # (savings etc.) needs nothing beyond its initial value.
+        kind = attrs.get("kind", getattr(self.instance, "kind", "DEPRECIATING"))
+        if kind == "DEPRECIATING":
+            purchase = attrs.get(
+                "purchase_month", getattr(self.instance, "purchase_month", "")
+            )
+            lifetime = attrs.get(
+                "lifetime_years", getattr(self.instance, "lifetime_years", None)
+            )
+            if not purchase or lifetime in (None, ""):
+                raise serializers.ValidationError(
+                    "Depreciating assets need the purchase month and the "
+                    "expected lifetime (in years)."
+                )
+        return attrs
+
+    def get_current_value(self, obj):
+        return str(obj.current_value)
+
+
+class LoanPaymentSerializer(serializers.ModelSerializer):
+    class Meta:
+        model = LoanPayment
+        fields = ["id", "loan", "amount", "date", "note"]
+
+
+class LoanSerializer(serializers.ModelSerializer):
+    """
+    Loan with its EMI maths exposed: `computed_emi` is the formula figure,
+    `emi` the user's (possibly edited) commitment — created from the computed
+    one when the caller omits it.
+    """
+
+    computed_emi = serializers.SerializerMethodField()
+    effective_emi = serializers.SerializerMethodField()
+    total_payable = serializers.SerializerMethodField()
+    emis_due = serializers.SerializerMethodField()
+    amount_paid = serializers.SerializerMethodField()
+    outstanding = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Loan
+        fields = [
+            "id",
+            "name",
+            "principal",
+            "annual_interest_rate",
+            "start_date",
+            "duration_months",
+            "emi",
+            "initial_paid",
+            "computed_emi",
+            "effective_emi",
+            "total_payable",
+            "emis_due",
+            "amount_paid",
+            "outstanding",
+            "created_at",
+        ]
+
+    def validate_duration_months(self, value):
+        if value <= 0:
+            raise serializers.ValidationError("Duration must be at least 1 month.")
+        return value
+
+    def validate_initial_paid(self, value):
+        if value is not None and value < 0:
+            raise serializers.ValidationError("Already paid cannot be negative.")
+        return value
+
+    @staticmethod
+    def _fill_emi(validated, instance=None):
+        """emi=None => keep the computed figure (create AND edit)."""
+        if validated.get("emi") is None:
+            validated["emi"] = Loan.compute_emi(
+                validated.get("principal", instance.principal if instance else 0),
+                validated.get(
+                    "annual_interest_rate",
+                    instance.annual_interest_rate if instance else 0,
+                ),
+                validated.get(
+                    "duration_months", instance.duration_months if instance else 0
+                ),
+            )
+        return validated
+
+    def create(self, validated):
+        return super().create(self._fill_emi(validated))
+
+    def update(self, instance, validated):
+        return super().update(instance, self._fill_emi(validated, instance))
+
+    def get_computed_emi(self, obj):
+        return str(obj.computed_emi)
+
+    def get_effective_emi(self, obj):
+        return str(obj.effective_emi)
+
+    def get_total_payable(self, obj):
+        return str(obj.total_payable)
+
+    def get_emis_due(self, obj):
+        return obj.emis_due
+
+    def get_amount_paid(self, obj):
+        return str(obj.amount_paid)
+
+    def get_outstanding(self, obj):
+        return str(obj.outstanding)
 

@@ -67,6 +67,17 @@ def make_batch(material, qty, price, arrival=date(2026, 8, 1)):
     )
 
 
+def month_start_back(months):
+    """
+    The 1st of the month `months` calendar months before today. Loans started
+    on the 1st give a deterministic EMI-due count in tests (the day-of-month
+    check always passes).
+    """
+    today = date.today()
+    idx = today.year * 12 + (today.month - 1) - months
+    return date(idx // 12, idx % 12 + 1, 1)
+
+
 class FIFOConsumptionTests(TestCase):
     """Spec 5: consume oldest batch first, roll over to next-oldest."""
 
@@ -2194,6 +2205,276 @@ class DashboardAssetsTests(TestCase):
         a = self.assets()
         # Alpha's whole September ledger is replaced by the marked 50.
         self.assertEqual(D(a["pending"]), D("1050"))
+
+
+class AssetMasterTests(TestCase):
+    """
+    User request: an asset master (auto, printing machine…) that estimates
+    each asset's current value straight-line from the initial value to the
+    end-of-life value across the expected lifetime — and never touches a
+    non-depreciating asset (savings etc.).
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+
+    @staticmethod
+    def month_back(months):
+        """YYYY-MM for `months` calendar months before today."""
+        today = date.today()
+        idx = today.year * 12 + (today.month - 1) - months
+        return f"{idx // 12:04d}-{idx % 12 + 1:02d}"
+
+    def add_asset(self, **extra):
+        payload = {
+            "name": "Auto",
+            "kind": "DEPRECIATING",
+            "initial_value": "120000",
+            "purchase_month": self.month_back(12),
+            "lifetime_years": "4",
+            "end_of_life_value": "20000",
+        }
+        payload.update(extra)
+        resp = self.api.post("/api/assets/", payload, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        return resp.data
+
+    def test_depreciating_asset_loses_value_straight_line(self):
+        # 120,000 bought 12 months ago, 4-year life, 20,000 salvage: a
+        # quarter of the 100,000 depreciation has happened -> 95,000.
+        data = self.add_asset()
+        self.assertEqual(D(data["current_value"]), D("95000.00"))
+
+    def test_asset_floors_at_its_end_of_life_value(self):
+        # Bought 100 months ago against a 48-month life: fully depreciated.
+        data = self.add_asset(purchase_month=self.month_back(100))
+        self.assertEqual(D(data["current_value"]), D("20000.00"))
+
+    def test_bought_this_month_the_value_is_still_the_initial_one(self):
+        data = self.add_asset(purchase_month=self.month_back(0))
+        self.assertEqual(D(data["current_value"]), D("120000.00"))
+
+    def test_non_depreciating_asset_never_moves(self):
+        # Savings etc. — only the initial value is collected, and it stands.
+        resp = self.api.post(
+            "/api/assets/",
+            {"name": "Savings", "kind": "NON_DEPRECIATING", "initial_value": "50000"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(D(resp.data["current_value"]), D("50000.00"))
+
+    def test_depreciating_asset_requires_its_life_details(self):
+        resp = self.api.post(
+            "/api/assets/",
+            {
+                "name": "Auto",
+                "kind": "DEPRECIATING",
+                "initial_value": "120000",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+
+class LoanTests(TestCase):
+    """
+    User request: loan details produce the EXPECTED EMI (shown before
+    confirm, editable), and every recorded payment — an EMI instalment or a
+    transfer from profits — clears the outstanding 1:1.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+
+    def create_loan(self, **extra):
+        payload = {
+            "name": "Auto loan",
+            "principal": "100000",
+            "annual_interest_rate": "12",
+            "start_date": "2026-09-01",
+            "duration_months": 12,
+        }
+        payload.update(extra)
+        resp = self.api.post("/api/loans/", payload, format="json")
+        self.assertEqual(resp.status_code, 201, resp.data)
+        return resp.data
+
+    def test_expected_emi_is_computed_from_the_terms(self):
+        # 100,000 @ 1% a month for 12 months = 8884.88 (annuity formula).
+        data = self.create_loan()
+        self.assertEqual(D(data["computed_emi"]), D("8884.88"))
+        self.assertEqual(D(data["emi"]), D("8884.88"))
+        self.assertEqual(D(data["total_payable"]), D("106618.56"))
+
+    def test_user_can_edit_the_emi_before_confirm(self):
+        data = self.create_loan(emi="9000")
+        self.assertEqual(D(data["emi"]), D("9000.00"))
+        self.assertEqual(D(data["computed_emi"]), D("8884.88"))  # formula still shown
+        self.assertEqual(D(data["total_payable"]), D("108000.00"))
+
+    def test_zero_percent_loan_splits_the_principal(self):
+        data = self.create_loan(annual_interest_rate="0")
+        self.assertEqual(D(data["emi"]), D("8333.33"))
+
+    def test_outstanding_counts_only_the_emis_fallen_due(self):
+        # The start date is the FIRST EMI date (user request): started on the
+        # 1st two months back, three EMIs have fallen due and a fresh loan has
+        # paid nothing yet.
+        data = self.create_loan(emi="9000", start_date=month_start_back(2).isoformat())
+        self.assertEqual(D(data["outstanding"]), D("27000.00"))
+        self.assertEqual(D(data["amount_paid"]), D("0.00"))
+
+    def test_already_paid_is_collected_and_counts_against_the_dues(self):
+        # An existing loan imported with three EMIs already paid -> nothing
+        # outstanding left against the dues so far.
+        data = self.create_loan(
+            emi="9000",
+            start_date=month_start_back(2).isoformat(),
+            initial_paid="27000",
+        )
+        self.assertEqual(D(data["amount_paid"]), D("27000.00"))
+        self.assertEqual(D(data["outstanding"]), D("0.00"))
+
+    def test_already_paid_cannot_be_negative(self):
+        resp = self.api.post(
+            "/api/loans/",
+            {
+                "principal": "100000",
+                "annual_interest_rate": "12",
+                "start_date": "2026-09-01",
+                "duration_months": 12,
+                "initial_paid": "-5",
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 400)
+
+    def test_a_fresh_loan_starts_at_exactly_one_emi(self):
+        # EMI #1 falls due today itself, so the outstanding is one EMI.
+        data = self.create_loan(start_date=date.today().isoformat())
+        self.assertEqual(D(data["outstanding"]), D(data["effective_emi"]))
+
+    def test_a_loan_starting_in_the_future_owes_nothing(self):
+        future = date.today().replace(year=date.today().year + 1)
+        data = self.create_loan(start_date=future.isoformat())
+        self.assertEqual(D(data["outstanding"]), D("0.00"))
+
+    def test_a_payment_clears_the_outstanding(self):
+        data = self.create_loan(
+            emi="9000", start_date=month_start_back(2).isoformat()
+        )
+        resp = self.api.post(
+            f"/api/loans/{data['id']}/payments/",
+            {"amount": "9000", "date": date.today().isoformat(), "note": "EMI"},
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        self.assertEqual(D(resp.data["loan"]["amount_paid"]), D("9000.00"))
+        self.assertEqual(D(resp.data["loan"]["outstanding"]), D("18000.00"))
+
+
+class NetWorthTests(TestCase):
+    """
+    The balance-sheet page behind the Home tiles (user request): fixed assets
+    at today's depreciated value + stock in hand at the material master's
+    vendor price + lifetime profit, against every loan's outstanding.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.client_obj = Client.objects.create(name="Alpha")
+        # Master says the vendor price is 12; the batch in hand was bought at
+        # 8 — the stock figure must use the MASTER price (user request).
+        self.mat = make_material("Bottle API", "12")
+        make_batch(self.mat, "100", "8", arrival=date(2026, 9, 1))
+        self.sku = SKU.objects.create(description="Serum 500ml", qty_per_case=D("1"))
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.mat, qty_per_case=D("1")
+        )
+        # Revenue 1000; FIFO direct cost 2 x 8 = 16; overhead 350 -> 634 profit.
+        self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku.id,
+                "qty_cases": "2",
+                "selling_price_per_case": "500",
+                "date": "2026-09-10",
+            },
+            format="json",
+        )
+        MonthlyOverhead.objects.create(
+            category=OverheadCategory.objects.get(name="Rent"),
+            month="2026-09",
+            amount=D("350"),
+        )
+        self.api.post(
+            "/api/assets/",
+            {"name": "Savings", "kind": "NON_DEPRECIATING", "initial_value": "50000"},
+            format="json",
+        )
+        self.loan = self.api.post(
+            "/api/loans/",
+            {
+                "name": "Print machine loan",
+                "principal": "200000",
+                "annual_interest_rate": "12",
+                # First EMI date three months back (on the 1st) -> 4 EMIs due.
+                "start_date": month_start_back(3).isoformat(),
+                "duration_months": 20,
+                "emi": "11122",
+            },
+            format="json",
+        ).data
+
+    def networth(self):
+        return self.api.get("/api/networth/").data
+
+    def test_assets_hold_fixed_stock_and_profit(self):
+        assets = self.networth()["assets"]
+        self.assertEqual(
+            {r["name"]: D(r["current_value"]) for r in assets["non_depreciating"]},
+            {"Savings": D("50000.00")},
+        )
+        # Stock: 98 cases left (100 arrived − 2 delivered) at the MASTER
+        # price of 12, not the batch's 8.
+        self.assertEqual(D(assets["stock_total"]), D("1176.00"))
+        row = assets["stock"][0]
+        self.assertEqual(D(row["qty"]), D("98"))
+        self.assertEqual(D(row["price_per_unit"]), D("12.00"))
+        # Lifetime profit after overhead: 1000 − 16 − 350.
+        self.assertEqual(D(assets["profit"]["net"]), D("634.00"))
+        self.assertEqual(D(assets["total"]), D("51810.00"))
+
+    def test_liabilities_hold_the_outstanding_and_net_ties_out(self):
+        data = self.networth()
+        loan = data["liabilities"]["loans"][0]
+        # 4 EMIs have fallen due from the first EMI date (user request); none
+        # has been paid -> 4 x 11122 outstanding.
+        self.assertEqual(loan["emis_due"], 4)
+        self.assertEqual(D(loan["outstanding"]), D("44488.00"))
+        self.assertEqual(D(data["liabilities"]["total"]), D("44488.00"))
+        self.assertEqual(
+            D(data["net"]),
+            D(data["assets"]["total"]) - D(data["liabilities"]["total"]),
+        )
+
+    def test_a_profit_transfer_reduces_the_liability_only(self):
+        self.api.post(
+            f"/api/loans/{self.loan['id']}/payments/",
+            {
+                "amount": "11122",
+                "date": date.today().isoformat(),
+                "note": "Transferred from profits",
+            },
+            format="json",
+        )
+        data = self.networth()
+        self.assertEqual(D(data["liabilities"]["total"]), D("33366.00"))
+        # The profit figure itself never moves — a transfer is a movement of
+        # money, not a change of what was earned.
+        self.assertEqual(D(data["assets"]["profit"]["net"]), D("634.00"))
 
 
 class MultiSKUDeliveryTests(TestCase):

@@ -1300,5 +1300,184 @@ class LoginAttempt(models.Model):
         return f"{self.timestamp:%Y-%m-%d %H:%M} {self.ip}{where}: {kind}"
 
 
+# ---------------------------------------------------------------------------
+# Asset & Loan master (user request): the fixed-asset and liability side of
+# the Net Worth page. Assets are labelled DEPRECIATING (auto, printing
+# machine…) or NON_DEPRECIATING (savings, deposits…); only a depreciating
+# asset carries life details and its value is estimated straight-line down to
+# its end-of-life value. Loans carry the standard EMI terms — computed from
+# the annuity formula, editable before confirm — and every recorded payment
+# (an EMI instalment or a transfer from profits) clears the outstanding 1:1.
+# ---------------------------------------------------------------------------
+class Asset(AuditModel):
+    KIND_CHOICES = [
+        ("DEPRECIATING", "Depreciating"),
+        ("NON_DEPRECIATING", "Non-depreciating"),
+    ]
+
+    objects = InvalidateQuerySet.as_manager()
+    name = models.CharField(max_length=200)
+    kind = models.CharField(max_length=20, choices=KIND_CHOICES, default="DEPRECIATING")
+    initial_value = models.DecimalField(max_digits=12, decimal_places=2)
+    # Purchase month + year (YYYY-MM) — the day is irrelevant to depreciation.
+    purchase_month = models.CharField(max_length=7, blank=True, default="")
+    # Expected asset life time, in YEARS (decimal allowed, e.g. 7.5).
+    lifetime_years = models.DecimalField(
+        max_digits=6, decimal_places=2, null=True, blank=True
+    )
+    # Scrap / resale value once the life ends — also the depreciation floor.
+    end_of_life_value = models.DecimalField(
+        max_digits=12, decimal_places=2, null=True, blank=True, default=0
+    )
+
+    class Meta:
+        ordering = ["name"]
+
+    def __str__(self):
+        return self.name
+
+    @property
+    def current_value(self):
+        """
+        Today's value (user request: "from these the value, each asset value
+        should be estimated"): STRAIGHT-LINE depreciation from initial_value
+        down to end_of_life_value across lifetime_years, floored at the
+        end-of-life value. A non-depreciating asset never moves, and a
+        depreciating one missing its life details shows its initial value
+        rather than guessing.
+        """
+        initial = money(self.initial_value)
+        if self.kind != "DEPRECIATING":
+            return initial
+        if not self.purchase_month or not self.lifetime_years:
+            return initial
+        try:
+            p_year, p_mon = (int(p) for p in self.purchase_month.split("-"))
+        except ValueError:
+            return initial
+        today = timezone.localtime().date()
+        elapsed_months = (today.year - p_year) * 12 + (today.month - p_mon)
+        lifetime_months = int((self.lifetime_years or Decimal("0")) * Decimal("12"))
+        if lifetime_months <= 0 or elapsed_months <= 0:
+            return initial
+        salvage = money(self.end_of_life_value or Decimal("0"))
+        fraction = min(Decimal(elapsed_months) / Decimal(lifetime_months), Decimal("1"))
+        value = initial - (initial - salvage) * fraction
+        return money(max(value, salvage))
+
+
+class Loan(AuditModel):
+    objects = InvalidateQuerySet.as_manager()
+    # Free label ("Auto loan — bank", optional).
+    name = models.CharField(max_length=200, blank=True, default="")
+    principal = models.DecimalField(max_digits=12, decimal_places=2)
+    # Percent per year (e.g. 9.5).
+    annual_interest_rate = models.DecimalField(max_digits=6, decimal_places=2, default=0)
+    start_date = models.DateField()
+    duration_months = models.PositiveIntegerField(default=0)
+    # The EXPECTED EMI computed from the formula is shown before confirm and
+    # the user may edit it; None means "keep the computed figure" (the
+    # serializer fills it in on save).
+    emi = models.DecimalField(max_digits=12, decimal_places=2, null=True, blank=True)
+    # Total payment already made BEFORE this loan was entered in the app —
+    # 0 for a fresh loan, whatever the user has already paid for one that has
+    # been running. Counts against the EMIs that have fallen due.
+    initial_paid = models.DecimalField(max_digits=12, decimal_places=2, default=0)
+
+    class Meta:
+        ordering = ["name", "id"]
+
+    def __str__(self):
+        return self.name or f"Loan #{self.pk}"
+
+    @staticmethod
+    def compute_emi(principal, annual_rate, months):
+        """
+        Standard reducing-balance EMI:
+            r = annual% / 12 / 100
+            EMI = P·r·(1+r)^n / ((1+r)^n − 1)
+        A 0% loan simply splits the principal into equal instalments.
+        """
+        principal = Decimal(principal)
+        months = int(months or 0)
+        if months <= 0:
+            return money(0)
+        rate = Decimal(annual_rate) / Decimal("12") / Decimal("100")
+        if rate == 0:
+            return money(principal / months)
+        factor = (Decimal("1") + rate) ** months
+        return money(principal * rate * factor / (factor - Decimal("1")))
+
+    @property
+    def computed_emi(self):
+        """The EMI the formula gives for the current terms (no override)."""
+        return self.compute_emi(
+            self.principal, self.annual_interest_rate, self.duration_months
+        )
+
+    @property
+    def effective_emi(self):
+        """What the user actually pays: their override, else the formula."""
+        return money(self.emi) if self.emi is not None else self.computed_emi
+
+    @property
+    def total_payable(self):
+        return money(self.effective_emi * self.duration_months)
+
+    @property
+    def emis_due(self):
+        """
+        How many EMIs have fallen due so far (user request: "the start date
+        is the first EMI date, from there the EMIs outstanding are
+        calculated"): EMI #1 is due ON start_date, #2 a month later and so
+        on — counted up to today and capped at the tenure. A loan starting
+        in the future has nothing due yet.
+        """
+        today = timezone.localtime().date()
+        start = self.start_date
+        if not start or start > today:
+            return 0
+        elapsed = (today.year - start.year) * 12 + (today.month - start.month)
+        # The first EMI is due on the start date itself; each full month
+        # after it adds one more (same day-of-month, month-end clamped).
+        due = elapsed + (1 if today.day >= start.day else 0)
+        return max(0, min(due, int(self.duration_months or 0)))
+
+    @property
+    def amount_paid(self):
+        """Everything paid against the loan: the entry-time figure plus every
+        recorded payment (EMI instalments, profit transfers)."""
+        from django.db.models import Sum
+
+        total = self.payments.filter(is_deleted=False).aggregate(s=Sum("amount"))["s"]
+        return money((self.initial_paid or Decimal("0")) + (total or Decimal("0")))
+
+    @property
+    def outstanding(self):
+        """
+        What is still unpaid RIGHT NOW (user request): the EMIs that have
+        fallen due from the first EMI date, minus everything paid against
+        them — never negative, and a fresh loan starts at a single EMI.
+        """
+        due_amount = self.effective_emi * self.emis_due
+        return money(max(due_amount - self.amount_paid, Decimal("0")))
+
+
+class LoanPayment(models.Model):
+    loan = models.ForeignKey(Loan, on_delete=models.CASCADE, related_name="payments")
+    amount = models.DecimalField(max_digits=12, decimal_places=2)
+    date = models.DateField(default=timezone.now)
+    # "EMI" by default; "Transferred from profits" when funded that way.
+    note = models.TextField(blank=True, default="")
+    is_deleted = models.BooleanField(default=False)
+    created_at = models.DateTimeField(auto_now_add=True)
+
+    class Meta:
+        ordering = ["-date", "-id"]
+
+    def __str__(self):
+        return f"{self.loan} paid {self.amount}"
+
+
 
 

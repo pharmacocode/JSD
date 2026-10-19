@@ -1,11 +1,14 @@
 from django.contrib import admin
 
 from .models import (
+    Asset,
     Client,
     ClientLedgerEntry,
     ClientSKUPrice,
     Employee,
     EmployeePayment,
+    Loan,
+    LoanPayment,
     Material,
     MaterialBatch,
     MonthlyOverhead,
@@ -105,6 +108,30 @@ class StockDeliveryAdmin(admin.ModelAdmin):
 @admin.register(Vendor)
 class VendorAdmin(admin.ModelAdmin):
     list_display = ("name", "contact_number", "amount_owed", "created_at")
+
+
+# Asset & Loan master (user request) — managed from the app, not the admin,
+# but registered so the rows are visible and recoverable if ever needed.
+@admin.register(Asset)
+class AssetAdmin(admin.ModelAdmin):
+    list_display = ("name", "kind", "initial_value", "purchase_month", "created_at")
+
+
+@admin.register(Loan)
+class LoanAdmin(admin.ModelAdmin):
+    list_display = (
+        "name",
+        "principal",
+        "annual_interest_rate",
+        "duration_months",
+        "emi",
+        "initial_paid",
+    )
+
+
+@admin.register(LoanPayment)
+class LoanPaymentAdmin(admin.ModelAdmin):
+    list_display = ("loan", "amount", "date", "is_deleted")
     search_fields = ("name", "contact_number")
 
 

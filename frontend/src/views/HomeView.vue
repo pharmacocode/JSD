@@ -707,7 +707,47 @@ const _load = load
 async function loadAll() {
   await _load()
   await loadOrders()
+  loadNetworth() // not awaited — the tiles paint whenever it lands
 }
+
+// ---------------------------------------------------------------------------
+// Net worth at a glance (user request): three small tiles above the primary
+// actions; tapping one opens the detailed Assets & Liabilities page.
+// ---------------------------------------------------------------------------
+const networth = ref(null)
+
+async function loadNetworth() {
+  try {
+    networth.value = await api.get('/networth/')
+  } catch {
+    // Non-fatal — the tiles simply stay hidden.
+  }
+}
+
+const networthTiles = computed(() => {
+  const n = networth.value
+  if (!n) return []
+  return [
+    {
+      key: 'assets',
+      label: 'Assets',
+      value: money(n.assets?.total),
+      tone: 'text-success',
+    },
+    {
+      key: 'liabilities',
+      label: 'Liabilities',
+      value: money(n.liabilities?.total),
+      tone: 'text-error',
+    },
+    {
+      key: 'net',
+      label: 'Net',
+      value: money(n.net),
+      tone: Number(n.net) < 0 ? 'text-error' : 'text-primary',
+    },
+  ]
+})
 
 function openOrder(order) {
   editingOrder.value = order
@@ -901,6 +941,28 @@ const onOrderClosed = () => {
 
 <template>
   <div>
+    <!-- Net worth at a glance (user request): three small tiles above the
+         Add Delivery row — tap any of them for the detailed breakup. -->
+    <div v-if="networthTiles.length" class="d-flex flex-wrap ga-3 mb-4">
+      <v-card
+        v-for="t in networthTiles"
+        :key="t.key"
+        variant="tonal"
+        class="flex-grow-1"
+        style="min-width: 100px; cursor: pointer"
+        @click="router.push('/networth')"
+      >
+        <v-card-text class="text-center py-2 px-3">
+          <div class="text-caption font-weight-bold text-uppercase text-medium-emphasis">
+            {{ t.label }}
+          </div>
+          <div class="text-subtitle-1 font-weight-bold" :class="t.tone">
+            {{ t.value }}
+          </div>
+        </v-card-text>
+      </v-card>
+    </div>
+
     <!-- Primary actions (spec 4.1). One size for both: the hierarchy comes from
          colour (flat vs tonal), not from a bigger button — they used to render
          as two different heights and wrapped awkwardly on phones. -->

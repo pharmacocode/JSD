@@ -25,12 +25,15 @@ from .cogs import (
     split_order_lines,
 )
 from .models import (
+    Asset,
     Client,
     ClientLedgerEntry,
     ClientOrder,
     ClientSKUPrice,
     Employee,
     EmployeePayment,
+    Loan,
+    LoanPayment,
     LoginAttempt,
     Material,
     MaterialBatch,
@@ -48,6 +51,7 @@ from .models import (
     money,
 )
 from .serializers import (
+    AssetSerializer,
     ClientLedgerEntrySerializer,
     ClientOrderSerializer,
     ClientOrderWriteSerializer,
@@ -55,6 +59,8 @@ from .serializers import (
     ClientSKUPriceSerializer,
     EmployeePaymentSerializer,
     EmployeeSerializer,
+    LoanPaymentSerializer,
+    LoanSerializer,
     MaterialBatchSerializer,
     MaterialSerializer,
     MonthlyOverheadSerializer,
@@ -2933,6 +2939,188 @@ class LoginAttemptViewSet(viewsets.ReadOnlyModelViewSet):
             for r in self.get_queryset()[:500]
         ]
         return Response(rows)
+
+
+# ---------------------------------------------------------------------------
+# Asset & Loan master + the Net Worth page (user request).
+# ---------------------------------------------------------------------------
+class AssetViewSet(viewsets.ModelViewSet):
+    """Asset master: fixed assets with their live (depreciated) value."""
+
+    queryset = Asset.objects.filter(is_deleted=False)
+    serializer_class = AssetSerializer
+
+    def perform_destroy(self, instance):
+        instance.soft_delete()
+
+
+class LoanViewSet(viewsets.ModelViewSet):
+    queryset = Loan.objects.filter(is_deleted=False)
+    serializer_class = LoanSerializer
+
+    def perform_destroy(self, instance):
+        instance.soft_delete()
+
+    @action(detail=True, methods=["get", "post"])
+    def payments(self, request, pk=None):
+        """
+        GET  -> {loan, payments} — the loan with every recorded payment.
+        POST -> record a payment (an EMI instalment or a transfer from the
+        profits); it clears the loan's outstanding 1:1 and the returned loan
+        already carries the corrected figures.
+        """
+        loan = self.get_object()
+        if request.method == "POST":
+            # The loan is implied by the URL — the serializer's FK field is
+            # filled from it rather than demanded in the body.
+            serializer = LoanPaymentSerializer(
+                data={**request.data, "loan": loan.pk}
+            )
+            serializer.is_valid(raise_exception=True)
+            serializer.save()
+            return Response(
+                {
+                    "loan": LoanSerializer(loan).data,
+                    "payment": serializer.data,
+                },
+                status=status.HTTP_201_CREATED,
+            )
+        rows = loan.payments.filter(is_deleted=False).order_by("-date", "-id")
+        return Response(
+            {
+                "loan": LoanSerializer(loan).data,
+                "payments": LoanPaymentSerializer(rows, many=True).data,
+            }
+        )
+
+
+class NetWorthView(APIView):
+    """
+    Balance-sheet snapshot (user request): the page the Home tiles open.
+        ASSETS      = fixed assets at today's value (straight-line
+                      depreciation) + stock in hand at the price we pay the
+                      vendor (material master, per case) + lifetime profit
+                      (revenue − current direct cost − all overhead booked).
+        LIABILITIES = every loan's outstanding (total payable − payments).
+        NET         = assets − liabilities.
+    Everything is LIVE — a master edit moves the figures immediately.
+    """
+
+    def get(self, request):
+        # --- Fixed assets from the asset master.
+        depreciating, non_depreciating = [], []
+        dep_total = Decimal("0")
+        non_dep_total = Decimal("0")
+        for a in Asset.objects.filter(is_deleted=False).order_by("name"):
+            row = {
+                "id": a.id,
+                "name": a.name,
+                "kind": a.kind,
+                "initial_value": str(money(a.initial_value)),
+                "purchase_month": a.purchase_month,
+                "lifetime_years": (
+                    str(a.lifetime_years) if a.lifetime_years is not None else None
+                ),
+                "end_of_life_value": str(money(a.end_of_life_value or Decimal("0"))),
+                "current_value": str(a.current_value),
+            }
+            if a.kind == "DEPRECIATING":
+                depreciating.append(row)
+                dep_total += a.current_value
+            else:
+                non_depreciating.append(row)
+                non_dep_total += a.current_value
+
+        # --- Stock in hand, valued at the price we pay the vendor (the
+        # material master's current price, per case — the figure the material
+        # form shows, not a FIFO average).
+        stock_rows = []
+        stock_total = Decimal("0")
+        for m in Material.objects.all().order_by("name"):
+            qty = m.stock_in_hand
+            value = money(qty * m.current_price_per_unit)
+            if not qty and not value:
+                continue  # zero-stock materials carry no information here
+            stock_rows.append(
+                {
+                    "material_id": m.id,
+                    "material": m.name,
+                    "unit": m.unit_of_measure,
+                    "qty": dstr(qty),
+                    "price_per_unit": str(money(m.current_price_per_unit)),
+                    "value": str(value),
+                }
+            )
+            stock_total += value
+
+        # --- Lifetime profit (after overhead): one blended FIFO walk over
+        # every live delivery (same machinery as the dashboard tile) minus
+        # every rupee of overhead booked so far. A lifetime loss simply
+        # reduces the assets, exactly like a loss reduces equity.
+        deliveries = list(
+            StockDelivery.objects.filter(is_deleted=False).select_related(
+                "client", "sku", "sku__print_cost"
+            )
+        )
+        dynamic = cogs.dynamic_costs_for(deliveries)
+        revenue = sum(
+            (d.qty_cases * d.selling_price_per_case for d in deliveries), Decimal("0")
+        )
+        direct = sum((dynamic[d.id]["direct"] for d in deliveries), Decimal("0"))
+        overhead = (
+            MonthlyOverhead.objects.aggregate(s=Sum("amount"))["s"] or Decimal("0")
+        )
+        profit = money(revenue - direct - overhead)
+
+        assets_total = money(dep_total + non_dep_total + stock_total + profit)
+
+        # --- Liabilities: every loan's outstanding.
+        loans = []
+        liabilities_total = Decimal("0")
+        for loan in Loan.objects.filter(is_deleted=False):
+            loans.append(
+                {
+                    "id": loan.id,
+                    "name": str(loan),
+                    "principal": str(money(loan.principal)),
+                    "annual_interest_rate": str(loan.annual_interest_rate),
+                    "start_date": loan.start_date.isoformat(),
+                    "duration_months": loan.duration_months,
+                    "emi": str(loan.effective_emi),
+                    "computed_emi": str(loan.computed_emi),
+                    "emi_edited": loan.emi is not None
+                    and money(loan.emi) != loan.computed_emi,
+                    "initial_paid": str(money(loan.initial_paid)),
+                    # EMIs fallen due from the first EMI date (= start_date).
+                    "emis_due": loan.emis_due,
+                    "total_payable": str(loan.total_payable),
+                    "amount_paid": str(loan.amount_paid),
+                    "outstanding": str(loan.outstanding),
+                }
+            )
+            liabilities_total += loan.outstanding
+        liabilities_total = money(liabilities_total)
+
+        return Response(
+            {
+                "assets": {
+                    "depreciating": depreciating,
+                    "non_depreciating": non_depreciating,
+                    "stock": stock_rows,
+                    "profit": {
+                        "revenue": str(money(revenue)),
+                        "direct_cost": str(money(direct)),
+                        "overhead": str(money(overhead)),
+                        "net": str(profit),
+                    },
+                    "fixed_total": str(money(dep_total + non_dep_total)),
+                    "stock_total": str(money(stock_total)),
+                    "total": str(assets_total),
+                },
+                "liabilities": {"loans": loans, "total": str(liabilities_total)},
+                "net": str(money(assets_total - liabilities_total)),
+            }
+        )
 
 
 

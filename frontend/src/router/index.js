@@ -82,6 +82,21 @@ const routes = [
     meta: { title: 'Overheads' },
   },
   {
+    // Asset & Loan master (user request): fixed assets (depreciating /
+    // non-depreciating) and the loans behind the Liabilities figure.
+    path: '/masters/assets',
+    name: 'assets',
+    component: () => import('@/views/AssetsView.vue'),
+    meta: { title: 'Asset & Loan Master' },
+  },
+  {
+    // Balance sheet behind the Home tiles (user request).
+    path: '/networth',
+    name: 'net-worth',
+    component: () => import('@/views/NetWorthView.vue'),
+    meta: { title: 'Assets & Liabilities' },
+  },
+  {
     path: '/reports',
     name: 'reports',
     component: () => import('@/views/ReportsView.vue'),

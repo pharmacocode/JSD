@@ -33,6 +33,13 @@ const sections = [
     icon: 'mdi-cash-multiple',
     color: 'warning',
   },
+  {
+    to: '/masters/assets',
+    title: 'Asset & Loan Master',
+    subtitle: 'Fixed assets (depreciating / savings) · loans with EMIs',
+    icon: 'mdi-car-cash',
+    color: 'info',
+  },
 ]
 </script>
 
