@@ -178,6 +178,66 @@ def _pending_amount_map(clients):
     return out
 
 
+def _payable_amount_map(vendors):
+    """
+    What we owe every vendor, from TWO grouped queries instead of 2 PER VENDOR.
+
+    Identical arithmetic to `Vendor.amount_owed` (the number the Vendors screen
+    shows): without a marker the payable is purchases − payments over all time;
+    with a marker it is the user's figure as of the marked date plus every
+    purchase/payment dated strictly after it. Rows are grouped per
+    (vendor, date) rather than filtered per vendor, because every vendor has its
+    own cutoff date.
+
+    Returns {vendor_id: Decimal} — `money()`-rounded like the property.
+    """
+    from collections import defaultdict
+
+    ids = [v.id for v in vendors if v.id]
+    if not ids:
+        return {}
+    markers = {v.id: (v.payable_as_of_date, v.payable_as_of_amount) for v in vendors}
+
+    purchased_total = defaultdict(lambda: Decimal("0"))
+    purchased_after = defaultdict(lambda: Decimal("0"))
+    for vid, arrived, value in (
+        MaterialBatch.objects.filter(is_deleted=False, material__vendor_id__in=ids)
+        .values("material__vendor_id", "arrival_date")
+        .annotate(s=Sum(F("quantity_received") * F("price_per_unit")))
+        .values_list("material__vendor_id", "arrival_date", "s")
+    ):
+        value = value or Decimal("0")
+        purchased_total[vid] += value
+        marker_date, _ = markers[vid]
+        if marker_date is not None and arrived > marker_date:
+            purchased_after[vid] += value
+
+    paid_total = defaultdict(lambda: Decimal("0"))
+    paid_after = defaultdict(lambda: Decimal("0"))
+    for vid, paid_on, value in (
+        VendorPayment.objects.filter(is_deleted=False, vendor_id__in=ids)
+        .values("vendor_id", "date")
+        .annotate(s=Sum("amount"))
+        .values_list("vendor_id", "date", "s")
+    ):
+        value = value or Decimal("0")
+        paid_total[vid] += value
+        marker_date, _ = markers[vid]
+        if marker_date is not None and paid_on > marker_date:
+            paid_after[vid] += value
+
+    out = {}
+    for v in vendors:
+        marker_date, marker_amount = markers[v.id]
+        if marker_date is None:
+            out[v.id] = money(purchased_total[v.id] - paid_total[v.id])
+        else:
+            out[v.id] = money(
+                marker_amount + purchased_after[v.id] - paid_after[v.id]
+            )
+    return out
+
+
 class ClientViewSet(viewsets.ModelViewSet):
     queryset = Client.objects.all().prefetch_related("sku_prices__sku")
     serializer_class = ClientSerializer
@@ -2009,10 +2069,15 @@ class DashboardView(APIView):
 
         pending_per_client = []
         pending_total = Decimal("0")
-        for c in Client.objects.all().order_by("name"):
+        # ONE ledger query for every client (this loop used to run
+        # `Client.pending_amount` per client — 120+ round trips on Supabase for
+        # a month's dashboard).
+        pending_clients = list(Client.objects.all().order_by("name"))
+        pending_map = _pending_amount_map(pending_clients)
+        for c in pending_clients:
             # The live, marker-aware figure — the same number the Clients
             # screen shows, so the two can never disagree.
-            amount = c.pending_amount
+            amount = Decimal(pending_map[c.id])
             pending_per_client.append(
                 {"client_id": c.id, "client": c.name, "amount": str(amount)}
             )
@@ -2020,8 +2085,10 @@ class DashboardView(APIView):
 
         vendor_payable_per_vendor = []
         vendor_payable_total = Decimal("0")
-        for v in Vendor.objects.all().order_by("name"):
-            amount = v.amount_owed
+        payable_vendors = list(Vendor.objects.all().order_by("name"))
+        payable_map = _payable_amount_map(payable_vendors)
+        for v in payable_vendors:
+            amount = payable_map[v.id]
             vendor_payable_per_vendor.append(
                 {"vendor_id": v.id, "vendor": v.name, "amount": str(amount)}
             )

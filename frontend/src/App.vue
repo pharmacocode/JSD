@@ -36,8 +36,8 @@ const cachedViews = [
 ]
 
 const isRoot = computed(() => route.path === '/')
-// Screens the user asked to be plain — no header, no drawer, no bottom nav, so
-// /statusupdate in particular offers no way back to Home (user request).
+// Screens the user asked to be plain — no header, no drawer, no bottom nav.
+// (`meta.bare` is still honoured so a bare screen can be added back in one line.)
 const isBare = computed(() => !!route.meta.bare)
 const snack = computed(() => ui.toast)
 const renderError = ref(null)
@@ -45,9 +45,8 @@ function reloadApp() {
   window.location.reload()
 }
 
-// A view that throws during render used to leave a blank page — invisible on
-// meta.bare routes such as /statusupdate, which hide the app bar, drawer and
-// bottom nav. Surface it instead, with a way back.
+// A view that throws during render used to leave a blank page. Surface it
+// instead, with a way back.
 onErrorCaptured((err, instance, info) => {
   renderError.value = { message: err?.message || String(err), info }
   // eslint-disable-next-line no-console
@@ -196,8 +195,7 @@ function goHome() {
         />
 
         <!-- A view that threw during render (caught above) leaves an error
-             instead of a blank page — invisible on meta.bare routes such as
-             /statusupdate, which hide the app bar, drawer and bottom nav. -->
+             instead of a blank page. -->
         <v-alert
           v-if="renderError"
           type="error"

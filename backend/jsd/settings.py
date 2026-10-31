@@ -49,6 +49,10 @@ MIDDLEWARE = [
     # can ever see values memoized for another.
     "core.middleware.PerfCacheMiddleware",
     "django.middleware.security.SecurityMiddleware",
+    # Compresses the JSON payloads (the month dashboard alone is ~330 KB, i.e.
+    # several seconds on a phone connection). Place it high so every response
+    # below it is compressed; clients send Accept-Encoding by default.
+    "django.middleware.gzip.GZipMiddleware",
     "whitenoise.middleware.WhiteNoiseMiddleware",
     "corsheaders.middleware.CorsMiddleware",
     "django.contrib.sessions.middleware.SessionMiddleware",

@@ -8,6 +8,10 @@
  * tiles (cases sold / revenue / profit / overhead) drive ONE chart area.
  * The month's inward material arrivals sit at the bottom with editable line
  * items — correcting one recalculates stock, FIFO cost and the payable.
+ *
+ * The order pipeline (Enter Order → Pending Orders → Ready to Deliver) has been
+ * removed from this screen per user request: a delivery is now entered directly
+ * against the client on /delivery/new, which is the only path stock leaves by.
  */
 import { ref, watch, onMounted, onActivated, computed } from 'vue'
 import { useRouter } from 'vue-router'
@@ -17,9 +21,6 @@ import { money, num, monthLong, rangeLong } from '@/utils/format'
 import MonthPicker from '@/components/MonthPicker.vue'
 import ChartCanvas from '@/components/ChartCanvas.vue'
 import EmptyState from '@/components/EmptyState.vue'
-import OrderDialog from '@/components/OrderDialog.vue'
-import OrderLinesDialog from '@/components/OrderLinesDialog.vue'
-import ConfirmDialog from '@/components/ConfirmDialog.vue'
 import ExportDialog from '@/components/ExportDialog.vue'
 import { exportDeliveryRegister } from '@/utils/pdf'
 
@@ -740,40 +741,20 @@ async function deleteItem(item) {
 }
 
 // ---------------------------------------------------------------------------
-// Orders pipeline (user request)
+// Dashboard refresh
 // ---------------------------------------------------------------------------
-// One endpoint feeds both panels: /orders/summary/ returns the pending orders,
-// the Ready to Deliver bucket and the per-material commitment behind it, so the
-// two collapsible panels never disagree about the same stock.
-const pendingOrders = ref([])
-const readyOrders = ref([])
-const commitment = ref([])
-const pendingExpanded = ref(false)
-const readyExpanded = ref(false)
-const orderDialog = ref(false)
-const editingOrder = ref(null) // null = new order, otherwise the order to edit
-
-const pendingCount = computed(() => pendingOrders.value.length)
-const readyCount = computed(() => readyOrders.value.length)
-
-async function loadOrders() {
-  try {
-    const data = await api.get('/orders/summary/')
-    pendingOrders.value = data.pending || []
-    readyOrders.value = data.ready || []
-    commitment.value = data.commitment || []
-  } catch (e) {
-    error.value = e.message
-  }
-}
-
-// The order panels refresh with the dashboard: commitment, the stock tiles and
-// the two panels then always describe the same state of the warehouse.
+// The order pipeline (Enter Order / Pending / Ready to Deliver) used to be read
+// here as well, because it committed stock and the tiles show what is free.
+// Deliveries are now keyed directly against the client (user request), so there
+// is no commitment to re-read: the dashboard and the net-worth tiles suffice.
 const _load = load
 async function loadAll() {
+  // Both requests in one round of parallel work: they are independent, and on
+  // a slow link waiting for the (larger) dashboard before even asking for the
+  // three small tiles doubled the perceived load time.
+  const networthStart = loadNetworth() // not awaited — the tiles paint whenever it lands
   await _load()
-  await loadOrders()
-  loadNetworth() // not awaited — the tiles paint whenever it lands
+  await networthStart
 }
 
 // ---------------------------------------------------------------------------
@@ -815,194 +796,6 @@ const networthTiles = computed(() => {
   ]
 })
 
-function openOrder(order) {
-  editingOrder.value = order
-  orderDialog.value = true
-}
-
-// ---------------------------------------------------------------------------
-// Moving part of an order, and deleting one (user request)
-// ---------------------------------------------------------------------------
-// Both panels drive the same pair of dialogs. `moveMode` is the direction:
-// 'ready' sends cases Pending -> Ready to Deliver (`complete`), 'pending' sends
-// them back (`reopen`). The dialog collects the selection; the split itself is
-// the server's job, so a partial move comes back as two orders.
-const moveOrder = ref(null)
-const moveMode = ref('ready')
-const moveOpen = ref(false)
-const moveBusy = ref(false)
-const moveError = ref('')
-const moveShortfall = ref(null) // set after a 409: offer "move anyway"
-
-const deleteOrder = ref(null)
-const deleteOpen = ref(false)
-const deleteBusy = ref(false)
-const deleteError = ref('')
-
-/** Lines that can still move: anything not already delivered. */
-function movableLines(order) {
-  return (order?.items || [])
-    .filter((i) => !i.delivery)
-    .map((i) => ({
-      id: i.id,
-      label: i.sku_description,
-      detail: `${num(i.qty_cases)} cases at ${money(i.selling_price_per_case)} each`,
-      qty: Number(i.qty_cases),
-      price: Number(i.selling_price_per_case),
-    }))
-}
-
-const moveLines = computed(() => movableLines(moveOrder.value))
-const moveToReady = computed(() => moveMode.value === 'ready')
-const moveTitle = computed(() =>
-  moveToReady.value ? 'Move to Ready to Deliver' : 'Move back to Pending'
-)
-const moveSubtitle = computed(() =>
-  moveOrder.value
-    ? `#${moveOrder.value.id} — ${moveOrder.value.client_name}: pick how much of each line crosses.`
-    : ''
-)
-const moveConfirmLabel = computed(() =>
-  moveShortfall.value
-    ? 'Move anyway'
-    : moveToReady.value
-      ? 'Move to Ready to Deliver'
-      : 'Move to Pending'
-)
-
-function openMove(order, mode) {
-  moveOrder.value = order
-  moveMode.value = mode
-  moveError.value = ''
-  moveShortfall.value = null
-  moveOpen.value = true
-}
-
-async function doMove(selection) {
-  const order = moveOrder.value
-  if (!order || moveBusy.value) return
-  moveBusy.value = true
-  moveError.value = ''
-  try {
-    const result = await api.post(
-      `/orders/${order.id}/${moveToReady.value ? 'complete' : 'reopen'}/`,
-      { items: selection, force: Boolean(moveShortfall.value) }
-    )
-    moveOpen.value = false
-    await loadAll()
-    const where = moveToReady.value ? 'Ready to Deliver' : 'Pending'
-    ui.notify(
-      result?.split
-        ? `Order #${order.id} split — #${result.split.id} moved to ${where}`
-        : `Order #${order.id} moved to ${where}`
-    )
-  } catch (e) {
-    if (e.data?.shortages?.length) {
-      // Same behaviour as the other stock actions: show the gap, then let the
-      // user choose to move anyway.
-      moveShortfall.value = e.data.shortages
-      moveError.value =
-        'Not enough free stock: ' +
-        e.data.shortages
-          .map(
-            (g) =>
-              `${g.material}: need ${num(g.required)}, only ${num(g.available)} free`
-          )
-          .join('; ')
-    } else {
-      moveError.value = e.message || 'Could not move these cases'
-    }
-  } finally {
-    moveBusy.value = false
-  }
-}
-
-function openDelete(order) {
-  deleteOrder.value = order
-  deleteError.value = ''
-  deleteOpen.value = true
-}
-
-const deleteText = computed(() => {
-  const o = deleteOrder.value
-  if (!o) return ''
-  const shipped = Number(o.total_qty) - Number(o.undelivered_qty ?? o.total_qty)
-  return shipped > 0
-    ? `#${o.id} — ${o.client_name} has already sent ${num(shipped)} case(s), so it cannot be deleted. Open it to see what is left.`
-    : `#${o.id} — ${o.client_name} (${num(o.total_qty)} cases). It is removed from the pipeline and its stock goes back to Stock in Hand.`
-})
-
-async function doDelete() {
-  const order = deleteOrder.value
-  if (!order || deleteBusy.value) return
-  deleteBusy.value = true
-  deleteError.value = ''
-  try {
-    await api.del(`/orders/${order.id}/`)
-    deleteOpen.value = false
-    await loadAll()
-    ui.notify(`Order #${order.id} deleted — stock released`)
-  } catch (e) {
-    deleteError.value = e.message || 'Could not delete this order'
-  } finally {
-    deleteBusy.value = false
-  }
-}
-
-function onOrderSaved() {
-  // Commitment changed, so the dashboard's stock tiles (which show available)
-  // and both order panels have to be re-read.
-  loadAll()
-}
-
-function dateShort(iso) {
-  if (!iso) return ''
-  const d = new Date(`${iso}T00:00:00`)
-  return d.toLocaleDateString(undefined, { day: 'numeric', month: 'short' })
-}
-
-/** True when some of an order's cases have already left the warehouse. */
-function partDelivered(order) {
-  return Number(order.undelivered_qty ?? order.total_qty) < Number(order.total_qty)
-}
-
-/** "split from #12" — the order this one was carved out of (user request). */
-const splitFrom = (order) =>
-  order?.source_order ? ` · split from #${order.source_order}` : ''
-
-/** A pending order has nothing delivered, so its total is what it holds. */
-function pendingSubtitle(order) {
-  return `${num(order.total_qty)} cases · ${dateShort(order.order_date)}${splitFrom(order)}`
-}
-
-/**
- * A Ready to Deliver order can be partly delivered, so it leads with the cases
- * still owed rather than the original total — the same figure the deliver
- * screen collects against (user request: track what is left).
- */
-function readySubtitle(order) {
-  const owed = Number(order.undelivered_qty ?? order.total_qty)
-  const total = Number(order.total_qty)
-  const figure = owed < total
-    ? `${num(owed)} of ${num(total)} cases still to deliver`
-    : `${num(total)} cases`
-  return `${figure} · ${dateShort(order.order_date)}${splitFrom(order)}`
-}
-
-onMounted(loadAll)
-onActivated(loadAll)
-
-// Enter Order / edit order modal. One dialog for both, as the lines are
-// captured identically — editing simply starts from the saved order.
-const closeOrderDialog = () => {
-  orderDialog.value = false
-  editingOrder.value = null
-}
-
-const onOrderClosed = () => {
-  closeOrderDialog()
-  onOrderSaved()
-}
 </script>
 
 <template>
@@ -1054,17 +847,6 @@ const onOrderClosed = () => {
         @click="router.push('/stock/arrived')"
       >
         Enter Arrived Stock
-      </v-btn>
-      <v-btn
-        color="info"
-        size="large"
-        variant="tonal"
-        prepend-icon="mdi-clipboard-text-outline"
-        class="flex-grow-1"
-        style="min-width: 190px"
-        @click="orderDialog = true"
-      >
-        Enter Order
       </v-btn>
     </div>
 
@@ -1227,255 +1009,6 @@ const onOrderClosed = () => {
         </div>
       </v-expand-transition>
     </v-card>
-
-    <!-- Pending orders: orders logged at Enter Order that have not yet been
-         moved to Ready to Deliver. ALWAYS visible - an empty bucket shows its
-         own "No pending orders." state instead of the panel disappearing
-         (user request), so the pipeline's two stages are permanent landmarks
-         on Home. Collapsible like Stock in Hand; tapping a row opens the
-         order for editing. -->
-    <v-card class="mb-4">
-      <v-card-item class="py-3" @click="pendingExpanded = !pendingExpanded">
-        <div class="d-flex align-center ga-3">
-          <v-chip
-            :color="pendingCount ? 'warning' : 'grey'"
-            variant="flat"
-            size="small"
-            class="font-weight-bold"
-          >
-            {{ pendingCount }}
-          </v-chip>
-          <span class="text-uppercase font-weight-bold text-medium-emphasis">
-            Pending Orders
-          </span>
-          <v-spacer />
-          <v-btn
-            variant="text"
-            size="small"
-            color="primary"
-            @click.stop="router.push('/statusupdate')"
-          >
-            Open status update
-          </v-btn>
-          <v-icon>{{ pendingExpanded ? "mdi-chevron-up" : "mdi-chevron-down" }}</v-icon>
-        </div>
-      </v-card-item>
-      <v-expand-transition>
-        <div v-show="pendingExpanded">
-          <v-card-text class="pt-0">
-            <EmptyState
-              v-if="!pendingOrders.length"
-              icon="mdi-clipboard-text-outline"
-              text="No pending orders."
-              action="Enter an order"
-              @action="orderDialog = true"
-            />
-            <v-list v-if="pendingOrders.length" density="compact">
-              <v-list-item
-                v-for="o in pendingOrders"
-                :key="o.id"
-                :title="`#${o.id} — ${o.client_name}`"
-                :subtitle="pendingSubtitle(o)"
-                @click="openOrder(o)"
-              >
-                <template #append>
-                  <!-- Row tap still opens the editor; these three buttons are
-                       the explicit actions (user request). The move dialog
-                       opens with every line pre-ticked, so moving the whole
-                       order is still a confirm — it is only there to let part
-                       of the order cross. -->
-                  <v-btn
-                    icon="mdi-truck-fast-outline"
-                    size="small"
-                    variant="text"
-                    color="primary"
-                    title="Move to Ready to Deliver"
-                    @click.stop="openMove(o, 'ready')"
-                  />
-                  <v-btn
-                    icon="mdi-pencil-outline"
-                    size="small"
-                    variant="text"
-                    title="Edit order"
-                    @click.stop="openOrder(o)"
-                  />
-                  <v-btn
-                    icon="mdi-delete-outline"
-                    size="small"
-                    variant="text"
-                    color="error"
-                    title="Delete this pending order"
-                    @click.stop="openDelete(o)"
-                  />
-                </template>
-              </v-list-item>
-            </v-list>
-          </v-card-text>
-        </div>
-      </v-expand-transition>
-    </v-card>
-
-    <!-- Ready to Deliver: orders whose material has left Stock in Hand. Same
-         collapsible pattern as the two panels above, and equally permanent -
-         empty it says so itself (user request). The commitment breakdown under
-         it says which materials are spoken for and whether the promise can
-         still be met from what is free. -->
-    <v-card class="mb-4">
-      <v-card-item class="py-3" @click="readyExpanded = !readyExpanded">
-        <div class="d-flex align-center ga-3">
-          <v-chip
-            :color="readyCount ? 'success' : 'grey'"
-            variant="flat"
-            size="small"
-            class="font-weight-bold"
-          >
-            {{ readyCount }}
-          </v-chip>
-          <span class="text-uppercase font-weight-bold text-medium-emphasis">
-            Ready to Deliver
-          </span>
-          <v-spacer />
-          <v-btn
-            variant="text"
-            size="small"
-            color="primary"
-            @click.stop="router.push('/delivery/new?from=ready')"
-          >
-            Deliver these
-          </v-btn>
-          <v-icon>{{ readyExpanded ? "mdi-chevron-up" : "mdi-chevron-down" }}</v-icon>
-        </div>
-      </v-card-item>
-      <v-expand-transition>
-        <div v-show="readyExpanded">
-          <v-card-text class="pt-0">
-            <v-alert
-              v-if="commitment.some((c) => c.short)"
-              type="warning"
-              variant="tonal"
-              density="compact"
-              class="mb-3"
-            >
-              Some committed material is no longer free — see the breakdown below.
-            </v-alert>
-            <EmptyState
-              v-if="!readyOrders.length"
-              icon="mdi-truck-outline"
-              text="Nothing ready to deliver."
-              action="Open status update"
-              @action="router.push('/statusupdate')"
-            />
-            <v-list v-if="readyOrders.length" density="compact">
-              <v-list-item
-                v-for="o in readyOrders"
-                :key="o.id"
-                :title="`#${o.id} — ${o.client_name}`"
-                :subtitle="readySubtitle(o)"
-                @click="openOrder(o)"
-              >
-                <template #append>
-                  <v-chip
-                    v-if="partDelivered(o)"
-                    size="small"
-                    color="info"
-                    variant="tonal"
-                    class="mr-2"
-                  >
-                    part delivered
-                  </v-chip>
-                  <v-btn
-                    icon="mdi-undo"
-                    size="small"
-                    variant="text"
-                    color="warning"
-                    title="Move back to Pending"
-                    @click.stop="openMove(o, 'pending')"
-                  />
-                  <v-btn
-                    icon="mdi-pencil-outline"
-                    size="small"
-                    variant="text"
-                    title="Edit order"
-                    @click.stop="openOrder(o)"
-                  />
-                  <v-btn
-                    v-if="!partDelivered(o)"
-                    icon="mdi-delete-outline"
-                    size="small"
-                    variant="text"
-                    color="error"
-                    title="Delete this order"
-                    @click.stop="openDelete(o)"
-                  />
-                </template>
-              </v-list-item>
-            </v-list>
-            <div v-if="commitment.length" class="text-uppercase text-medium-emphasis mt-3 mb-1">
-              Material committed
-            </div>
-            <v-table v-if="commitment.length" density="compact">
-              <thead>
-                <tr>
-                  <th>Material</th>
-                  <th class="text-right">Committed</th>
-                  <th class="text-right">Available</th>
-                </tr>
-              </thead>
-              <tbody>
-                <tr v-for="c in commitment" :key="c.material_id">
-                  <td>{{ c.material }}</td>
-                  <td class="text-right">{{ num(c.committed) }} {{ c.unit }}</td>
-                  <td
-                    class="text-right font-weight-bold"
-                    :class="c.short ? 'text-error' : 'text-success'"
-                  >
-                    {{ num(c.available) }}
-                  </td>
-                </tr>
-              </tbody>
-            </v-table>
-          </v-card-text>
-        </div>
-      </v-expand-transition>
-    </v-card>
-
-    <!-- Enter Order / edit order. Both use the same dialog — editing simply
-         starts from the saved order's lines. -->
-    <OrderDialog
-      v-model="orderDialog"
-      :order="editingOrder"
-      @closed="onOrderClosed"
-    />
-
-    <!-- Partial move, both directions (user request). The selection is sent to
-         the same complete/reopen endpoints the status board uses; only the
-         presence of `items` makes it a split. -->
-    <OrderLinesDialog
-      v-model="moveOpen"
-      :title="moveTitle"
-      :subtitle="moveSubtitle"
-      :confirm-label="moveConfirmLabel"
-      :color="moveToReady ? 'primary' : 'warning'"
-      :icon="moveToReady ? 'mdi-truck-fast-outline' : 'mdi-undo'"
-      :lines="moveLines"
-      :busy="moveBusy"
-      :error="moveError"
-      @confirm="doMove"
-    />
-
-    <!-- Deleting an order (user request). Pending and unsent orders go; one
-         that has already shipped part of itself is refused by the server, and
-         that refusal is what this dialog then shows. -->
-    <ConfirmDialog
-      v-model="deleteOpen"
-      title="Delete this order?"
-      :text="deleteText"
-      confirm-label="Delete order"
-      icon="mdi-trash-can-outline"
-      :busy="deleteBusy"
-      :error="deleteError"
-      @confirm="doDelete"
-    />
 
     <!-- Delivery register export (user request): pick a range, preview the
          rows the server returns for it, then download the PDF with revenue

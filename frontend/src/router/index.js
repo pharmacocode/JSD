@@ -108,13 +108,12 @@ const routes = [
     meta: { title: 'Login Attempts' },
   },
   {
-    // Order status board (user request): a deliberately bare screen with no
-    // app bar, drawer or bottom nav, so there is no UI on it that leads back
-    // to Home. `meta.bare` is what App.vue keys off to hide all of that.
+    // The old order status board is retired with the order pipeline (user
+    // request: deliveries are keyed directly against the client). The path is
+    // kept as a redirect so an old bookmark lands on Home instead of a blank
+    // screen, and no view file has to exist for it.
     path: '/statusupdate',
-    name: 'status-update',
-    component: () => import('@/views/StatusUpdateView.vue'),
-    meta: { title: 'Order Status', bare: true },
+    redirect: '/',
   },
 ]
 

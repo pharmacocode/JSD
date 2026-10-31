@@ -87,7 +87,7 @@ Actions is what lets the two `VITE_API_BASE_URL` guards further down run at all 
 the host only ever receives the finished `dist/`. SPA routing comes from
 `frontend/public/_redirects` (`/*  /index.html  200`), which Vite copies into
 `dist/` and Cloudflare Pages honours natively, so deep links such as
-`/statusupdate` return **200** on refresh.
+`/delivery/new` return **200** on refresh.
 
 The Pages project must exist before the first CI deploy (one-time, locally):
 
@@ -184,6 +184,25 @@ screens instant and the API quiet. Nothing here changes the business rules.
   times over. The cache memoises those lookups for the life of a single
   request, and `core/signals.py` drops it whenever stock, costs or config
   change — no response is ever served from a stale cache.
+- **No per-row / per-pair queries** (measured: one month of Home data used to
+  cost **647 sequential DB round trips**; Supabase latency turns that into the
+  25–30 s load the user reported). The remaining work is batched at the source:
+  - `cogs.resolve_requirements` reads **every** SKU→material requirement once per
+    request (`cogs._requirements_by_sku`) and takes a client's custom label from
+    one all-clients index, instead of 2 queries per (SKU, client) pair — that
+    pair count (≈120/month) was ~240 round trips alone. It also stops
+    `resolve_requirements` from querying `sku.requirements` per delivery row.
+  - `cogs.legacy_demand_by_material` sums cases **per (SKU, client)** in SQL
+    (`Sum`/`Max`) rather than walking every delivery ever recorded — twice per
+    dashboard load, and growing every month.
+  - The dashboard's pending-per-client and payable-per-vendor tiles go through
+    `views._pending_amount_map` / `views._payable_amount_map` (one grouped query
+    each) instead of calling a model property per row.
+  - Net effect on the same data: dashboard **395 → 34** queries, deliveries list
+    **247 → 9**, net worth **252 → 13**; dashboard CPU **2.1 s → 0.3 s**.
+- **GZip on API responses** (`django.middleware.gzip.GZipMiddleware`): the month
+  dashboard serialises to ~330 KB (a bar-chart row per client) — 14 KB
+  compressed. No payload shape changed.
 - **Database indexes** (`core/migrations/0007_performance_indexes.py`):
   additive indexes on the columns the month-scoped dashboards filter and join
   on (dates, foreign keys, `is_deleted`), so those queries stop scanning whole
@@ -209,6 +228,9 @@ screens instant and the API quiet. Nothing here changes the business rules.
   deliberately excluded so they always mount fresh and clean.
 - **Per-month dashboard cache** (`src/stores/ui.js`): the Home payload is kept
   per month, so month switching and returning from another screen are instant.
+- **Home fetches in parallel** (`HomeView.loadAll`): the net-worth tiles are
+  requested alongside the dashboard instead of after it — the two endpoints are
+  independent, so waiting for the larger one first only added latency.
 
 ## Key business rules (implemented as specified)
 
@@ -231,32 +253,41 @@ screens instant and the API quiet. Nothing here changes the business rules.
   live sum of `ClientLedgerEntry.amount` (positive = delivery, negative =
   payment), plus the optional *balance marker* described next. No running total
   is ever stored.
-- **A delivery can only come from the order pipeline (user request):** Enter
-  Order -> Ready to Deliver -> Add Delivery is the single sanctioned path. The
-  Add Delivery screen lists only the Ready-to-Deliver bucket (one tap opens a
-  confirmation showing the remaining lines, with an editable delivery date, a
-  note and the optional payment), and `POST /api/orders/<id>/deliver/` refuses
-  an order that is still PENDING or already fully delivered, so nothing can be
-  sent out that was never ordered. Deliverability is judged on the LINES, not
-  the stored status: a multi-line order whose delivery was deleted stays in the
-  bucket for the lines still to go out. `StockDelivery` admin add is disabled
-  for the same reason. The whole order goes out in ONE atomic request — one
-  `StockDelivery` per undelivered line, or only the cases named in the
-  request's `items` — and the response returns `deliveries[]`
-  (each with `selling_price_per_case` / `amount`), `total_cases`,
-  `total_amount`, `client_pending_amount` and `payment`.
+- **Deliveries are entered directly against the client (user request — order
+  pipeline retired from the UI):** Home now carries **Add Delivery** and **Enter
+  Arrived Stock** only. `/delivery/new` is a single screen — pick the client, tap
+  any of *that client's* priced SKUs (their own cost of goods per case), set
+  qty / price per line, date, note and the optional payment, watch the live COGS
+  + shortfall preview, then submit. The whole run goes out in ONE atomic request
+  (`POST /api/deliveries/bulk/`), one `StockDelivery` per line. There is no Enter
+  Order, no Pending Orders panel, no Ready-to-Deliver panel and no order status
+  board any more: `/statusupdate` just redirects to Home. The `OrderDialog`,
+  `OrderLinesDialog`, `StatusUpdateView` and the orders Pinia store were removed
+  with it.
+- **The order API is still there (kept, not shown):** `ClientOrder` /
+  `OrderItem`, `POST /api/orders/<id>/complete|reopen|deliver/`, the split
+  endpoints and `cogs.committed_map` are untouched, so existing history keeps
+  reporting correctly and the pipeline can be re-exposed by adding one route
+  back. Two consequences worth knowing: (a) stock committed by *legacy*
+  Ready-to-Deliver orders still shows as "N on orders" on the Stock in Hand tile
+  and is still deducted from the tile's `available` figure, and (b) a direct
+  delivery is checked against **physical** stock (`cogs.stock_map`), so such a
+  legacy commitment never blocks a delivery — see the next bullets for the
+  detail of the pipeline endpoints themselves.
 
-- **Orders can be edited or deleted until their stock leaves (user request):**
-  the pipeline screens carry **Edit** and **Delete** on every row that is still
-  changeable, so a mistake can be taken back: a PENDING order — and a Ready-to-
-  Deliver one that has sent nothing — can be deleted. Deleting soft-deletes it
+- **Orders can be edited or deleted until their stock leaves (user request):** a
+  PENDING order — and a Ready-to-Deliver one that has sent nothing — can be
+  deleted. (The pipeline screens that exposed this are gone; the endpoints
+  below still behave exactly as described, so history stays correct.) Deleting
+  soft-deletes it
   (`is_deleted`, spec 3.7) via `DELETE /api/orders/<id>/`, so the row and its
   lines survive in the audit trail while the material it was reserving
   returns to Stock in Hand (commitment is derived from the lines, never
   stored). The judgement is on the LINES again, not the stored status: as soon
   as one line has a delivery behind it, both are refused with a `400` (delete
   those deliveries from the deliveries list first) — that stock has
-  physically left. Editing reuses the Enter-Order dialog. The update replaces
+  physically left. Editing used the Enter-Order dialog (same endpoint today:
+  `PUT /api/orders/<id>/`). The update replaces
   the whole line set (`PUT /api/orders/<id>/`), and PATCH is refused for that
   same reason: a partial payload could otherwise silently drop lines.
 - **Part of an order can move through the pipeline (user request — backend
@@ -265,7 +296,8 @@ screens instant and the API quiet. Nothing here changes the business rules.
   quantity may be anything from 1 up to what that line holds. Only those cases
   change bucket and the caller gets **both sides** back — the source order
   that stayed (`order`), a new order holding exactly what moved (`split`) and a
-  `partial: true` flag — the UI shows the new one as *split from #N*. A line that
+  `partial: true` flag — the retired UI showed the new one as *split from #N*. A
+  line that
   moves whole is **reassigned** to the split order and keeps its identity (its
   id, edit history and, where it applied, its delivery link); only a line sent
   in part is split into a new line — so nothing is duplicated and no case is
@@ -275,9 +307,9 @@ screens instant and the API quiet. Nothing here changes the business rules.
   unknown/foreign line, a line already delivered, the same line twice or a
   quantity larger than the line is rejected with a `400` before a single row is
   written.
-- **Part of an order can be delivered (user request):** the Add-Delivery
-  confirmation lists the remaining lines ticked at full quantity, and both the
-  tick and the cases can be trimmed — send 8 of 10 cases now and keep the
+- **Part of an order can be delivered (user request):** the retired Add-Delivery
+  confirmation used to list the remaining lines ticked at full quantity, and both
+  the tick and the cases could be trimmed — send 8 of 10 cases now and keep the
   client's order standing for the other two. `POST /api/orders/<id>/deliver/`
   takes the same `items: [{item, qty_cases}]`: a whole line goes through the
   normal delivery path and keeps its identity, a part line is split so the
@@ -286,10 +318,13 @@ screens instant and the API quiet. Nothing here changes the business rules.
   shortfall check) — one `StockDelivery` per line, all or nothing, a shortfall
   still rolls the request back with a `409` and `shortages[]`. The response
   adds `partial` (true while cases are still owed) and every order carries
-  `undelivered_qty` / `undelivered_amount`, so a part-delivered order **stays**
-  in the Ready-to-Deliver bucket with the leftover cases and value on it (chipped
+  `undelivered_qty` / `undelivered_amount`, so a part-delivered order **stayed**
+  in the (now retired) Ready-to-Deliver bucket with the leftover cases and value
+  on it (chipped
   *part delivered*), and the client's pending amount only moves by what actually
-  went out. Sending a whole order still sends no `items` at all.
+  went out. Sending a whole order still sends no `items` at all, and the endpoint
+  still refuses a PENDING order (and an already fully delivered one) with a
+  `400`, so nothing that was never ordered can slip out through it.
 
 - **Payment noted at delivery entry (user request):** the Add-Delivery screen
   carries an optional **Payment** section — a switch (off by default), the amount

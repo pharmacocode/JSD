@@ -40,6 +40,7 @@ from .models import (
     Material,
     MaterialBatch,
     SKU,
+    SKUMaterialRequirement,
     SKUPrintCost,
     StockDelivery,
     money,
@@ -92,9 +93,40 @@ def months_between(start, end) -> list:
     return out
 
 
-def client_label_material(client: Client, category: str = "Label"):
-    """Client-owned label material (memoized — resolve_requirements reads it per SKU)."""
+def _client_labels_by_client() -> dict:
+    """
+    EVERY client-owned label material in ONE query, keyed by client id.
+
+    `resolve_requirements` needs a client's custom label for each (sku, client)
+    pair it resolves. On the dashboard a month touches ~120 clients, so the old
+    per-client `.first()` lookup was 120 round trips (Supabase) for a table with
+    a handful of rows. First row per client wins, exactly like
+    `.order_by("id").first()`.
+    """
     from .models import Material
+
+    def compute():
+        index = {}
+        for mat in Material.objects.filter(
+            is_client_specific=True, category="Label"
+        ).order_by("id"):
+            index.setdefault(mat.client_id, mat)
+        return index
+
+    return perfcache.cached(("client_labels_by_client",), compute)
+
+
+def client_label_material(client: Client, category: str = "Label"):
+    """
+    Client-owned label material (memoized — resolve_requirements reads it per SKU).
+
+    The default Label lookup is served from the all-clients index above; any
+    other category (not used by the costing code) keeps the per-client query.
+    """
+    from .models import Material
+
+    if category == "Label":
+        return _client_labels_by_client().get(client.id)
 
     cached_value = perfcache.cached(
         ("client_label", client.id, category),
@@ -105,6 +137,32 @@ def client_label_material(client: Client, category: str = "Label"):
         .first(),
     )
     return cached_value
+
+
+def _requirements_by_sku() -> dict:
+    """
+    EVERY SKU's material requirements in ONE query, keyed by sku id.
+
+    This is the fix for the slow dashboard / delivery list: requirements were
+    read per (sku, client) pair, so one month of deliveries cost 2 queries PER
+    PAIR (~240 round trips at 120 pairs). The through-table is tiny, so reading
+    it once per request beats hundreds of keyed lookups.
+
+    Ordering matches SKUMaterialRequirement.Meta ("sku__description",
+    "material__name") scoped to a single SKU, so a SKU's resolved requirement
+    list comes out in exactly the order it always did.
+    """
+
+    def compute():
+        index = {}
+        for req in (
+            SKUMaterialRequirement.objects.select_related("material")
+            .order_by("sku_id", "material__name", "id")
+        ):
+            index.setdefault(req.sku_id, []).append((req.material, req.qty_per_case))
+        return {sku_id: tuple(rows) for sku_id, rows in index.items()}
+
+    return perfcache.cached(("requirements_by_sku",), compute)
 
 
 def stock_map() -> dict:
@@ -273,28 +331,34 @@ def resolve_requirements(sku, client: Client):
       substituted with this client's own label material when one exists
       (custom labels are per-client stock — spec 3.3 / 4.2 step 4).
 
-    Memoized per (sku, client) for the request: the delivery list resolves
-    the same pair for every row, and this used to cost 2 queries PER ROW.
+    Memoized per (sku, client) for the request, and the underlying rows come
+    from `_requirements_by_sku()` — one query for the whole request instead of
+    2 queries per (sku, client) pair (that pair count is what made a month of
+    deliveries cost ~240 round trips).
     Returns a fresh list — callers may mutate it.
     """
-    from .models import Material
 
     def compute():
         resolved = []
-        for req in sku.requirements.select_related("material"):
-            mat = req.material
+        client_label = None
+        client_label_loaded = False
+        for mat, per_case in _requirements_by_sku().get(sku.id, ()):
             if mat.is_client_specific:
                 if mat.client_id == client.id:
-                    resolved.append((mat, req.qty_per_case))
+                    resolved.append((mat, per_case))
                 # Client-specific material for a DIFFERENT client never applies
                 # to this delivery — skip rather than consume the wrong labels.
                 continue
             if mat.category == "Label":
-                client_label = client_label_material(client)
+                # Only asked for when the SKU actually has a generic label,
+                # exactly like before (the lookup is now a dict hit).
+                if not client_label_loaded:
+                    client_label = client_label_material(client)
+                    client_label_loaded = True
                 if client_label:
-                    resolved.append((client_label, req.qty_per_case))
+                    resolved.append((client_label, per_case))
                     continue
-            resolved.append((mat, req.qty_per_case))
+            resolved.append((mat, per_case))
         return tuple(resolved)
 
     return list(perfcache.cached(("requirements", sku.id, client.id), compute))
@@ -475,8 +539,9 @@ def legacy_demand_by_material(year=None, month=None):
     Shared read-only helper (see legacy_booked_consumption): the backfill
     command and the dashboard badge both read through here. Writes nothing.
 
-    Memoized per (year, month) for the request; the call walks every live
-    delivery, so the dashboard must not pay for it twice. Returns fresh dicts.
+    Memoized per (year, month) for the request; the call is one grouped query
+    per (sku, client) pair, not a walk over every delivery row, so the
+    dashboard cost stays flat as history grows. Returns fresh dicts.
     """
     demand, last_event = perfcache.cached(
         ("legacy_demand", year, month),
@@ -486,43 +551,60 @@ def legacy_demand_by_material(year=None, month=None):
 
 
 def _legacy_demand_by_material(year=None, month=None):
-    from .models import StockAdjustment, StockDelivery
+    from django.db.models import Max, Sum
+
+    from .models import StockAdjustment
 
     demand = {}
     last_event = {}
 
-    deliveries = (
-        StockDelivery.objects.filter(is_deleted=False)
-        .select_related("sku", "client")
-        .prefetch_related("sku__requirements__material")
-        .order_by("date", "id")
+    # ONE grouped row per (sku, client) instead of one row PER DELIVERY: the
+    # resolved requirement — and therefore the quantity per case — depends only
+    # on that pair, so the database can sum the cases. This is what keeps the
+    # dashboard flat as history grows; the old version read every delivery ever
+    # recorded, and the dashboard paid for that walk TWICE (all-time + month).
+    groups = StockDelivery.objects.filter(is_deleted=False)
+    if year is not None and month is not None:
+        groups = groups.filter(**month_range(year, month))
+    groups = list(
+        groups.values("sku_id", "client_id").annotate(
+            cases=Sum("qty_cases"), last=Max("date")
+        )
     )
+
+    skus = {s.id: s for s in SKU.objects.filter(id__in={g["sku_id"] for g in groups})}
+    clients = {
+        c.id: c for c in Client.objects.filter(id__in={g["client_id"] for g in groups})
+    }
+    for group in groups:
+        sku = skus.get(group["sku_id"])
+        client = clients.get(group["client_id"])
+        cases = group["cases"] or ZERO
+        if sku is None or client is None or cases == ZERO:
+            continue
+        for material, qty_per_case in resolve_requirements(sku, client):
+            demand[material.id] = demand.get(material.id, ZERO) + cases * qty_per_case
+            seen = last_event.get(material.id)
+            if seen is None or group["last"] > seen:
+                last_event[material.id] = group["last"]
+
+    # Round once per material (the per-line rounding this replaced only ever
+    # mattered for quantities below 1e-4 of a case, and rounding per group is
+    # what makes a single grouped row possible).
+    demand = {material_id: round_qty(value) for material_id, value in demand.items()}
+
     adjustments = StockAdjustment.objects.filter(is_deleted=False)
     if year is not None and month is not None:
-        deliveries = deliveries.filter(**month_range(year, month))
         adjustments = adjustments.filter(**month_range(year, month))
 
-    for delivery in deliveries:
-        for material, qty_per_case in resolve_requirements(
-            delivery.sku, delivery.client
-        ):
-            line_demand = round_qty(delivery.qty_cases * qty_per_case)
-            if line_demand == 0:
-                continue
-            demand[material.id] = demand.get(material.id, ZERO) + line_demand
-            last_event[material.id] = delivery.date
-
-    for adjustment in adjustments:
-        if adjustment.quantity >= 0:
+    for material_id, quantity, adjusted_on in adjustments.values_list(
+        "material_id", "quantity", "date"
+    ):
+        if quantity >= 0:
             continue
-        size = abs(adjustment.quantity)
-        demand[adjustment.material_id] = (
-            demand.get(adjustment.material_id, ZERO) + size
-        )
-        if adjustment.date >= (
-            last_event.get(adjustment.material_id) or adjustment.date
-        ):
-            last_event[adjustment.material_id] = adjustment.date
+        demand[material_id] = demand.get(material_id, ZERO) + abs(quantity)
+        if adjusted_on >= (last_event.get(material_id) or adjusted_on):
+            last_event[material_id] = adjusted_on
 
     return demand, last_event
 
