@@ -676,6 +676,16 @@ class MaterialBatchViewSet(viewsets.ModelViewSet):
     """
     Arrived Stock entries (spec 4.3 = creation UI for MaterialBatch).
     Soft delete + edit audit per spec 3.7.
+
+    DELETE GUARD (production incident, Oct 2026): removing an arrival that has
+    already fed deliveries is stock-neutral in the moment — its remaining is 0,
+    so in hand does not move — which makes it look harmless. It is not: the
+    deliveries keep booking those cases against a row the register no longer
+    shows, and re-keying the same arrival afterwards adds its FULL quantity on
+    top. That is how stock was overstated by 1,104 units across three
+    materials. Such a delete is refused with 409 and the row is left alone;
+    correct the arrival instead (edit `quantity_received`, 0 is allowed) or
+    repeat with `?force=1&reason=...`, which is recorded in `edit_history`.
     """
 
     queryset = MaterialBatch.objects.all()
@@ -689,6 +699,67 @@ class MaterialBatchViewSet(viewsets.ModelViewSet):
         if not self.request.query_params.get("include_deleted"):
             qs = qs.filter(is_deleted=False)
         return qs.order_by("arrival_date", "id")
+
+    def destroy(self, request, *args, **kwargs):
+        instance = self.get_object()
+        force = str(request.query_params.get("force", "")).lower() in {
+            "1",
+            "true",
+            "yes",
+        }
+        if force:
+            reason = (request.query_params.get("reason") or "").strip()
+            if not reason:
+                return Response(
+                    {
+                        "detail": (
+                            "A forced delete needs a reason — it is stored in "
+                            "this arrival's audit trail. Repeat with "
+                            "?force=1&reason=<why this row has to go>."
+                        )
+                    },
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            instance.soft_delete(reason=reason)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        consumed = instance.consumed_quantity
+        bookings = cogs.arrival_bookings(instance)
+        if consumed <= 0 and not bookings:
+            # Nothing has been taken out of it (an over-restored row with a
+            # negative "consumed" and no bookings is a ghost worth removing).
+            self.perform_destroy(instance)
+            return Response(status=status.HTTP_204_NO_CONTENT)
+
+        booked = sum((q for _kind, _id, _date, q in bookings), Decimal("0"))
+        drawn = consumed if consumed > 0 else booked
+        sources = len({f"{kind}:{rid}" for kind, rid, _date, _qty in bookings})
+        if sources:
+            drew_from = (
+                f"has gone out to {sources} "
+                f"{'record' if sources == 1 else 'records'} already on file"
+            )
+        else:
+            drew_from = "has already left the shelf, but no delivery on file says so"
+        return Response(
+            {
+                "detail": (
+                    f"Arrival #{instance.pk} has already been drawn on: "
+                    f"{dstr(drawn)} of the {dstr(instance.quantity_received)} "
+                    f"keyed in {drew_from}. Deleting it keeps those cases "
+                    "booked while removing the row they came from, so "
+                    "re-keying this arrival later would double count stock. "
+                    "Correct it instead — edit Received to what actually "
+                    "arrived (0 is allowed and keeps the row in the history) "
+                    "— or repeat the delete with ?force=1&reason=<why>, which "
+                    "is recorded in the audit trail."
+                ),
+                "consumed": str(consumed),
+                "booked": str(booked),
+                "can_force": True,
+            },
+            status=status.HTTP_409_CONFLICT,
+        )
 
     def perform_destroy(self, instance):
         instance.soft_delete()

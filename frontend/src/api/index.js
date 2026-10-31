@@ -74,7 +74,7 @@ export const api = {
   post: (path, body) => request(path, { method: 'POST', body }),
   put: (path, body) => request(path, { method: 'PUT', body }),
   patch: (path, body) => request(path, { method: 'PATCH', body }),
-  del: (path) => request(path, { method: 'DELETE' }),
+  del: (path, params) => request(path, { method: 'DELETE', params }),
 }
 
 /** DRF paginated list -> plain array (handles {results} payloads). */

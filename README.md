@@ -39,7 +39,7 @@ cd backend
 python -m pip install -r requirements.txt
 python manage.py migrate          # seeds Rent/Diesel/Electricity/Labour
 python manage.py runserver        # http://localhost:8000
-python manage.py test core        # 173 tests (FIFO + COGS + ledger + orders + fixes)
+python manage.py test core        # 226 tests (FIFO + COGS + ledger + orders + fixes)
 ```
 
 Without `DATABASE_URL` the backend uses local SQLite (dev/tests). Set it to
@@ -327,6 +327,26 @@ screens instant and the API quiet. Nothing here changes the business rules.
   mandatory reason — positive adds a zero-price batch, negative consumes the
   FIFO queue. The FIFO engine never rewrites what was keyed; a **wrongly keyed
   arrival is corrected on the Home screen** instead (see the next bullet).
+- **A consumed arrival cannot be deleted (production incident, Oct 2026):**
+  deleting an arrival that has already fed deliveries is *stock-neutral in the
+  moment* — nothing is left in it — which made it look harmless, while the
+  deliveries kept booking those cases against a row the register no longer
+  showed. Re-keying the same arrival afterwards (typically backdated to the
+  same date) then put its **full** quantity back on top: 1,104 units overstated
+  across three materials, and `booked - demand` stayed at 0 the whole time, so
+  the per-material audit saw nothing at all. `DELETE /api/batches/<id>/` now
+  answers **409**, naming the consumed quantity and the records that drew on the
+  row, and leaves everything untouched; the Home screen's × pivots to the edit
+  form instead. Correcting the arrival is the supported path:
+  `quantity_received` is editable and **0 is a valid correction** — the row is
+  emptied but kept, so no `consumption_log` pointer is ever orphaned — while
+  negatives are rejected (they would hand stock back through the remaining
+  delta). A genuine removal needs `?force=1&reason=<why>`, and the reason lands
+  in `edit_history`, where it is printed by `python manage.py stock_audit`
+  (`--bookings` also lists every booking left pointing at a non-live row). Rows
+  already damaged can be put back exactly with `python manage.py
+  reconcile_rekeyed_arrivals --restore=<ids> --delete=<ids> --apply` (dry run
+  without `--apply`; `--force` allows a restore that moves stock).
 - **Negative stock is visible, never silently ignored (user request):** a
   delivery recorded without enough stock (409 → *Proceed anyway*) always
   drives `stock_in_hand` **negative** — partially consumed batches go

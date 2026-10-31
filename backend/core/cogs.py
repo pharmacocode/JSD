@@ -376,6 +376,62 @@ def settle_deficit(material, arriving) -> list:
     return settlements
 
 
+def arrival_bookings(batch) -> list:
+    """
+    Deliveries and stock adjustments that have ALREADY drawn on one arrival row.
+
+    Deleting a fully consumed arrival is stock-neutral in the moment — its
+    `quantity_remaining` is 0, so stock in hand does not move. That is exactly
+    why it is dangerous: the cases really did leave the shelf, the deliveries
+    keep booking them against a row the register no longer shows, and re-keying
+    the same arrival afterwards puts its FULL quantity back on top. This is how
+    production stock came to be overstated by 1,104 units across three
+    materials (Oct 2026 rebuild), so the API refuses that delete and this
+    helper is what tells it why.
+
+    Returns [(kind, record_id, date, qty), ...] for every LIVE delivery (its
+    consumption_log) and LIVE stock adjustment (its reference_batches) that
+    names this batch id. Reads only; writes nothing.
+    """
+    from .models import StockAdjustment, StockDelivery, qty
+
+    hits = []
+    for delivery in StockDelivery.objects.filter(is_deleted=False).only(
+        "id", "date", "consumption_log"
+    ):
+        for block in delivery.consumption_log or []:
+            if block.get("material_id") != batch.material_id:
+                continue
+            for entry in block.get("consumed") or []:
+                if entry.get("batch_id") != batch.pk:
+                    continue
+                hits.append(
+                    (
+                        "delivery",
+                        delivery.id,
+                        delivery.date,
+                        qty(entry.get("qty") or 0),
+                    )
+                )
+    for adjustment in StockAdjustment.objects.filter(is_deleted=False).only(
+        "id", "date", "material_id", "reference_batches"
+    ):
+        if adjustment.material_id != batch.material_id:
+            continue
+        for entry in adjustment.reference_batches or []:
+            if entry.get("batch_id") != batch.pk:
+                continue
+            hits.append(
+                (
+                    "adjustment",
+                    adjustment.id,
+                    adjustment.date,
+                    qty(entry.get("qty") or 0),
+                )
+            )
+    return hits
+
+
 def check_shortfall(sku, client, qty_cases: Decimal):
     """
     Without mutating the DB, check stock sufficiency for every required
@@ -1476,11 +1532,68 @@ def rollback_delivery_stock(delivery) -> dict:
     Deliveries created before this log existed have an empty one; they are
     reported via `skipped` so callers can warn instead of silently pretending
     the rollback was complete.
+
+    Two shapes that look like stock but are not, both unpacked here so the
+    figures stay honest (user bug report: in-hand stock drifted away from the
+    batch ledger whenever a delivery was deleted):
+
+      - a settled deficit — the cases were delivered before the stock arrived,
+        then `settle_deficit` moved them out of the batches that DID arrive.
+        Handing them back to the insisting batch alone loses them (it is
+        already at its received cap), so whatever cannot go back where it came
+        from is given to the batches that gave cases up, oldest first — the
+        exact reverse of what settle_deficit did.
+      - an orphaned booking — the batch a case came from is gone, or was
+        retired by that settlement. Same treatment.
+
+    Stock is never INVENTED: a case only comes back to a batch that has cases
+    booked out of it (`received - remaining`). Anything with nowhere to go is
+    reported in `unrestored` instead of silently adjusting a figure.
     """
+    from .models import Material
+
     log = delivery.consumption_log or []
     restored = []
     touched_batches = {}
     carriers_to_drop = []
+    homeless = {}  # material_id -> cases with nowhere to go yet
+
+    def load_batch(batch_id):
+        """One instance per batch, so in-memory credits cannot be lost."""
+        batch = touched_batches.get(batch_id)
+        if batch is None:
+            batch = (
+                MaterialBatch.objects.filter(pk=batch_id)
+                .select_related("material")
+                .first()
+            )
+            if batch is not None:
+                touched_batches[batch.pk] = batch
+        return batch
+
+    def report(batch, material_id, amount):
+        restored.append(
+            {
+                "material_id": material_id,
+                "material": batch.material.name,
+                "qty": str(round_qty(amount)),
+                "unit": batch.material.unit_of_measure,
+            }
+        )
+
+    def credit(batch, amount):
+        """
+        Give `amount` cases back to `batch`, up to the cases it has booked out
+        (`received - remaining`). Returns how many actually landed: a rollback
+        may never push a batch above what it received, because that would
+        invent stock that never arrived.
+        """
+        booked_out = round_qty(batch.quantity_received - batch.quantity_remaining)
+        if booked_out <= 0:
+            return ZERO
+        placed = amount if amount < booked_out else booked_out
+        batch.quantity_remaining = round_qty(batch.quantity_remaining + placed)
+        return placed
 
     for line in log:
         material_id = line.get("material_id")
@@ -1488,37 +1601,60 @@ def rollback_delivery_stock(delivery) -> dict:
             qty_back = Decimal(str(entry.get("qty") or 0))
             if qty_back <= 0:
                 continue
-            batch = touched_batches.get(entry.get("batch_id"))
+            batch = load_batch(entry.get("batch_id"))
             if batch is None:
-                batch = MaterialBatch.objects.filter(pk=entry.get("batch_id")).first()
-                if batch is None:
-                    continue
-                touched_batches[batch.pk] = batch
+                homeless[material_id] = homeless.get(material_id, ZERO) + qty_back
+                continue
             if entry.get("carrier"):
-                batch.quantity_remaining = round_qty(batch.quantity_remaining + qty_back)
+                if batch.is_deleted:
+                    # Already retired by settle_deficit: the arriving stock
+                    # covered these cases, so they belong to the arrivals.
+                    homeless[material_id] = (
+                        homeless.get(material_id, ZERO) + qty_back
+                    )
+                    continue
+                # The invented deficit row is credited back in full (it never
+                # had a received quantity) and retired once it reaches 0.
+                batch.quantity_remaining = round_qty(
+                    batch.quantity_remaining + qty_back
+                )
                 if batch.quantity_remaining <= 0:
                     carriers_to_drop.append(batch)
-                    restored.append(
-                        {
-                            "material_id": material_id,
-                            "material": batch.material.name,
-                            "qty": str(qty_back),
-                            "unit": batch.material.unit_of_measure,
-                        }
-                    )
+                report(batch, material_id, qty_back)
                 continue
-            # Real batch: give the cases back. Never let a rollback push a
-            # batch above what it actually received.
-            batch.quantity_remaining = min(
-                round_qty(batch.quantity_remaining + qty_back),
-                batch.quantity_received,
-            )
-            restored.append(
+            placed = credit(batch, qty_back)
+            if placed < qty_back:
+                homeless[material_id] = homeless.get(material_id, ZERO) + (
+                    qty_back - placed
+                )
+            if placed > 0:
+                report(batch, material_id, placed)
+
+    unrestored = []
+    for material_id, amount in homeless.items():
+        material = Material.objects.filter(pk=material_id).first()
+        left = amount
+        if material is not None:
+            # Oldest first: the batch that ran short is the one that gave the
+            # cases up when the deficit settled.
+            for candidate in fifo_batches_for(material):
+                if left <= 0:
+                    break
+                batch = touched_batches.get(candidate.pk) or candidate
+                touched_batches[batch.pk] = batch
+                if batch.is_deleted:
+                    continue
+                placed = credit(batch, left)
+                if placed > 0:
+                    left = round_qty(left - placed)
+                    report(batch, material_id, placed)
+        if left > 0:
+            unrestored.append(
                 {
                     "material_id": material_id,
-                    "material": batch.material.name,
-                    "qty": str(qty_back),
-                    "unit": batch.material.unit_of_measure,
+                    "material": material.name if material else "",
+                    "qty": str(round_qty(left)),
+                    "unit": material.unit_of_measure if material else "",
                 }
             )
 
@@ -1534,6 +1670,9 @@ def rollback_delivery_stock(delivery) -> dict:
         # No log => pre-dates this feature; the stock cannot be reversed
         # automatically and the caller must surface that.
         "skipped": not log,
+        # Cases the log asked for that no batch could take back — surfaced so
+        # the gap is visible instead of quietly absorbed.
+        "unrestored": unrestored,
     }
 
 
@@ -1548,7 +1687,7 @@ def void_delivery(delivery, reason: str = "") -> dict:
     Nothing is hard-deleted: the delivery and its ledger rows stay in the
     audit trail, greyed out and marked deleted, per spec 3.7.
 
-    `delivery.voided` makes this idempotent — calling it twice is a no-op
+    `delivery.is_deleted` makes this idempotent — calling it twice is a no-op
     rather than a double stock credit.
     """
     if delivery.is_deleted:
@@ -1557,8 +1696,22 @@ def void_delivery(delivery, reason: str = "") -> dict:
             "already_deleted": True,
             "restored": [],
             "skipped": False,
+            "unrestored": [],
             "ledger_entries_deleted": [],
         }
+
+    # Claim the delivery BEFORE anything else. Soft-deleting its ledger entries
+    # below cascades straight back into this function
+    # (ClientLedgerEntry.soft_delete -> void_delivery), and that nested call
+    # must find the delivery already voided. Without the claim the FIFO
+    # rollback ran TWICE on every deletion and handed the consumed cases back
+    # twice, so stock in hand climbed a little higher each time a delivery was
+    # deleted — the reported mismatch. The claim is a queryset UPDATE so the
+    # nested call's freshly loaded instance sees it, not just this one.
+    StockDelivery.objects.filter(pk=delivery.pk, is_deleted=False).update(
+        is_deleted=True
+    )
+    delivery.is_deleted = True
 
     rollback = rollback_delivery_stock(delivery)
 
@@ -1574,6 +1727,7 @@ def void_delivery(delivery, reason: str = "") -> dict:
             "action": "deleted",
             "reason": reason,
             "stock_restored": rollback["restored"],
+            "stock_unrestored": rollback["unrestored"],
             "stock_rollback_skipped": rollback["skipped"],
             "ledger_entries_deleted": ledger_entries_deleted,
             "before": delivery._audit_snapshot(),
@@ -1600,8 +1754,127 @@ def void_delivery(delivery, reason: str = "") -> dict:
         "already_deleted": False,
         "restored": rollback["restored"],
         "skipped": rollback["skipped"],
+        "unrestored": rollback["unrestored"],
         "ledger_entries_deleted": ledger_entries_deleted,
     }
+
+@transaction.atomic
+def rebook_delivery(delivery, force: bool = False, **changes) -> StockDelivery:
+    """
+    Correct a delivery AFTER it was booked (user bug: editing `qty_cases` over
+    the API wrote the new figure and walked nothing, so the deliveries list said
+    40 cases while the batches had only ever given up 10 — stock in hand and the
+    batch ledger drifted apart with no record of why).
+
+    In one transaction:
+      1. hands back everything the old figures had consumed
+         (`rollback_delivery_stock` — the same engine deleting a delivery uses),
+      2. re-runs the FIFO walk for the NEW figures, so the batches, the
+         consumption log and the creation-time cost snapshots all describe the
+         delivery as it now stands,
+      3. re-points the linked DELIVERY ledger entry at the new amount, so the
+         client's pending balance follows the edit.
+
+    An edit that would overdraw stock raises DeliveryShortfall unless `force`
+    is set — the same contract as creating a delivery — and because everything
+    runs in one transaction a rejected edit leaves the delivery and its stock
+    exactly as they were.
+
+    `changes` are the serializer's validated model fields:
+    qty_cases / sku / client / date / selling_price_per_case.
+    """
+    if delivery.is_deleted:
+        raise ValueError("A deleted delivery cannot be edited.")
+
+    old_qty = delivery.qty_cases
+    old_sku = delivery.sku
+    old_client = delivery.client
+    old_date = delivery.date
+
+    def qty_text(value):
+        """3.0000 -> '3' (the form the auto-generated ledger notes use)."""
+        text = f"{Decimal(value):f}".rstrip("0").rstrip(".")
+        return text or "0"
+
+    new_qty = Decimal(str(changes.get("qty_cases", old_qty)))
+    new_sku = changes.get("sku", old_sku)
+    new_client = changes.get("client", old_client)
+    new_date = changes.get("date", old_date)
+    new_price = Decimal(
+        str(changes.get("selling_price_per_case", delivery.selling_price_per_case))
+    )
+    if new_qty <= 0:
+        raise ValueError("qty_cases must be greater than zero.")
+
+    # Only a different quantity / SKU / client changes WHAT is consumed. A price
+    # or date edit just re-prices, and re-running FIFO for it would book the
+    # consumption a second time.
+    stock_changed = (
+        new_qty != old_qty
+        or new_sku.pk != old_sku.pk
+        or new_client.pk != old_client.pk
+    )
+
+    if stock_changed:
+        # Undo first: the shortfall check below must see the stock this
+        # delivery had taken out, not what is left after it.
+        rollback_delivery_stock(delivery)
+
+    shortfall = check_shortfall(new_sku, new_client, new_qty) if stock_changed else []
+    if shortfall and not force:
+        # Raising here rolls the transaction (and the rollback above) back, and
+        # a rollback fires no signals — so drop the request memo explicitly or
+        # this process could keep serving the pre-rollback stock figures.
+        perfcache.invalidate()
+        raise DeliveryShortfall(shortfall)
+
+    result = None
+    if stock_changed:
+        result = estimate_cogs(new_sku, new_client, new_qty, new_date, preview=False)
+
+    delivery.qty_cases = new_qty
+    delivery.sku = new_sku
+    delivery.client = new_client
+    delivery.date = new_date
+    delivery.selling_price_per_case = new_price
+    if result is not None:
+        delivery.base_cogs_per_case_snapshot = Decimal(result["per_case_base"])
+        delivery.cogs_per_case_snapshot = Decimal(result["per_case"])
+        delivery.consumption_log = result["consumption"]
+        delivery.stock_shortfall_flag = bool(shortfall) or result[
+            "has_unrecorded_shortfall"
+        ]
+    # Not skip_audit: the change lands in the row's edit history (spec 3.7).
+    delivery.save()
+
+    amount = money(new_qty * new_price)
+    entry = delivery.ledger_entries.filter(
+        entry_type="DELIVERY", is_deleted=False
+    ).first()
+    if entry is not None:
+        entry.client = new_client
+        entry.amount = amount
+        entry.date = new_date
+        # Only the auto-generated wording is rewritten — a note the user typed
+        # is theirs.
+        if entry.note.startswith("Delivery: "):
+            entry.note = f"Delivery: {qty_text(new_qty)} x {new_sku.description}"
+        entry.save()
+
+    # A payment taken with this delivery quotes the old quantity too.
+    for payment_entry in delivery.ledger_entries.filter(
+        entry_type="PAYMENT", is_deleted=False
+    ):
+        if payment_entry.note.startswith("Payment with delivery: "):
+            payment_entry.note = (
+                f"Payment with delivery: {qty_text(new_qty)} x "
+                f"{new_sku.description}"
+            )
+            payment_entry.save()
+
+    return delivery
+
+
 
 
 @transaction.atomic

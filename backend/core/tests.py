@@ -8,6 +8,7 @@ from decimal import Decimal
 from io import StringIO
 
 from django.core.management import call_command
+from django.core.management.base import CommandError
 from django.test import TestCase
 from rest_framework.test import APIClient
 
@@ -761,7 +762,27 @@ class DeliveryDeletionCascadeTests(TestCase):
             payload["force"] = True
         resp = self.api.post("/api/deliveries/", payload, format="json")
         self.assertEqual(resp.status_code, 201)
-        return StockDelivery.objects.get()
+        return StockDelivery.objects.latest("id")
+
+    def _arrive(self, qty, arrival="2026-09-05"):
+        """Arrived stock through the API, so settle_deficit really runs."""
+        resp = self.api.post(
+            "/api/batches/",
+            {
+                "material": self.bottle.id,
+                "quantity_received": qty,
+                "price_per_unit": "240",
+                "arrival_date": arrival,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        return MaterialBatch.objects.latest("id")
+
+    def _patch(self, delivery, data):
+        return self.api.patch(
+            f"/api/deliveries/{delivery.id}/", data, format="json"
+        )
 
     def test_deleting_ledger_entry_voids_delivery_everywhere(self):
         make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
@@ -949,6 +970,138 @@ class DeliveryDeletionCascadeTests(TestCase):
         # October's own consumption is scoped to October.
         demand, _ = legacy_demand_by_material(2026, 10)
         self.assertEqual(demand[self.bottle.id], D("4"))
+
+    # ------------------------------------------------------------------
+    # User bug: in-hand stock drifted away from the batch ledger, worst of
+    # all right after deleting a delivery (it climbed by the cases the
+    # delivery had consumed, a second time).
+    # ------------------------------------------------------------------
+    def test_deleting_one_of_two_deliveries_credits_its_cases_once(self):
+        """
+        The ledger-entry cascade re-entered void_delivery, so the FIFO rollback
+        ran twice. On a single delivery over an untouched batch the second
+        credit was invisible (the batch was already back at
+        `quantity_received`), but on a batch a LATER delivery had also drawn
+        from it pushed stock above what ever arrived — exactly what the user
+        saw. Now the delivery is claimed before anything else, so the rollback
+        happens once.
+        """
+        batch = make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        first = self._deliver(cases="3")
+        self._deliver(cases="4")
+        self.assertEqual(self.bottle.stock_in_hand, D("3"))
+
+        resp = self.api.delete(f"/api/deliveries/{first.id}/")
+        self.assertEqual(resp.status_code, 200)
+        self.assertEqual(sum(D(r["qty"]) for r in resp.data["restored"]), D("3"))
+        # 10 arrived - the 4 cases still out; never 9 or 12.
+        self.assertEqual(self.bottle.stock_in_hand, D("6"))
+        batch.refresh_from_db()
+        self.assertEqual(batch.quantity_remaining, D("6"))
+        self.assertLessEqual(batch.quantity_remaining, batch.quantity_received)
+
+    def test_settled_deficit_returns_to_the_arrival_that_covered_it(self):
+        """
+        A delivery made before its stock arrived books an invented zero-received
+        carrier batch; the arrival that covers it retires the carrier. Deleting
+        the delivery has to hand those cases back to the ARRIVAL — the batch
+        that actually gave them up — instead of losing them with the carrier.
+        """
+        delivery = self._deliver(cases="4", force=True)
+        self.assertEqual(self.bottle.stock_in_hand, D("-4"))
+        self._arrive("4")
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+
+        resp = self.api.delete(f"/api/deliveries/{delivery.id}/")
+        self.assertEqual(sum(D(r["qty"]) for r in resp.data["restored"]), D("4"))
+        self.assertEqual(resp.data["unrestored"], [])
+        self.assertEqual(self.bottle.stock_in_hand, D("4"))
+
+    def test_settled_real_batch_deficit_returns_to_the_arrival(self):
+        """
+        The same shortfall booked on a REAL batch (stock existed, just not
+        enough) must not be capped away: the cases the arrival covered belong
+        to the arrival once the delivery is deleted.
+        """
+        make_batch(self.bottle, "6", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver(cases="9", force=True)  # 6 real + 3 deficit
+        self.assertEqual(self.bottle.stock_in_hand, D("-3"))
+        self._arrive("3")
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+
+        resp = self.api.delete(f"/api/deliveries/{delivery.id}/")
+        self.assertEqual(sum(D(r["qty"]) for r in resp.data["restored"]), D("9"))
+        self.assertEqual(resp.data["unrestored"], [])
+        self.assertEqual(self.bottle.stock_in_hand, D("9"))
+
+    # ------------------------------------------------------------------
+    # Editing a delivery must re-book the stock it consumed.
+    # ------------------------------------------------------------------
+    def test_editing_a_delivery_quantity_rebooks_stock_and_the_ledger(self):
+        """
+        A PATCH of qty_cases used to save the row alone, leaving stock in hand
+        pointing at the OLD quantity. The edit now reverses the old consumption
+        and walks FIFO for the new one.
+        """
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver(cases="3")
+        self.assertEqual(self.bottle.stock_in_hand, D("7"))
+
+        resp = self._patch(delivery, {"qty_cases": "5"})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(self.bottle.stock_in_hand, D("5"))
+        delivery.refresh_from_db()
+        self.assertEqual(delivery.qty_cases, D("5"))
+        # The stored FIFO booking describes the delivery as it now stands.
+        self.assertEqual(
+            D(delivery.consumption_log[0]["consumed"][0]["qty"]), D("5")
+        )
+        # Cash follows the new quantity: 5 x 300.
+        self.assertEqual(self.client_obj.pending_amount, D("1500.00"))
+        entry = delivery.ledger_entries.get(entry_type="DELIVERY")
+        self.assertEqual(entry.amount, D("1500.00"))
+
+    def test_editing_a_delivery_down_hands_stock_back(self):
+        batch = make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver(cases="5")
+        self.assertEqual(self.bottle.stock_in_hand, D("5"))
+
+        resp = self._patch(delivery, {"qty_cases": "2"})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        self.assertEqual(self.bottle.stock_in_hand, D("8"))
+        batch.refresh_from_db()
+        self.assertEqual(batch.quantity_remaining, D("8"))
+
+    def test_editing_a_delivery_beyond_stock_is_refused(self):
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver(cases="2")
+
+        resp = self._patch(delivery, {"qty_cases": "50"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("shortfall", resp.data)
+        # Nothing moved: not the stock, not the row, not the cash.
+        self.assertEqual(self.bottle.stock_in_hand, D("8"))
+        delivery.refresh_from_db()
+        self.assertEqual(delivery.qty_cases, D("2"))
+        self.assertEqual(self.client_obj.pending_amount, D("600.00"))
+
+    def test_editing_a_price_leaves_stock_alone(self):
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver(cases="3")
+
+        resp = self._patch(delivery, {"selling_price_per_case": "350"})
+        self.assertEqual(resp.status_code, 200, resp.data)
+        # A re-price is not a re-delivery: the batches must not move.
+        self.assertEqual(self.bottle.stock_in_hand, D("7"))
+        self.assertEqual(self.client_obj.pending_amount, D("1050.00"))
+
+    def test_editing_a_delivery_quantity_to_zero_is_rejected(self):
+        make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        delivery = self._deliver(cases="3")
+
+        resp = self._patch(delivery, {"qty_cases": "0"})
+        self.assertEqual(resp.status_code, 400)
+        self.assertEqual(self.bottle.stock_in_hand, D("7"))
 
 
 class APITests(TestCase):
@@ -1688,6 +1841,147 @@ class InwardLineItemEditTests(TestCase):
         self.assertEqual(self.vendor.amount_owed, D("0"))
         batches = self.api.get(f"/api/materials/{self.mat.id}/batches/")
         self.assertEqual(batches.data["batches"], [])
+
+
+class ArrivalDeleteGuardTests(TestCase):
+    """
+    Production incident (Oct 2026): arrivals that had ALREADY fed deliveries
+    were deleted — stock-neutral in the moment, because nothing was left in them
+    — and then re-keyed backdated, which put their full quantity back on top of
+    stock that had already left the shelf. Per-material `booked - demand` stayed
+    at zero throughout, so nothing flagged it.
+
+    The delete is now refused while any cases (or any booking) point at the row.
+    Correcting Received is the supported way to cancel an arrival, and 0 is a
+    valid correction: it empties the row without ever orphaning a booking.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.vendor = Vendor.objects.create(name="Guard Vendor")
+        self.mat = make_material("Bottle API", "10", vendor=self.vendor)
+        self.batch = make_batch(self.mat, "100", "10", date(2026, 9, 5))
+        self.url = f"/api/batches/{self.batch.id}/"
+        self.client_obj = Client.objects.create(name="Alpha")
+        self.sku = SKU.objects.create(description="Serum 500ml", qty_per_case=D("1"))
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.mat, qty_per_case=D("1")
+        )
+
+    def deliver(self, cases="40", when="2026-09-10"):
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku.id,
+                "qty_cases": cases,
+                "selling_price_per_case": "500",
+                "date": when,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201)
+        return StockDelivery.objects.latest("id")
+
+    def test_deleting_a_consumed_arrival_is_refused(self):
+        self.deliver("40")
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.consumed_quantity, D("40"))
+
+        resp = self.api.delete(self.url)
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("already been drawn on", resp.data["detail"])
+        self.assertIn("40", resp.data["detail"])
+        self.assertTrue(resp.data["can_force"])
+        # Nothing moved: the row is still live and stock is untouched.
+        self.batch.refresh_from_db()
+        self.assertFalse(self.batch.is_deleted)
+        self.assertEqual(self.batch.quantity_remaining, D("60"))
+        self.assertEqual(self.mat.stock_in_hand, D("60"))
+        self.assertEqual(MaterialBatch.objects.filter(is_deleted=False).count(), 1)
+
+    def test_refusal_counts_the_records_that_drew_on_the_row(self):
+        self.deliver("25")
+        self.deliver("15", when="2026-09-12")
+        resp = self.api.delete(self.url)
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("2 records", resp.data["detail"])
+        self.assertEqual(D(resp.data["booked"]), D("40"))
+
+    def test_a_row_whose_balance_hides_its_bookings_is_still_protected(self):
+        """consumed == 0 but a delivery still names the row: still refused."""
+        self.deliver("40")
+        MaterialBatch.objects.filter(pk=self.batch.pk).update(
+            quantity_remaining=D("100")
+        )
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.consumed_quantity, D("0"))
+
+        resp = self.api.delete(self.url)
+
+        self.assertEqual(resp.status_code, 409)
+        self.assertIn("1 record", resp.data["detail"])
+        self.assertEqual(D(resp.data["booked"]), D("40"))
+        self.batch.refresh_from_db()
+        self.assertFalse(self.batch.is_deleted)
+
+    def test_an_over_restored_ghost_row_can_still_be_deleted(self):
+        """remaining above received (a double-rollback ghost) holds nothing."""
+        MaterialBatch.objects.filter(pk=self.batch.pk).update(
+            quantity_remaining=D("120")
+        )
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.consumed_quantity, D("-20"))
+
+        resp = self.api.delete(self.url)
+
+        self.assertEqual(resp.status_code, 204)  # removable: no bookings
+        self.batch.refresh_from_db()
+        self.assertTrue(self.batch.is_deleted)
+
+    def test_forced_delete_without_a_reason_is_refused(self):
+        self.deliver("40")
+        resp = self.api.delete(self.url + "?force=1")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("needs a reason", resp.data["detail"])
+        self.batch.refresh_from_db()
+        self.assertFalse(self.batch.is_deleted)
+
+    def test_forced_delete_records_the_reason_in_the_audit_trail(self):
+        self.deliver("40")
+        resp = self.api.delete(self.url + "?force=1&reason=keyed twice by mistake")
+        self.assertEqual(resp.status_code, 204)
+        self.batch.refresh_from_db()
+        self.assertTrue(self.batch.is_deleted)
+        last = self.batch.edit_history[-1]
+        self.assertEqual(last["action"], "deleted")
+        self.assertEqual(last["reason"], "keyed twice by mistake")
+
+    def test_editing_received_to_zero_cancels_the_arrival_without_deleting(self):
+        """0 is the supported way to cancel an arrival: the row stays."""
+        resp = self.api.patch(self.url, {"quantity_received": "0"}, format="json")
+        self.assertEqual(resp.status_code, 200)
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.quantity_received, D("0"))
+        self.assertEqual(self.batch.quantity_remaining, D("0"))
+        self.assertEqual(self.batch.consumed_quantity, D("0"))
+        self.assertEqual(self.mat.stock_in_hand, D("0"))
+        self.assertFalse(self.batch.is_deleted)  # history kept
+        self.assertTrue(self.batch.is_edited)
+        # Still on the register as a zero line, and never in the deleted pile.
+        live = self.api.get(f"/api/materials/{self.mat.id}/batches/")
+        self.assertEqual(len(live.data["batches"]), 1)
+        self.assertEqual(D(live.data["batches"][0]["quantity_received"]), D("0"))
+        self.assertEqual(MaterialBatch.objects.filter(is_deleted=True).count(), 0)
+
+    def test_negative_received_is_refused(self):
+        resp = self.api.patch(self.url, {"quantity_received": "-5"}, format="json")
+        self.assertEqual(resp.status_code, 400)
+        self.assertIn("0 or more", str(resp.data))
+        self.batch.refresh_from_db()
+        self.assertEqual(self.batch.quantity_received, D("100"))
+        self.assertEqual(self.mat.stock_in_hand, D("100"))
 
 
 class DashboardSummaryTests(TestCase):
@@ -4305,4 +4599,354 @@ class CleanupEmptySplitOrdersCommandTests(OrdersPipelineBase, TestCase):
         self.assertFalse(source.is_deleted)
 
 
+class StockIntegrityTests(TestCase):
+    """
+    In-hand stock must always equal what ARRIVED minus what was DELIVERED, no
+    matter which path moved it: an arrival edit, a deleted arrival, a multi-line
+    delivery or a bulk deletion. These are the paths the reported mismatch
+    ("stock in hand does not match the batch ledger") came from.
+    """
+
+    def setUp(self):
+        self.api = APIClient()
+        self.client_obj = Client.objects.create(name="Integrity Client")
+        self.sku = SKU.objects.create(
+            description="500ml Integrity", qty_per_case=D("24")
+        )
+        self.bottle = make_material("Bottle Integrity", "240")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+
+    def _deliver(self, cases, day="2026-09-10"):
+        resp = self.api.post(
+            "/api/deliveries/",
+            {
+                "client": self.client_obj.id,
+                "sku": self.sku.id,
+                "qty_cases": cases,
+                "date": day,
+            },
+            format="json",
+        )
+        self.assertEqual(resp.status_code, 201, resp.data)
+        return StockDelivery.objects.latest("id")
+
+    def test_editing_an_arrival_moves_stock_by_the_delta(self):
+        """
+        The inward line is editable (user request): correcting
+        `quantity_received` moves stock by the SAME delta, so cases already
+        delivered stay delivered.
+        """
+        batch = make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        create_delivery(
+            self.client_obj, self.sku, D("4"), delivery_date=date(2026, 9, 10)
+        )
+        self.assertEqual(self.bottle.stock_in_hand, D("6"))
+
+        batch.refresh_from_db()
+        batch.quantity_received = D("15")
+        batch.save()
+        self.assertEqual(self.bottle.stock_in_hand, D("11"))  # 15 - 4 out
+
+        batch.refresh_from_db()
+        batch.quantity_received = D("5")
+        batch.save()
+        self.assertEqual(self.bottle.stock_in_hand, D("1"))  # 5 - 4 out
+
+    def test_deleting_an_arrival_leaves_no_phantom_stock(self):
+        batch = make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        create_delivery(
+            self.client_obj, self.sku, D("4"), delivery_date=date(2026, 9, 10)
+        )
+        batch.soft_delete()
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+
+    def test_multi_line_delivery_consumes_the_shared_material_once(self):
+        """Two SKUs drawn from the same bottle material: 10 + 15 out of 100."""
+        second = SKU.objects.create(
+            description="500ml Integrity 2", qty_per_case=D("24")
+        )
+        SKUMaterialRequirement.objects.create(
+            sku=second, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=second, selling_price_per_case=D("300")
+        )
+        make_batch(self.bottle, "100", "240", arrival=date(2026, 9, 1))
+        create_deliveries(
+            self.client_obj,
+            [
+                {"sku": self.sku, "qty_cases": D("10")},
+                {"sku": second, "qty_cases": D("15")},
+            ],
+        )
+        self.assertEqual(self.bottle.stock_in_hand, D("75"))
+
+    def test_deleting_every_delivery_returns_the_whole_arrival(self):
+        batch = make_batch(self.bottle, "10", "240", arrival=date(2026, 9, 1))
+        for _ in range(3):
+            self._deliver("2")
+        self.assertEqual(self.bottle.stock_in_hand, D("4"))
+
+        for delivery in StockDelivery.objects.all():
+            resp = self.api.delete(f"/api/deliveries/{delivery.id}/")
+            self.assertEqual(resp.status_code, 200)
+            self.assertEqual(resp.data["unrestored"], [])
+
+        self.assertEqual(self.bottle.stock_in_hand, D("10"))
+        batch.refresh_from_db()
+        self.assertEqual(batch.quantity_remaining, batch.quantity_received)
+
+
+class StockAuditCommandTests(TestCase):
+    """
+    `stock_audit` is the read-only report used to check real (production) data
+    for the drift this bug left behind: rows that were over-restored and
+    materials whose booked consumption disagrees with the deliveries on record.
+    """
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(name="Audit Co")
+        self.sku = SKU.objects.create(
+            description="Audit 500ml", qty_per_case=D("24"), volume_ml=500
+        )
+        self.bottle = make_material("Audit Bottle", "240")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+
+    def _run(self, *args):
+        out = StringIO()
+        call_command("stock_audit", *args, stdout=out)
+        return out.getvalue()
+
+    def test_a_healthy_ledger_reports_no_anomalies(self):
+        make_batch(self.bottle, "10", "240")
+        create_delivery(
+            self.client_obj, self.sku, D("4"), delivery_date=date(2026, 9, 10)
+        )
+        report = self._run()
+        self.assertIn("Over-restored rows", report)
+        self.assertIn("none", report)
+        self.assertIn("every material reconciles", report)
+
+    def test_an_over_restored_row_is_listed_and_reported_as_a_gap(self):
+        """The shape the double rollback produced: remaining > received."""
+        batch = make_batch(self.bottle, "10", "240")
+        batch.quantity_remaining = D("13")
+        batch.save(skip_audit=True)
+        report = self._run()
+        self.assertIn(f"batch #{batch.id}", report)
+        self.assertIn("over 3", report)
+        self.assertNotIn("every material reconciles", report)
+
+    def test_bookings_stranded_on_a_deleted_arrival_are_reported(self):
+        """
+        The production shape behind "in-hand stock is not actually there": the
+        arrival row a delivery consumed is deleted, then the same arrival is
+        keyed again (often backdated to the original date). Deleting a fully
+        consumed row is stock-neutral, but the re-keyed row adds its full
+        quantity back, so stock is overstated while the per-material gap stays
+        zero — this section is what makes that visible.
+        """
+        first = make_batch(self.bottle, "4", "240", arrival=date(2026, 9, 1))
+        delivery, _result = create_delivery(
+            self.client_obj, self.sku, D("4"), delivery_date=date(2026, 9, 10)
+        )
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+        self.assertEqual(
+            delivery.consumption_log[0]["consumed"][0]["batch_id"], first.id
+        )
+
+        first.refresh_from_db()  # the FIFO wrote the row through another instance
+        first.soft_delete()
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))  # deleting it was neutral
+
+        make_batch(self.bottle, "4", "240", arrival=date(2026, 9, 1))  # re-keyed
+        self.assertEqual(self.bottle.stock_in_hand, D("4"))  # ...but this is phantom
+
+        report = self._run()
+        self.assertIn("Bookings pointing at an arrival row that is no longer live", report)
+        self.assertIn("Audit Bottle: 4 units across 1 deliveries", report)
+        self.assertIn(f"delivery #{delivery.id}", report)
+        self.assertIn(f"batch #{first.id} (deleted row)", report)
+        self.assertIn("stock is overstated", report)
+        self.assertIn(f"batch #{first.id} Audit Bottle arrived 2026-09-01", report)
+        self.assertIn("Arrival rows deleted after stock had been taken out of them", report)
+
+    def test_a_live_row_with_unexplained_consumption_is_reported(self):
+        """Stock that vanished with no delivery behind it is attributed here."""
+        batch = make_batch(self.bottle, "10", "240")
+        batch.quantity_remaining = D("6")
+        batch.save(skip_audit=True)
+        report = self._run()
+        self.assertIn("Live rows whose consumption no booking explains", report)
+        self.assertIn(f"batch #{batch.id} Audit Bottle", report)
+        self.assertIn("unexplained 4", report)
+
+    def test_a_healthy_ledger_books_every_unit(self):
+        make_batch(self.bottle, "10", "240")
+        create_delivery(
+            self.client_obj, self.sku, D("4"), delivery_date=date(2026, 9, 10)
+        )
+        report = self._run()
+        self.assertIn("Bookings pointing at an arrival row that is no longer live:\n  none", report)
+        self.assertIn("Live rows whose consumption no booking explains:\n", report)
+        self.assertNotIn("unexplained", report)
+
+    def test_it_never_writes(self):
+        batch = make_batch(self.bottle, "10", "240")
+        create_delivery(
+            self.client_obj, self.sku, D("4"), delivery_date=date(2026, 9, 10)
+        )
+        cogs_mod.void_delivery(StockDelivery.objects.get(), "audit run")
+        before = list(MaterialBatch.objects.values_list("id", "quantity_remaining"))
+        report = self._run("--voided", "5")
+        self.assertIn("Deleted deliveries", report)
+        self.assertIn("rollback_skipped", report)
+        self.assertEqual(
+            before, list(MaterialBatch.objects.values_list("id", "quantity_remaining"))
+        )
+
+
+
+class ReconcileRekeyedArrivalsCommandTests(TestCase):
+    """
+    The repair tool for the production shape behind "in-hand stock is not
+    actually there": an arrival is deleted after it was consumed (neutral), then
+    re-keyed, which puts its quantity back on top of consumption that already
+    happened. Restoring the original and deleting the duplicate is reversible
+    and takes exactly the phantom quantity out of stock.
+    """
+
+    def setUp(self):
+        self.client_obj = Client.objects.create(name="Reconcile Co")
+        self.sku = SKU.objects.create(
+            description="Reconcile 500ml", qty_per_case=D("24"), volume_ml=500
+        )
+        self.bottle = make_material("Reconcile Bottle", "240")
+        SKUMaterialRequirement.objects.create(
+            sku=self.sku, material=self.bottle, qty_per_case=D("1")
+        )
+        ClientSKUPrice.objects.create(
+            client=self.client_obj, sku=self.sku, selling_price_per_case=D("300")
+        )
+
+    def _run(self, *args, expect_error=False):
+        out, err = StringIO(), StringIO()
+        if expect_error:
+            # call_command RAISES CommandError, so the message is on the
+            # exception — it never reaches stderr.
+            with self.assertRaises(CommandError) as caught:
+                call_command(
+                    "reconcile_rekeyed_arrivals", *args, stdout=out, stderr=err
+                )
+            return out.getvalue() + err.getvalue() + str(caught.exception)
+        call_command("reconcile_rekeyed_arrivals", *args, stdout=out, stderr=err)
+        return out.getvalue()
+
+    def _orphan_and_duplicate(self):
+        """A consumed arrival that was deleted, then keyed again (backdated)."""
+        original = make_batch(self.bottle, "4", "240", arrival=date(2026, 9, 1))
+        delivery, _result = create_delivery(
+            self.client_obj, self.sku, D("4"), delivery_date=date(2026, 9, 10)
+        )
+        original.refresh_from_db()
+        original.soft_delete()
+        duplicate = make_batch(self.bottle, "4", "240", arrival=date(2026, 9, 1))
+        self.assertEqual(self.bottle.stock_in_hand, D("4"))  # phantom
+        return original, duplicate, delivery
+
+    def test_a_dry_run_shows_the_delta_and_writes_nothing(self):
+        original, duplicate, _delivery = self._orphan_and_duplicate()
+        report = self._run("--restore", str(original.id), "--delete", str(duplicate.id))
+        self.assertIn("restore", report)
+        self.assertIn("delete", report)
+        self.assertIn("Reconcile Bottle", report)
+        self.assertIn("Dry run: nothing was written", report)
+        original.refresh_from_db()
+        duplicate.refresh_from_db()
+        self.assertTrue(original.is_deleted)
+        self.assertFalse(duplicate.is_deleted)
+        self.assertEqual(self.bottle.stock_in_hand, D("4"))
+
+    def test_apply_restores_the_original_and_removes_the_duplicate(self):
+        original, duplicate, _delivery = self._orphan_and_duplicate()
+        self._run(
+            "--restore", str(original.id),
+            "--delete", str(duplicate.id),
+            "--reason", "duplicate re-key",
+            "--apply",
+        )
+        original.refresh_from_db()
+        duplicate.refresh_from_db()
+        self.assertFalse(original.is_deleted)  # deliveries book against it again
+        self.assertEqual(original.quantity_remaining, D("0"))  # restored, not refilled
+        self.assertTrue(duplicate.is_deleted)  # the phantom stock is gone
+        self.assertEqual(self.bottle.stock_in_hand, D("0"))
+        # The reason is on the record for both rows.
+        self.assertEqual(original.edit_history[-1]["action"], "restored")
+        self.assertEqual(original.edit_history[-1]["reason"], "duplicate re-key")
+        self.assertEqual(duplicate.edit_history[-1]["action"], "deleted")
+        self.assertEqual(duplicate.edit_history[-1]["reason"], "duplicate re-key")
+
+    def test_it_leaves_a_clean_audit_behind(self):
+        original, duplicate, _delivery = self._orphan_and_duplicate()
+        self._run("--restore", str(original.id), "--delete", str(duplicate.id), "--apply")
+        report = StringIO()
+        call_command("stock_audit", stdout=report)
+        audit = report.getvalue()
+        self.assertIn(
+            "Bookings pointing at an arrival row that is no longer live:\n  none", audit
+        )
+        self.assertNotIn("stock is overstated", audit)
+        # The duplicate is still visible, with the reason it was taken out.
+        self.assertIn(
+            f"batch #{duplicate.id} Reconcile Bottle: remaining 4 "
+            "— duplicate re-key of an arrival already consumed",
+            audit,
+        )
+
+    def test_it_refuses_to_restore_a_row_that_still_carries_stock(self):
+        batch = make_batch(self.bottle, "10", "240")
+        batch.refresh_from_db()
+        batch.soft_delete()  # remaining 10 — restoring would ADD stock
+        report = self._run("--restore", str(batch.id), "--apply", expect_error=True)
+        self.assertIn("would ADD stock", report)
+        batch.refresh_from_db()
+        self.assertTrue(batch.is_deleted)
+
+    def test_it_refuses_to_delete_a_row_that_has_bookings_against_it(self):
+        batch = make_batch(self.bottle, "10", "240")
+        create_delivery(
+            self.client_obj, self.sku, D("4"), delivery_date=date(2026, 9, 10)
+        )
+        report = self._run("--delete", str(batch.id), "--apply", expect_error=True)
+        self.assertIn("booked against it", report)
+        batch.refresh_from_db()
+        self.assertFalse(batch.is_deleted)
+
+    def test_it_rejects_the_same_id_in_both_lists(self):
+        batch = make_batch(self.bottle, "4", "240")
+        report = self._run(
+            "--restore", str(batch.id), "--delete", str(batch.id), expect_error=True
+        )
+        self.assertIn("batch ids in both lists", report)
+
+    def test_a_second_run_reports_nothing_left_to_do(self):
+        original, duplicate, _delivery = self._orphan_and_duplicate()
+        self._run("--restore", str(original.id), "--delete", str(duplicate.id), "--apply")
+        report = self._run(
+            "--restore", str(original.id), "--delete", str(duplicate.id),
+            "--apply", expect_error=True,
+        )
+        self.assertIn("already live", report)
+        self.assertIn("already deleted", report)
 

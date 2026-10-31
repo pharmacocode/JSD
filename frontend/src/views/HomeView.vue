@@ -557,7 +557,13 @@ const inwardRows = computed(() => {
         // (the group). Keep both, under names that cannot collide.
         batch_consumed: item.consumed,
         month_consumed: group.consumed,
-        stock_in_hand: group.stock_in_hand,
+        // `available` is THIS line's own balance — what is still left of this
+        // one arrival. It is deliberately NOT the material total: repeating the
+        // material total on every line made "In hand" read 1,120 on all four
+        // 1 L rows (user bug report). The material figure now travels as
+        // `material_stock`, and the register shows it once, in the tiles.
+        available: item.quantity_remaining,
+        material_stock: group.stock_in_hand,
       })
     }
   }
@@ -594,12 +600,41 @@ const inwardTotal = computed(() =>
 //   carry forward + inward - delivered = in hand.
 // "In hand" is the material's live balance, so this holds even when the cases
 // arrived in an earlier month.
+//
+// `month_consumed` and `material_stock` are MATERIAL-level figures that the API
+// repeats on every arrival line of that material, so they must be counted once
+// per material, not once per line (user bug report: 1,120 in hand on four 1 L
+// rows showed up as 4,480 in the tile). `inward` is a genuine per-line figure
+// and stays a plain sum.
 const inwardSummary = computed(() => {
   const rows = visibleInwardRows.value
   const inward = rows.reduce((s, r) => s + Number(r.quantity_received), 0)
-  const delivered = rows.reduce((s, r) => s + Number(r.month_consumed), 0)
-  const inHand = rows.reduce((s, r) => s + Number(r.stock_in_hand), 0)
+  const perMaterial = new Map()
+  for (const row of rows) {
+    if (!perMaterial.has(row.material_id)) {
+      perMaterial.set(row.material_id, {
+        consumed: Number(row.month_consumed) || 0,
+        inHand: Number(row.material_stock) || 0,
+      })
+    }
+  }
+  const materials = [...perMaterial.values()]
+  const delivered = materials.reduce((s, m) => s + m.consumed, 0)
+  const inHand = materials.reduce((s, m) => s + m.inHand, 0)
   return { inward, delivered, inHand, carryForward: inHand + delivered - inward }
+})
+
+// Footer totals for the register table: what arrived on the visible lines, how
+// much of it the FIFO queue has already taken and what is left of it. All three
+// are per-line figures, so they sum cleanly (user request: date / received /
+// consumed / available).
+const inwardLineTotals = computed(() => {
+  const rows = visibleInwardRows.value
+  return {
+    received: rows.reduce((s, r) => s + Number(r.quantity_received), 0),
+    consumed: rows.reduce((s, r) => s + Number(r.batch_consumed), 0),
+    available: rows.reduce((s, r) => s + Number(r.available), 0),
+  }
 })
 
 // The reconciliation as four tiles (user request). Negative figures are shown in
@@ -635,11 +670,22 @@ function cancelEdit(id) {
 async function saveItem(item) {
   const draft = inwardDraft.value[item.id]
   if (!draft) return
+  const raw = inwardDraft.value[item.id].quantity_received
+  // An empty box is NOT 0 — clearing the field must never silently cancel an
+  // arrival, because 0 is a deliberate correction here.
+  const qty =
+    raw === '' || raw === null || raw === undefined ? NaN : Number(raw)
+  if (!Number.isFinite(qty)) {
+    error.value =
+      'Received must be a number — enter 0 to cancel an arrival (the row ' +
+      'stays in the history with nothing in hand).'
+    return
+  }
   inwardSaving.value = item.id
   error.value = ''
   try {
     await api.patch(`/batches/${item.id}/`, {
-      quantity_received: String(draft.quantity_received),
+      quantity_received: String(qty),
       price_per_unit: String(draft.price_per_unit),
       arrival_date: draft.arrival_date,
     })
@@ -653,7 +699,25 @@ async function saveItem(item) {
   }
 }
 
+/**
+ * Deleting an arrival is guarded in the API: a row that has already fed
+ * deliveries must not disappear, because those cases stay booked while the row
+ * they came from leaves the register — re-keying the arrival afterwards is what
+ * overstated stock in October 2026 (1,104 units across three materials). So for
+ * a consumed row this pivots straight to the edit form, where correcting
+ * Received (0 allowed) is the safe, audited way to cancel it.
+ */
 async function deleteItem(item) {
+  const consumed = Number(item.batch_consumed) || 0
+  if (consumed > 0) {
+    error.value =
+      `Arrival #${item.id} has already fed ${num(consumed)}, so it cannot be ` +
+      'deleted — those cases would stay booked against a row the register no ' +
+      'longer shows. Correct it instead: set Received to what actually ' +
+      'arrived (0 cancels the arrival and keeps the history).'
+    startEdit(item)
+    return
+  }
   const ok = confirm(
     `Remove this arrival of ${item.quantity_received}? Stock in hand and the ` +
       'vendor payable are recalculated.'
@@ -667,6 +731,8 @@ async function deleteItem(item) {
     await load()
     ui.notify('Arrival removed — figures recalculated')
   } catch (e) {
+    // 409 = the API refused it because deliveries already drew on this row; its
+    // message names the quantity and the two safe ways forward.
     error.value = e.message
   } finally {
     inwardSaving.value = null
@@ -1793,8 +1859,9 @@ const onOrderClosed = () => {
                 <tr>
                   <th class="text-left">Date</th>
                   <th class="text-left">Material</th>
-                  <th class="text-right">Qty</th>
-                  <th class="text-right">In hand</th>
+                  <th class="text-right">Received</th>
+                  <th class="text-right">Consumed</th>
+                  <th class="text-right">Available</th>
                   <th></th>
                 </tr>
               </thead>
@@ -1816,13 +1883,17 @@ const onOrderClosed = () => {
                         v-model.number="inwardDraft[item.id].quantity_received"
                         type="number"
                         step="any"
+                        min="0"
                         density="compact"
                         hide-details
-                        label="Qty"
+                        label="Received (0 = cancel)"
                       />
                     </td>
                     <td class="text-right text-body-2 text-medium-emphasis">
-                      {{ num(item.stock_in_hand) }}
+                      {{ num(item.batch_consumed) }}
+                    </td>
+                    <td class="text-right text-body-2 text-medium-emphasis">
+                      {{ num(item.available) }}
                     </td>
                     <td class="text-no-wrap">
                       <v-btn
@@ -1848,7 +1919,10 @@ const onOrderClosed = () => {
                       {{ num(item.quantity_received) }}
                     </td>
                     <td class="text-right text-body-2">
-                      {{ num(item.stock_in_hand) }}
+                      {{ num(item.batch_consumed) }}
+                    </td>
+                    <td class="text-right text-body-2">
+                      {{ num(item.available) }}
                     </td>
                     <td class="text-no-wrap">
                       <v-btn
@@ -1868,6 +1942,21 @@ const onOrderClosed = () => {
                   </template>
                 </tr>
               </tbody>
+              <tfoot>
+                <tr class="text-body-2">
+                  <td colspan="2" class="font-weight-bold">Total</td>
+                  <td class="text-right font-weight-bold">
+                    {{ num(inwardLineTotals.received) }}
+                  </td>
+                  <td class="text-right font-weight-bold">
+                    {{ num(inwardLineTotals.consumed) }}
+                  </td>
+                  <td class="text-right font-weight-bold">
+                    {{ num(inwardLineTotals.available) }}
+                  </td>
+                  <td></td>
+                </tr>
+              </tfoot>
             </v-table>
             <p v-else-if="!loading" class="text-body-2 text-medium-emphasis mb-0">
               No stock arrivals this month.

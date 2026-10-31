@@ -177,16 +177,24 @@ class AuditModel(models.Model):
             self.edit_history = history
             self.is_edited = True
 
-    def soft_delete(self):
-        """Soft delete + audit entry. Never removes the row."""
+    def soft_delete(self, reason=""):
+        """
+        Soft delete + audit entry. Never removes the row.
+
+        `reason` is stored inside the same history entry, so a delete that had
+        to be forced past a guard (see MaterialBatchViewSet.destroy) explains
+        itself whenever the row is audited later — `stock_audit` reads it back
+        next to the deleted row.
+        """
         history = list(self.edit_history or [])
-        history.append(
-            {
-                "timestamp": timezone.now().isoformat(),
-                "action": "deleted",
-                "before": self._audit_snapshot(),
-            }
-        )
+        entry = {
+            "timestamp": timezone.now().isoformat(),
+            "action": "deleted",
+            "before": self._audit_snapshot(),
+        }
+        if reason:
+            entry["reason"] = reason
+        history.append(entry)
         self.edit_history = history
         self.is_deleted = True
         self.save(skip_audit=True)

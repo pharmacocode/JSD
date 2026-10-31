@@ -99,6 +99,7 @@ onMounted(load)
           <tr>
             <th>Arrival</th>
             <th class="text-right">Received (cases)</th>
+            <th class="text-right">Consumed</th>
             <th class="text-right">Remaining</th>
             <th class="text-right">₹ / case</th>
             <th></th>
@@ -112,6 +113,7 @@ onMounted(load)
           >
             <td>{{ b.arrival_date }}</td>
             <td class="text-right">{{ num(b.quantity_received) }}</td>
+            <td class="text-right">{{ num(b.consumed) }}</td>
             <td
               class="text-right font-weight-bold"
               :class="Number(b.quantity_remaining) < 0 ? 'text-error' : ''"

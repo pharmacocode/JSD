@@ -5,7 +5,7 @@ from decimal import Decimal, InvalidOperation
 from django.utils import timezone
 from rest_framework import serializers
 
-from .cogs import settle_deficit
+from .cogs import DeliveryShortfall, rebook_delivery, settle_deficit
 from .models import (
     Asset,
     Client,
@@ -265,6 +265,21 @@ class MaterialBatchSerializer(serializers.ModelSerializer):
             "edit_history",
         ]
 
+    def validate_quantity_received(self, value):
+        """
+        Zero is a legitimate correction — it is how an arrival that never
+        happened (or was keyed twice) is cancelled WITHOUT deleting the row, so
+        the register keeps the history and no `consumption_log` pointer is ever
+        orphaned. Only negatives are refused: `save()` moves `quantity_remaining`
+        by the same delta, so a negative receipt would hand stock back.
+        """
+        if value < 0:
+            raise serializers.ValidationError(
+                "Received must be 0 or more. To cancel an arrival set it to 0 — "
+                "the row stays in the history with nothing in hand."
+            )
+        return value
+
     def create(self, validated_data):
         # Arrived-stock entry (spec 4.3): remaining starts = received.
         validated_data.setdefault(
@@ -397,6 +412,47 @@ class StockDeliverySerializer(serializers.ModelSerializer):
             "is_deleted",
             "edit_history",
         ]
+
+    def validate_qty_cases(self, value):
+        """
+        Cases delivered must be positive: a zero or negative figure would walk
+        FIFO backwards (negative consumption ADDS stock), so it is rejected
+        before it can ever reach the engine.
+        """
+        if Decimal(str(value)) <= 0:
+            raise serializers.ValidationError(
+                "Quantity (cases) must be greater than zero."
+            )
+        return value
+
+    def update(self, instance, validated_data):
+        """
+        Editing a delivery must re-book the stock it consumed (user bug: a
+        PATCH of `qty_cases` used to save the new figure alone, leaving stock in
+        hand pointing at the old one — the row said 40 cases while the batches
+        had only given up 10).
+
+        `rebook_delivery` hands the old consumption back, walks FIFO for the new
+        figures and re-points the client-ledger entry, all in one transaction.
+        Short stock is still refused unless the request asks to force it, the
+        same contract the Add-Delivery screen uses.
+        """
+        force = str(self.initial_data.get("force", "")).lower() in ("1", "true", "yes")
+        try:
+            return rebook_delivery(instance, force=force, **validated_data)
+        except DeliveryShortfall as exc:
+            raise serializers.ValidationError(
+                {
+                    "detail": (
+                        "Insufficient stock for the edited quantity — resend "
+                        "with force to record it anyway (stock in hand will "
+                        "show negative)."
+                    ),
+                    "shortfall": exc.shortages,
+                }
+            )
+        except ValueError as exc:
+            raise serializers.ValidationError({"detail": str(exc)})
 
 
 class StockAdjustmentSerializer(serializers.ModelSerializer):
